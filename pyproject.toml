@@ -1,0 +1,86 @@
+[project]
+name = "wyoming-vietnamese"
+version = "1.0.0"
+description = "Wyoming protocol server for Vietnamese STT and TTS"
+readme = "README.md"
+requires-python = ">=3.14"
+license = { text = "MIT" }
+dependencies = [
+  "huggingface-hub",
+  "numpy",
+  "sherpa-onnx",
+  "sherpa-onnx-core",
+  "wyoming",
+]
+
+[dependency-groups]
+dev = [
+  "interrogate",
+  "orjson",
+  "packaging",
+  "prek",
+  "pyright",
+  "pytest",
+  "pytest-asyncio",
+  "pytest-cov",
+  "pytest-timeout",
+  "pytest-xdist",
+  "ruff",
+  "tomlkit",
+  "ty",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = [
+  "B",   # flake8-bugbear
+  "C4",  # flake8-comprehensions
+  "D",   # pydocstyle
+  "E",   # pycodestyle errors
+  "F",   # pyflakes
+  "G",   # flake8-logging-format
+  "I",   # isort
+  "LOG", # flake8-logging
+  "N",   # pep8-naming
+  "PIE", # flake8-pie
+  "PT",  # flake8-pytest-style
+  "RET", # flake8-return
+  "RUF", # ruff-specific rules
+  "SIM", # flake8-simplify
+  "TID", # flake8-tidy-imports
+  "UP",  # pyupgrade
+  "W",   # pycodestyle warnings
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest]
+asyncio_mode = "auto"
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = [
+  "-n",
+  "auto",
+  "--quiet",
+  "--cov=wyoming_vietnamese",
+  "--cov-fail-under=90",
+  "--cov-branch",
+  "--timeout=60",
+  "--strict-markers",
+]
+
+[tool.pyright]
+typeCheckingMode = "standard"
+
+[tool.interrogate]
+fail-under = 100
+ignore-nested-functions = true
+exclude = ["scratch"]

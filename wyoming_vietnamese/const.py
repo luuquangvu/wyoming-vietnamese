@@ -1,0 +1,56 @@
+"""Constants shared by the Wyoming Vietnamese services."""
+
+DEFAULT_PORT = 10300
+PROGRAM_NAME = "wyoming_vietnamese"
+NGHITTS_MODEL_BASE_URL = "https://nghitts.app/api/model"
+DEFAULT_CACHE_DIR = "/app/.cache"
+DEFAULT_DOWNLOAD_DIR = "/app/models"
+VIETNAMESE_LANGUAGE = "vi"
+
+DEFAULT_INFERENCE_QUEUE_TIMEOUT = 30.0
+DEFAULT_EVENT_TIMEOUT = 60.0
+DEFAULT_WRITE_TIMEOUT = 5.0
+DEFAULT_MAX_ACTIVE_CONNECTIONS = 64
+DEFAULT_MAX_STT_BUFFER_MB = 256
+DEFAULT_MAX_STT_AUDIO_SECONDS = 120.0
+DEFAULT_MAX_TTS_TEXT_CHARS = 2_000
+DEFAULT_TTS_SENTENCE_SILENCE_MS = 400
+DEFAULT_TTS_CLAUSE_SILENCE_MS = 180
+DEFAULT_TTS_SILENCE_JITTER_PERCENT = 25
+MAX_TTS_SILENCE_JITTER_PERCENT = 100
+MAX_TTS_SILENCE_MS = 3_000
+DEFAULT_TTS_CACHE_IDLE_SECONDS = 86_400.0
+DEFAULT_TTS_CACHE_MAX_ENTRIES = 128
+DEFAULT_TTS_CACHE_MAX_MB = 64
+DEFAULT_TTS_CACHE_MAX_ITEM_MB = 4
+DEFAULT_LOCAL_CONNECTION_RESERVE = 2
+SHUTDOWN_DRAIN_TIMEOUT = 10.0
+# Inference is serialized by the STT and TTS locks, so a small pool is enough: one STT
+# recognition, one TTS chunk, and their iterator cleanup never exceed it.
+INFERENCE_EXECUTOR_WORKERS = 4
+MAX_EVENT_DATA_BYTES = 64 * 1024
+MAX_EVENT_HEADER_BYTES = 64 * 1024
+MAX_EVENT_PAYLOAD_BYTES = 4 * 1024 * 1024
+
+TARGET_SAMPLE_RATE = 16000
+STT_SAMPLE_WIDTH = 2
+STT_SAMPLE_CHANNELS = 1
+MIN_INPUT_SAMPLE_RATE = 8_000
+MAX_INPUT_SAMPLE_RATE = 192_000
+SUPPORTED_INPUT_WIDTHS = frozenset({1, 2, 3, 4})
+SUPPORTED_INPUT_CHANNELS = frozenset({1, 2})
+STT_INLINE_CONVERSION_SECONDS = 0.1
+STT_CONVERSION_SLICE_SECONDS = 0.25
+
+TTS_SAMPLE_RATE = 22050
+TTS_SAMPLE_WIDTH = 2
+TTS_SAMPLE_CHANNELS = 1
+TTS_CHUNK_SIZE = 4096
+# Bounds the audio a producer may run ahead of a draining client. Inference releases the
+# shared TTS lock only once the engine iterator is exhausted, so a capacity below one
+# utterance couples the lock to client read speed. 128 chunks is 512 KiB, about 11.9
+# seconds at 22.05 kHz, and the TTS lock keeps at most one producer filling a queue.
+TTS_OUTPUT_QUEUE_CHUNKS = 128
+TTS_MODEL_FILE = "model.onnx"
+TTS_CONFIG_FILE = "model.onnx.json"
+TTS_TOKENS_FILE = "tokens.txt"
