@@ -98,8 +98,7 @@ def _sync_repo(
     from huggingface_hub import snapshot_download
 
     pattern_list = list(allow_patterns) if allow_patterns is not None else None
-    local_only = offline or get_env_bool("HF_HUB_OFFLINE", False)
-    if local_only:
+    if _local_only := offline or get_env_bool("HF_HUB_OFFLINE", False):
         _LOGGER.info("Loading %s from the local Hugging Face cache", repo_id)
         try:
             return Path(
@@ -576,8 +575,7 @@ def _structure_nghitts_files(snapshot_path: Path, dest_dir: Path) -> list[Path]:
     """Build Sherpa's local layout from a synchronized NghiTTS voice snapshot."""
     model_source = snapshot_path / TTS_MODEL_FILE
     config_source = snapshot_path / TTS_CONFIG_FILE
-    missing = [path.name for path in (model_source, config_source) if not path.is_file()]
-    if missing:
+    if missing := [path.name for path in (model_source, config_source) if not path.is_file()]:
         raise FileNotFoundError(
             f"Incomplete NghiTTS snapshot {snapshot_path!s}; missing: {', '.join(missing)}"
         )

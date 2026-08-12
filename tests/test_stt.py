@@ -344,7 +344,7 @@ async def test_stt_logs_aggregate_timings_without_chunk_noise(
 
     messages = caplog.messages
     assert any("STT step=audio-start" in message for message in messages)
-    assert not any("STT step=audio-chunk" in message for message in messages)
+    assert all("STT step=audio-chunk" not in message for message in messages)
     assert any(
         "STT step=queue-acquired" in message and "wait_ms=" in message for message in messages
     )
@@ -359,7 +359,7 @@ async def test_stt_logs_aggregate_timings_without_chunk_noise(
         and "real_time_factor=" in message
         for message in messages
     )
-    assert not any("cache=" in message for message in messages)
+    assert all("cache=" not in message for message in messages)
 
 
 async def test_stt_empty_audio_returns_empty_transcript() -> None:

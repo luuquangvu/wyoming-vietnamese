@@ -55,7 +55,7 @@ from .const import (
 )
 from .inference import run_inference
 from .protocol import ProtocolWriteError, SafeAsyncEventHandler, is_vietnamese_language
-from .tts_model import DEFAULT_TTS_VOICE, TtsVoiceSpec
+from .tts_model import DEFAULT_TTS_VOICE, TTS_VOICES_BY_ID, TtsVoiceSpec
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -426,9 +426,7 @@ def _boundary_kind(text: str) -> str:
     last_char = trimmed[-1]
     if last_char in _SENTENCE_END_CHARS:
         return "sentence"
-    if last_char in _CLAUSE_END_CHARS:
-        return "clause"
-    return "none"
+    return "clause" if last_char in _CLAUSE_END_CHARS else "none"
 
 
 class StreamClauseDetector:
@@ -811,8 +809,12 @@ class TTSEventHandler(SafeAsyncEventHandler):
             return None
 
         voice_name = voice.name
-        if voice_name is not None and not isinstance(voice_name, str):
-            raise TypeError("voice name must be text")
+        if voice_name is not None:
+            if not isinstance(voice_name, str):
+                raise TypeError("voice name must be text")
+            catalog_voice = TTS_VOICES_BY_ID.get(voice_name)
+            if catalog_voice is not None:
+                voice_name = catalog_voice.name
         if voice_name is not None and voice_name not in self.preset_voices:
             raise ValueError(f"Requested TTS voice is unavailable: {voice_name}")
 
@@ -1526,8 +1528,7 @@ def _resolve_nghitts_espeak_data(model_dir: Path) -> Path:
         Path("lang/aav/vi"),
     )
 
-    configured = os.environ.get("NGHITTS_ESPEAK_DATA_DIR", "").strip()
-    if configured:
+    if configured := os.environ.get("NGHITTS_ESPEAK_DATA_DIR", "").strip():
         configured_path = Path(configured).expanduser()
         if not all((configured_path / name).is_file() for name in required_paths):
             raise FileNotFoundError(
