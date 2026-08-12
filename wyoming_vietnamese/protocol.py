@@ -168,8 +168,7 @@ async def async_read_event_limited(
     if not isinstance(data, dict):
         raise ProtocolError("event data must be a JSON object")
 
-    data_length = _read_length(event_dict, "data_length", MAX_EVENT_DATA_BYTES)
-    if data_length:
+    if data_length := _read_length(event_dict, "data_length", MAX_EVENT_DATA_BYTES):
         data_bytes = await reader.readexactly(data_length)
         try:
             extra_data = json.loads(data_bytes)

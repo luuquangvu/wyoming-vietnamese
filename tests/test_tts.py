@@ -212,7 +212,7 @@ def test_next_pcm_chunk_converts_audio_and_uses_completion_marker() -> None:
     assert pcm == np.array([32767], dtype="<i2").tobytes()
     assert engine_seconds >= 0
     assert pcm_seconds >= 0
-    assert _next_pcm_chunk(iterator)[0:2] == (False, None)
+    assert _next_pcm_chunk(iterator)[:2] == (False, None)
 
 
 async def test_tts_describe_and_unknown_event() -> None:
@@ -259,6 +259,32 @@ async def test_tts_passes_wyoming_voice_name_to_engine() -> None:
         "audio-chunk",
         "audio-stop",
     ]
+
+
+async def test_tts_resolves_voice_by_catalog_id() -> None:
+    """Test a catalog voice ID resolves to its display name before dispatch."""
+    engine = FakeTTS()
+    engine._preset_voices = {DEFAULT_TTS_VOICE.name: {"description": "NghiTTS voice"}}
+    handler, writer = make_handler(engine)
+    request = Synthesize(text="Xin chào", voice=SynthesizeVoice(name=DEFAULT_TTS_VOICE.id)).event()
+    assert await handler.handle_event(request) is False
+    assert engine.calls == [("Xin chào", DEFAULT_TTS_VOICE.name)]
+    assert [event.type for event in written_events(writer)] == [
+        "audio-start",
+        "audio-chunk",
+        "audio-stop",
+    ]
+
+
+async def test_tts_rejects_a_catalog_id_not_configured_on_this_engine() -> None:
+    """Test a real catalog voice ID that isn't one of the configured voices still fails."""
+    unconfigured_voice = get_voice("chieu-thanh")
+    engine = FakeTTS()
+    handler, writer = make_handler(engine)
+    request = Synthesize(text="Xin chào", voice=SynthesizeVoice(name=unconfigured_voice.id)).event()
+    assert await handler.handle_event(request) is False
+    assert engine.calls == []
+    assert written_events(writer)[0].data["code"] == "invalid-request"
 
 
 async def test_tts_logs_real_time_factor_for_one_shot_request(
@@ -506,12 +532,12 @@ async def test_tts_logs_aggregate_timings_without_chunk_noise(
 
     messages = caplog.messages
     assert any("TTS step=text-stream-start" in message for message in messages)
-    assert not any("TTS step=text-chunk" in message for message in messages)
+    assert all("TTS step=text-chunk" not in message for message in messages)
     assert any("TTS step=sentence-ready" in message for message in messages)
     assert any(
         "TTS step=queue-acquired" in message and "wait_ms=" in message for message in messages
     )
-    assert not any("TTS step=engine-chunk" in message for message in messages)
+    assert all("TTS step=engine-chunk" not in message for message in messages)
     assert any(
         "TTS step=segment-complete" in message and "first_audio_ms=" in message
         for message in messages
@@ -1058,63 +1084,79 @@ def test_initialize_tts_auto_threads(tmp_path: Path, monkeypatch: pytest.MonkeyP
     )
 
 
-def test_stream_clause_detector() -> None:
-    """Test incremental streaming text clause detector."""
+def test_stream_clause_detector_empty_chunk_and_finish() -> None:
+    """Test an empty chunk yields no clauses and finish returns an empty tail."""
     detector = StreamClauseDetector(min_clause_chars=8)
-
-    assert list(detector.add_chunk("")) == []
+    assert not list(detector.add_chunk(""))
     assert detector.finish() == ""
 
+
+def test_stream_clause_detector_streams_sentence_clauses_incrementally() -> None:
+    """Test clauses are emitted as soon as enough streamed text forms a sentence."""
     detector = StreamClauseDetector(min_clause_chars=8)
-    clauses1 = list(detector.add_chunk("Xin chào, "))
-    assert clauses1 == ["Xin chào,"]
-
-    clauses2 = list(detector.add_chunk("tôi là trợ lý ảo "))
-    assert clauses2 == []
-
-    clauses3 = list(detector.add_chunk("tiếng Việt của bạn. "))
-    assert clauses3 == ["tôi là trợ lý ảo tiếng Việt của bạn."]
+    assert list(detector.add_chunk("Xin chào, ")) == ["Xin chào,"]
+    assert not list(detector.add_chunk("tôi là trợ lý ảo "))
+    assert list(detector.add_chunk("tiếng Việt của bạn. ")) == [
+        "tôi là trợ lý ảo tiếng Việt của bạn."
+    ]
 
     detector.add_chunk("Unfinished phrase")
     assert detector.finish() == "Unfinished phrase"
 
-    detector2 = StreamClauseDetector(min_clause_chars=5)
-    res = list(detector2.add_chunk("Sentence one. Clause two, three."))
-    assert "Sentence one." in res
 
-    detector3 = StreamClauseDetector(min_clause_chars=5)
-    clauses_space = list(detector3.add_chunk("This is a long sentence without punctuation"))
-    assert clauses_space == []
-    assert detector3.finish() == "This is a long sentence without punctuation"
+def test_stream_clause_detector_splits_sentence_within_single_chunk() -> None:
+    """Test a sentence boundary inside a single chunk still produces a clause."""
+    detector = StreamClauseDetector(min_clause_chars=5)
+    assert "Sentence one." in list(detector.add_chunk("Sentence one. Clause two, three."))
 
-    detector4 = StreamClauseDetector(min_clause_chars=5)
-    detector4.add_chunk("abcdefghijklmnopqrstuvwxyz")
-    assert detector4.finish() == "abcdefghijklmnopqrstuvwxyz"
 
-    split_res = StreamClauseDetector.split_clause_text(
+def test_stream_clause_detector_defers_clause_without_punctuation() -> None:
+    """Test text without sentence punctuation is withheld until finish."""
+    detector = StreamClauseDetector(min_clause_chars=5)
+    assert not list(detector.add_chunk("This is a long sentence without punctuation"))
+    assert detector.finish() == "This is a long sentence without punctuation"
+
+
+def test_stream_clause_detector_finish_returns_long_unsplit_word() -> None:
+    """Test a single long word with no boundary is returned whole by finish."""
+    detector = StreamClauseDetector(min_clause_chars=5)
+    detector.add_chunk("abcdefghijklmnopqrstuvwxyz")
+    assert detector.finish() == "abcdefghijklmnopqrstuvwxyz"
+
+
+def test_stream_clause_detector_split_clause_text_keeps_short_text_whole() -> None:
+    """Test text under the clause-length threshold is not split."""
+    assert StreamClauseDetector.split_clause_text(
         "Xin chào tôi là trợ lý ảo tiếng Việt của bạn và hôm nay tôi có thể giúp gì cho bạn."
-    )
-    assert split_res == [
-        "Xin chào tôi là trợ lý ảo tiếng Việt của bạn và hôm nay tôi có thể giúp gì cho bạn."
-    ]
+    ) == ["Xin chào tôi là trợ lý ảo tiếng Việt của bạn và hôm nay tôi có thể giúp gì cho bạn."]
 
-    detector5 = StreamClauseDetector(min_clause_chars=5)
-    res5 = list(detector5.add_chunk("Short clause, and then a much longer sentence after it."))
-    assert len(res5) >= 1
 
-    detector6 = StreamClauseDetector(min_clause_chars=15)
-    res6 = list(detector6.add_chunk("Hi there thisisalongwordwithoutspace"))
-    assert res6 == []
-    assert detector6.finish() == "Hi there thisisalongwordwithoutspace"
+def test_stream_clause_detector_emits_clause_for_long_trailing_sentence() -> None:
+    """Test a short clause followed by a much longer sentence still yields output."""
+    detector = StreamClauseDetector(min_clause_chars=5)
+    assert list(detector.add_chunk("Short clause, and then a much longer sentence after it."))
 
-    detector7 = StreamClauseDetector(min_clause_chars=12)
-    assert list(detector7.add_chunk("Hi, this is a useful natural clause, with a tail")) == [
+
+def test_stream_clause_detector_respects_higher_min_clause_chars() -> None:
+    """Test a higher min_clause_chars withholds a long unpunctuated chunk until finish."""
+    detector = StreamClauseDetector(min_clause_chars=15)
+    assert not list(detector.add_chunk("Hi there thisisalongwordwithoutspace"))
+    assert detector.finish() == "Hi there thisisalongwordwithoutspace"
+
+
+def test_stream_clause_detector_splits_natural_clause_with_tail() -> None:
+    """Test a natural clause boundary splits off from its trailing tail."""
+    detector = StreamClauseDetector(min_clause_chars=12)
+    assert list(detector.add_chunk("Hi, this is a useful natural clause, with a tail")) == [
         "Hi, this is a useful natural clause,"
     ]
 
+
+def test_stream_clause_detector_splits_default_min_clause_chars() -> None:
+    """Test the default min_clause_chars splits a long padded sentence."""
     long_sentence = f"{'word ' * 30}done."
-    detector8 = StreamClauseDetector()
-    assert list(detector8.add_chunk(long_sentence)) == [long_sentence.strip()]
+    detector = StreamClauseDetector()
+    assert list(detector.add_chunk(long_sentence)) == [long_sentence.strip()]
 
 
 def test_stream_clause_detector_keeps_numbers_intact() -> None:
@@ -1144,7 +1186,7 @@ def test_stream_clause_detector_keeps_hyphenated_tokens_intact(text: str) -> Non
     assert StreamClauseDetector.split_clause_text(text) == [text]
 
     detector = StreamClauseDetector()
-    assert list(detector.add_chunk(text)) == []
+    assert not list(detector.add_chunk(text))
     assert detector.finish() == text
 
 
@@ -1160,7 +1202,7 @@ def test_stream_clause_detector_still_splits_a_spaced_dash() -> None:
 def test_stream_clause_detector_waits_for_a_token_split_across_chunks() -> None:
     """Test a trailing dash holds until the rest of its token arrives."""
     detector = StreamClauseDetector()
-    assert list(detector.add_chunk("Bạn hãy kết nối Wi-")) == []
+    assert not list(detector.add_chunk("Bạn hãy kết nối Wi-"))
     assert list(detector.add_chunk("Fi trước đã. Rồi tiếp")) == ["Bạn hãy kết nối Wi-Fi trước đã."]
     assert detector.finish() == "Rồi tiếp"
 
@@ -1187,7 +1229,7 @@ def test_stream_clause_detector_still_splits_punctuation_after_digits() -> None:
 def test_stream_clause_detector_waits_for_a_number_split_across_chunks() -> None:
     """Test a trailing digit separator holds until the rest of the number arrives."""
     detector = StreamClauseDetector()
-    assert list(detector.add_chunk("Nhiệt độ ngoài trời là 33,")) == []
+    assert not list(detector.add_chunk("Nhiệt độ ngoài trời là 33,"))
     assert list(detector.add_chunk("8 độ C. Trời đẹp")) == ["Nhiệt độ ngoài trời là 33,8 độ C."]
     assert detector.finish() == "Trời đẹp"
 

@@ -105,10 +105,9 @@ def _get_float(
 
 def _get_required_text(environ: Mapping[str, str], name: str, default: str) -> str:
     """Read a non-empty text environment variable."""
-    value = environ.get(name, default).strip()
-    if not value:
-        raise ValueError(f"{name} must not be empty")
-    return value
+    if value := environ.get(name, default).strip():
+        return value
+    raise ValueError(f"{name} must not be empty")
 
 
 def _get_tts_voices(environ: Mapping[str, str]) -> tuple[TtsVoiceSpec, ...]:

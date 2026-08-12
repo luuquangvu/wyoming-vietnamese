@@ -59,7 +59,7 @@ Ví dụ:
 
 ```yaml
 environment:
-  TTS_VOICE: "ngoc-huyen-moi, ngoc-ngan, ban-mai"
+  TTS_VOICE: "ngoc-huyen-moi, phuong-trang, ngoc-ngan"
 ```
 
 Các biến môi trường (environment variable) chỉ được đọc khi container được tạo. Vì vậy, sau khi sửa `TTS_VOICE` hoặc bất kỳ biến nào khác trong phần `environment`, hãy **tạo lại (recreate) container**. Chỉ khởi động lại (restart) bằng `docker restart` sẽ không áp dụng cấu hình mới.
@@ -72,27 +72,27 @@ docker compose -f docker-compose.online.yaml up -d --force-recreate
 
 Các giọng có sẵn:
 
-| Mã                     | Tên hiển thị               |
-| ---------------------- | -------------------------- |
-| `ban-mai`              | Ban Mai                    |
-| `chieu-thanh`          | Chiếu Thành                |
-| `duy-onyx-moi`         | Duy Onyx (mới)             |
-| `duy-oryx`             | Duy Oryx                   |
-| `lac-phi`              | Lạc Phi                    |
-| `mai-phuong`           | Mai Phương                 |
-| `minh-khang`           | Minh Khang                 |
-| `minh-quang`           | Minh Quang                 |
-| `manh-dung`            | Mạnh Dũng                  |
-| `my-tam`               | Mỹ Tâm                     |
-| `my-tam-real`          | Mỹ Tâm Real                |
-| `ngoc-huyen-moi`       | Ngọc Huyền (mới, mặc định) |
-| `ngoc-ngan`            | Ngọc Ngạn                  |
-| `phuong-trang`         | Phương Trang               |
-| `thanh-phuong-viettel` | Thanh Phương Viettel       |
-| `thien-tam`            | Thiện Tâm                  |
-| `tran-thanh`           | Trấn Thành                 |
-| `tai-an`               | Tài An                     |
-| `viet-thao`            | Việt Thảo                  |
+| Mã                     | Tên hiển thị         | Mặc định |
+| ---------------------- | -------------------- | :------: |
+| `ban-mai`              | Ban Mai              |          |
+| `chieu-thanh`          | Chiếu Thành          |          |
+| `duy-onyx-moi`         | Duy Onyx (mới)       |          |
+| `duy-oryx`             | Duy Oryx             |          |
+| `lac-phi`              | Lạc Phi              |          |
+| `mai-phuong`           | Mai Phương           |          |
+| `minh-khang`           | Minh Khang           |          |
+| `minh-quang`           | Minh Quang           |          |
+| `manh-dung`            | Mạnh Dũng            |          |
+| `my-tam`               | Mỹ Tâm               |          |
+| `my-tam-real`          | Mỹ Tâm Real          |          |
+| `ngoc-huyen-moi`       | Ngọc Huyền (mới)     |    ✓     |
+| `ngoc-ngan`            | Ngọc Ngạn            |          |
+| `phuong-trang`         | Phương Trang         |          |
+| `thanh-phuong-viettel` | Thanh Phương Viettel |          |
+| `thien-tam`            | Thiện Tâm            |          |
+| `tran-thanh`           | Trấn Thành           |          |
+| `tai-an`               | Tài An               |          |
+| `viet-thao`            | Việt Thảo            |          |
 
 ## Các cách chạy khác
 

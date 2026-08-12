@@ -125,6 +125,4 @@ class BoundedLruCache[Key, Value]:
 
     def _expires_at(self, now: float) -> float:
         """Calculate an idle deadline, using infinity when expiration is disabled."""
-        if not self.max_idle_seconds:
-            return float("inf")
-        return now + self.max_idle_seconds
+        return now + self.max_idle_seconds if self.max_idle_seconds else float("inf")

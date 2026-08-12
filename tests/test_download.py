@@ -282,11 +282,17 @@ def test_generate_tokens_rejects_corrupt_models(
         _generate_tokens_from_bpe(model, tmp_path / "tokens.txt")
 
 
+def _write_source(tmp_path: Path, content: bytes = b"content") -> Path:
+    """Create a source file with the given content for copy-or-link tests."""
+    source = tmp_path / "source"
+    source.write_bytes(content)
+    return source
+
+
 def test_copy_or_link_is_atomic_and_idempotent(tmp_path: Path) -> None:
     """Test copy or link is atomic and idempotent."""
-    source = tmp_path / "source"
+    source = _write_source(tmp_path, b"one")
     destination = tmp_path / "nested" / "destination"
-    source.write_bytes(b"one")
     _copy_or_link(source, destination)
     assert destination.read_bytes() == b"one"
     assert os.path.samefile(source, destination)
@@ -301,9 +307,8 @@ def test_copy_or_link_is_atomic_and_idempotent(tmp_path: Path) -> None:
 
 def test_copy_or_link_falls_back_to_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Test copy or link falls back to copy."""
-    source = tmp_path / "source"
+    source = _write_source(tmp_path)
     destination = tmp_path / "destination"
-    source.write_bytes(b"content")
     monkeypatch.setattr(
         "wyoming_vietnamese.download.os.link",
         Mock(side_effect=OSError(errno.EXDEV, "cross-device")),
@@ -315,9 +320,8 @@ def test_copy_or_link_falls_back_to_copy(tmp_path: Path, monkeypatch: pytest.Mon
 
 def test_copy_or_link_replaces_stale_directory(tmp_path: Path) -> None:
     """Test copy or link replaces stale directory."""
-    source = tmp_path / "source"
+    source = _write_source(tmp_path)
     destination = tmp_path / "destination"
-    source.write_bytes(b"content")
     destination.mkdir()
     (destination / "stale").write_bytes(b"stale")
     _copy_or_link(source, destination)
@@ -328,8 +332,7 @@ def test_copy_or_link_propagates_unexpected_link_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Test copy or link propagates unexpected link error."""
-    source = tmp_path / "source"
-    source.write_bytes(b"content")
+    source = _write_source(tmp_path)
     monkeypatch.setattr(
         "wyoming_vietnamese.download.os.link",
         Mock(side_effect=OSError(errno.EIO, "disk")),
@@ -435,7 +438,7 @@ def test_structure_nghitts_files_skips_rehashing_a_prepared_model(
     monkeypatch.setattr("wyoming_vietnamese.download._file_sha256", record_digest)
 
     _structure_nghitts_files(snapshot, destination)
-    assert digests == []
+    assert not digests
     assert (destination / TTS_MODEL_FILE).read_bytes() == prepared
 
     (snapshot / TTS_MODEL_FILE).write_bytes(b"onnx-v2")

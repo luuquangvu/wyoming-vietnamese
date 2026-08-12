@@ -11,7 +11,7 @@ from pathlib import Path
 
 if __name__ == "__main__" and not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    __package__ = "wyoming_vietnamese"
+    sys.modules[__name__].__package__ = "wyoming_vietnamese"
 
 from wyoming.server import AsyncServer, HandlerFactory
 
