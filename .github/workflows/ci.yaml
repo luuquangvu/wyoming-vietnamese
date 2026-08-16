@@ -32,7 +32,7 @@ jobs:
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
 
       - name: Install dependencies
-        run: uv sync --all-groups
+        run: uv sync --locked --all-groups
 
       - name: Run Ruff
         run: uv run ruff check
@@ -48,6 +48,12 @@ jobs:
 
       - name: Run Interrogate
         run: uv run interrogate
+
+      - name: Run Tally
+        run: uv run tally lint Dockerfile
+
+      - name: Run Taplo
+        run: uv run taplo check pyproject.toml
 
       - name: Run Pytest
         run: uv run pytest

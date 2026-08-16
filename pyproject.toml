@@ -26,6 +26,8 @@ dev = [
   "pytest-timeout",
   "pytest-xdist",
   "ruff",
+  "tally-cli",
+  "taplo",
   "tomlkit",
   "ty",
 ]

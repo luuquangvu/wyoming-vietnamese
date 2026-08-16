@@ -36,6 +36,20 @@ repos:
         pass_filenames: false
         always_run: true
 
+      - id: tally
+        name: Run Tally
+        entry: uv run tally lint --fix Dockerfile
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: taplo
+        name: Run Taplo
+        entry: uv run taplo fmt pyproject.toml
+        language: system
+        pass_filenames: false
+        always_run: true
+
       - id: prettier
         name: Run Prettier
         entry: npx prettier --log-level warn --write .
