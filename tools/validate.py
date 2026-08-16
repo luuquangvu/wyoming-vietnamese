@@ -802,10 +802,10 @@ def _run_tally_step(repo_root: str) -> None:
 
 def _run_taplo_step(repo_root: str) -> None:
     """Format TOML files using the explicit Taplo command from pre-commit."""
-    taplo_cmd = "uv run taplo fmt pyproject.toml"
+    taplo_cmd = "uv run taplo format pyproject.toml"
     print(f"STEP_START: {taplo_cmd}", flush=True)
     subprocess.run(
-        ["uv", "run", "taplo", "fmt", "pyproject.toml"],
+        ["uv", "run", "taplo", "format", "pyproject.toml"],
         check=True,
         cwd=repo_root,
         timeout=_FORMAT_STEP_TIMEOUT_SECONDS,

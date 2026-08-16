@@ -53,7 +53,7 @@ jobs:
         run: uv run tally lint Dockerfile
 
       - name: Run Taplo
-        run: uv run taplo check pyproject.toml
+        run: uv run taplo format --check pyproject.toml
 
       - name: Run Pytest
         run: uv run pytest
