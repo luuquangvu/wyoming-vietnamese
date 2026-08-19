@@ -11,13 +11,17 @@ COPY pyproject.toml uv.lock ./
 
 RUN --mount=type=cache,target=/root/.cache/uv <<EOF
 set -eux
-uv sync --locked --no-install-project --no-dev
+uv sync --locked --no-install-project --no-default-groups
 EOF
 
 COPY wyoming_vietnamese/ ./wyoming_vietnamese/
 
 # Stage 2: Minimal runtime image
 FROM python:3.14-slim-trixie AS runtime
+
+LABEL \
+    org.opencontainers.image.title="Wyoming Vietnamese" \
+    org.opencontainers.image.description="Vietnamese speech-to-text and text-to-speech over the Wyoming protocol."
 
 WORKDIR /app
 
