@@ -584,7 +584,7 @@ def initialize_stt(
         num_threads=threads,
         sample_rate=TARGET_SAMPLE_RATE,
         feature_dim=80,
-        decoding_method="greedy_search",
+        decoding_method="modified_beam_search",
         provider="cpu",
     )
     _LOGGER.info(

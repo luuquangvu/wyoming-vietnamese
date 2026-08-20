@@ -394,6 +394,14 @@ def test_boundary_kind_classifies_trailing_punctuation() -> None:
     assert _boundary_kind("Thật sao?!  ") == "sentence"
     assert _boundary_kind('Anh ấy nói "vâng."') == "sentence"
     assert _boundary_kind("Ngày mai,") == "clause"
+    assert _boundary_kind("Sài Gòn \u2013") == "clause"
+    assert _boundary_kind("Sài Gòn \u2014") == "clause"
+    assert _boundary_kind("Tuyến đường Sài Gòn\u2013") == "clause"
+    assert _boundary_kind("Tuyến đường Sài Gòn\u2014") == "clause"
+    assert _boundary_kind('Tuyến đường Sài Gòn\u2013"') == "clause"
+    assert _boundary_kind("Tuyến đường Sài Gòn\u2014'") == "clause"
+    assert _boundary_kind("Sài Gòn\u2013Hà Nội") == "none"
+    assert _boundary_kind("Sài Gòn\u2014Hà Nội") == "none"
     assert _boundary_kind("một; hai") == "none"
     assert _boundary_kind("   ") == "none"
 
@@ -1179,6 +1187,8 @@ def test_stream_clause_detector_keeps_numbers_intact() -> None:
         "Hôm nay tôi nhận được e-mail mới từ công ty",
         "Thủ tục check-in đã hoàn tất từ sáng nay",
         "Tôi sống ở TP-HCM đã rất nhiều năm rồi",
+        "Tuyến đường Sài Gòn\u2013Hà Nội rất dài và đông",
+        "Tuyến đường Sài Gòn\u2014Hà Nội rất dài và đông",
     ],
 )
 def test_stream_clause_detector_keeps_hyphenated_tokens_intact(text: str) -> None:
@@ -1190,11 +1200,19 @@ def test_stream_clause_detector_keeps_hyphenated_tokens_intact(text: str) -> Non
     assert detector.finish() == text
 
 
-def test_stream_clause_detector_still_splits_a_spaced_dash() -> None:
+@pytest.mark.parametrize(
+    ("dash", "expected_head"),
+    [
+        ("-", "Tuyến đường Sài Gòn -"),
+        ("\u2013", "Tuyến đường Sài Gòn \u2013"),
+        ("\u2014", "Tuyến đường Sài Gòn \u2014"),
+    ],
+)
+def test_stream_clause_detector_still_splits_a_spaced_dash(dash: str, expected_head: str) -> None:
     """Test a dash used as punctuation remains a clause boundary."""
     detector = StreamClauseDetector()
-    assert list(detector.add_chunk("Tuyến đường Sài Gòn - Hà Nội rất dài và đông")) == [
-        "Tuyến đường Sài Gòn -"
+    assert list(detector.add_chunk(f"Tuyến đường Sài Gòn {dash} Hà Nội rất dài và đông")) == [
+        expected_head
     ]
     assert detector.finish() == "Hà Nội rất dài và đông"
 

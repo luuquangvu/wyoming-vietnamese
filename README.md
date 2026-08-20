@@ -96,6 +96,10 @@ Các giọng có sẵn:
 
 ## Các cách chạy khác
 
+### Cài đặt dưới dạng Home Assistant Add-on
+
+Nếu bạn đang sử dụng Home Assistant OS hoặc Supervised và muốn cài đặt trực tiếp dưới dạng App (Add-on) thay vì chạy container Docker độc lập, vui lòng xem hướng dẫn chi tiết tại kho lưu trữ [luuquangvu/ha-addons](https://github.com/luuquangvu/ha-addons).
+
 ### Chạy trực tiếp bằng Docker
 
 Nếu bạn không dùng Docker Compose, có thể chạy trực tiếp ảnh Docker:

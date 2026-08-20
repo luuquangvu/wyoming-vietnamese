@@ -19,10 +19,6 @@ COPY wyoming_vietnamese/ ./wyoming_vietnamese/
 # Stage 2: Minimal runtime image
 FROM python:3.14-slim-trixie AS runtime
 
-LABEL \
-    org.opencontainers.image.title="Wyoming Vietnamese" \
-    org.opencontainers.image.description="Vietnamese speech-to-text and text-to-speech over the Wyoming protocol."
-
 WORKDIR /app
 
 RUN --mount=type=cache,target=/var/cache/apt,id=apt,sharing=locked \

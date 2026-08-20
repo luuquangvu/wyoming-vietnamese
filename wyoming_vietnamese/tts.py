@@ -345,12 +345,12 @@ def _audio_to_pcm_bytes(audio: np.ndarray) -> bytes:
 
 
 _SENTENCE_END_CHARS = frozenset(".!?…")
-_CLAUSE_END_CHARS = frozenset(",;:\u2013-")
+_CLAUSE_END_CHARS = frozenset(",;:\u2013\u2014-")
 _LINE_BREAK_CHARS = frozenset("\n")
 # Subset of the delimiters above that also separate digits: "33,8", "1.000", "10:30".
-_NUMERIC_SEPARATOR_CHARS = frozenset(",.:\u2013-")
+_NUMERIC_SEPARATOR_CHARS = frozenset(",.:\u2013\u2014-")
 # Subset of the delimiters above that also joins one token: "Wi-Fi", "e-mail", "TP-HCM".
-_TOKEN_JOINING_CHARS = frozenset("\u2013-")
+_TOKEN_JOINING_CHARS = frozenset("\u2013\u2014-")
 # Closing punctuation may follow a boundary character; rstrip() requires text.
 _TRAILING_WRAPPER_CHARS = "\"')]}\u00bb\u201d\u2019"
 # Shortest clause a punctuation boundary may produce, and shortest standalone final tail.
