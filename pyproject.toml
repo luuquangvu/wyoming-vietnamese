@@ -1,7 +1,7 @@
 [project]
 name = "wyoming-vietnamese"
 version = "1.0.0"
-description = "Wyoming protocol server for Vietnamese STT and TTS"
+description = "Vietnamese speech-to-text and text-to-speech over the Wyoming protocol."
 readme = "README.md"
 requires-python = ">=3.14"
 license = { text = "MIT" }
