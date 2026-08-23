@@ -81,6 +81,7 @@ addopts = [
 
 [tool.pyright]
 typeCheckingMode = "standard"
+reportUnreachable = "warning"
 
 [tool.interrogate]
 fail-under = 100

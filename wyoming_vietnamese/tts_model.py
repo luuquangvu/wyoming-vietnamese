@@ -163,6 +163,11 @@ TTS_VOICES = (
         "Việt Thảo",
         "f8cad266cfed6018390752326373379411b85efcfca21441e41e31a5aa4a6daf",
     ),
+    _voice(
+        "adam",
+        "Adam",
+        "90e73d171447825fa8442fea8bf39c54bcfb206958f05170361e0fa3ba5c48eb",
+    ),
 )
 
 TTS_VOICES_BY_ID = {voice.id: voice for voice in TTS_VOICES}

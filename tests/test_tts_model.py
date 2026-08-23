@@ -14,7 +14,7 @@ from wyoming_vietnamese.tts_model import (
 
 def test_voice_catalog_has_unique_valid_entries() -> None:
     """Test every selectable voice has a unique ID and pinned artifacts."""
-    assert len(TTS_VOICES) == 19
+    assert len(TTS_VOICES) == 20
     assert len(TTS_VOICES_BY_ID) == len(TTS_VOICES)
     assert len({voice.name for voice in TTS_VOICES}) == len(TTS_VOICES)
     assert all(voice.id and voice.name for voice in TTS_VOICES)

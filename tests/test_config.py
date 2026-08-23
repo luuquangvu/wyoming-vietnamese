@@ -4,9 +4,40 @@ from pathlib import Path
 
 import pytest
 
-from wyoming_vietnamese.config import ServerConfig, get_env_bool, resolve_cpu_threads
+from wyoming_vietnamese.config import (
+    ServerConfig,
+    _get_float,
+    get_env_bool,
+    resolve_cpu_threads,
+)
 from wyoming_vietnamese.const import DEFAULT_PORT
 from wyoming_vietnamese.tts_model import DEFAULT_TTS_VOICE_ID
+
+
+def test_get_float_conflicting_bounds() -> None:
+    """Test _get_float rejects contradictory bound definitions."""
+    with pytest.raises(ValueError, match="both minimum_exclusive and minimum_inclusive"):
+        _get_float({}, "TEST", 1.0, minimum_exclusive=0.0, minimum_inclusive=0.0)
+    with pytest.raises(ValueError, match="maximum_inclusive cannot be less"):
+        _get_float({}, "TEST", 1.0, minimum_inclusive=5.0, maximum_inclusive=4.0)
+    with pytest.raises(ValueError, match="maximum_inclusive must be greater"):
+        _get_float({}, "TEST", 1.0, minimum_exclusive=5.0, maximum_inclusive=5.0)
+
+
+def test_get_float_bounds() -> None:
+    """Test _get_float enforces inclusive and exclusive bounds."""
+    assert (
+        _get_float({"TEST": "5.0"}, "TEST", 1.0, minimum_inclusive=5.0, maximum_inclusive=10.0)
+        == 5.0
+    )
+    assert (
+        _get_float({"TEST": "10.0"}, "TEST", 1.0, minimum_inclusive=5.0, maximum_inclusive=10.0)
+        == 10.0
+    )
+    with pytest.raises(ValueError, match=r"must be at least 5\.0"):
+        _get_float({"TEST": "4.9"}, "TEST", 1.0, minimum_inclusive=5.0)
+    with pytest.raises(ValueError, match=r"must be at most 10\.0"):
+        _get_float({"TEST": "10.1"}, "TEST", 1.0, maximum_inclusive=10.0)
 
 
 @pytest.mark.parametrize("value", ["true", "1", "YES", " on "])

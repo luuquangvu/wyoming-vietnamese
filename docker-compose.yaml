@@ -12,11 +12,11 @@ services:
     environment:
       WYOMING_PORT: 10300
       CPU_THREADS: 0 # 0 means auto-detect all available CPU threads, otherwise set to number of CPU threads to use
-      TTS_VOICE: "ngoc-huyen-moi, phuong-trang, ngoc-ngan" # Comma and/or whitespace separated; first is default
+      TTS_VOICE: "ngoc-huyen-moi, duy-onyx-moi, thanh-phuong-viettel, ngoc-ngan, mai-phuong" # Comma and/or whitespace separated; first is default
       OFFLINE: "false" # Set to true once all models are cached
       TTS_SENTENCE_SILENCE_MS: 400 # Pause between sentences and lines; raise for slower reading
       TTS_CLAUSE_SILENCE_MS: 180 # Pause after commas and other clause punctuation
-      TTS_SILENCE_JITTER_PERCENT: 25 # Random +/- spread per pause so delivery sounds less robotic
+      TTS_SILENCE_JITTER_PERCENT: 20 # Random +/- spread per pause so delivery sounds less robotic
       LOG_LEVEL: "info" # debug, info, warning, error, critical
       TZ: Asia/Ho_Chi_Minh # Local timezone for logging timestamps
     volumes:

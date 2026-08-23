@@ -59,7 +59,7 @@ Ví dụ:
 
 ```yaml
 environment:
-  TTS_VOICE: "ngoc-huyen-moi, phuong-trang, ngoc-ngan"
+  TTS_VOICE: "ngoc-huyen-moi, duy-onyx-moi, thanh-phuong-viettel, ngoc-ngan, mai-phuong"
 ```
 
 Các biến môi trường (environment variable) chỉ được đọc khi container được tạo. Vì vậy, sau khi sửa `TTS_VOICE` hoặc bất kỳ biến nào khác trong phần `environment`, hãy **tạo lại (recreate) container**. Chỉ khởi động lại (restart) bằng `docker restart` sẽ không áp dụng cấu hình mới.
@@ -93,6 +93,7 @@ Các giọng có sẵn:
 | `tran-thanh`           | Trấn Thành           |          |
 | `tai-an`               | Tài An               |          |
 | `viet-thao`            | Việt Thảo            |          |
+| `adam`                 | Adam                 |          |
 
 ## Các cách chạy khác
 
@@ -109,7 +110,7 @@ docker run -d \
   --name wyoming-vietnamese \
   --restart unless-stopped \
   -p 10300:10300 \
-  -e TTS_VOICE="ngoc-huyen-moi,ngoc-ngan" \
+  -e TTS_VOICE="ngoc-huyen-moi, duy-onyx-moi, thanh-phuong-viettel, ngoc-ngan, mai-phuong" \
   -v wyoming-vietnamese-cache:/app/.cache \
   -v wyoming-vietnamese-models:/app/models \
   ghcr.io/luuquangvu/wyoming-vietnamese:latest
