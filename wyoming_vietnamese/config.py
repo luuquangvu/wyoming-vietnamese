@@ -87,9 +87,30 @@ def _get_float(
     name: str,
     default: float,
     *,
-    minimum_exclusive: float,
+    minimum_exclusive: float | None = None,
+    minimum_inclusive: float | None = None,
+    maximum_inclusive: float | None = None,
 ) -> float:
-    """Read and range-check a floating-point environment variable."""
+    """Read and range-check a floating-point environment variable.
+
+    Specify either `minimum_exclusive` or `minimum_inclusive` (not both).
+    `maximum_inclusive` must be >= `minimum_inclusive` or > `minimum_exclusive`.
+    """
+    if minimum_exclusive is not None and minimum_inclusive is not None:
+        raise ValueError("Cannot specify both minimum_exclusive and minimum_inclusive")
+    if (
+        maximum_inclusive is not None
+        and minimum_inclusive is not None
+        and maximum_inclusive < minimum_inclusive
+    ):
+        raise ValueError("maximum_inclusive cannot be less than minimum_inclusive")
+    if (
+        maximum_inclusive is not None
+        and minimum_exclusive is not None
+        and maximum_inclusive <= minimum_exclusive
+    ):
+        raise ValueError("maximum_inclusive must be greater than minimum_exclusive")
+
     raw_value = environ.get(name)
     try:
         value = default if raw_value is None or not raw_value.strip() else float(raw_value)
@@ -98,8 +119,12 @@ def _get_float(
 
     if not math.isfinite(value):
         raise ValueError(f"{name} must be finite")
-    if value <= minimum_exclusive:
+    if minimum_exclusive is not None and value <= minimum_exclusive:
         raise ValueError(f"{name} must be greater than {minimum_exclusive}")
+    if minimum_inclusive is not None and value < minimum_inclusive:
+        raise ValueError(f"{name} must be at least {minimum_inclusive}")
+    if maximum_inclusive is not None and value > maximum_inclusive:
+        raise ValueError(f"{name} must be at most {maximum_inclusive}")
     return value
 
 
