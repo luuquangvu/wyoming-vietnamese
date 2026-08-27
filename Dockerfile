@@ -47,7 +47,7 @@ USER app
 EXPOSE 10300
 
 HEALTHCHECK --interval=30s \
-    --timeout=5s \
+    --timeout=15s \
     --start-period=10m \
     --retries=3 \
     CMD ["python", "-m", "wyoming_vietnamese.healthcheck"]

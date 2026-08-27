@@ -16,7 +16,7 @@ _LOGGER = logging.getLogger("healthcheck")
 
 async def check_port(
     port: int,
-    timeout: float = 2.0,
+    timeout: float = 10.0,
 ) -> bool:
     """Return whether a port advertises installed STT and TTS services."""
     writer: asyncio.StreamWriter | None = None
