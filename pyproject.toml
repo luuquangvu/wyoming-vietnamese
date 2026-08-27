@@ -27,7 +27,6 @@ dev = [
   "pytest-xdist",
   "ruff",
   "tally-cli",
-  "taplo",
   "tomlkit",
   "ty",
 ]

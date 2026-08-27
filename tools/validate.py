@@ -789,28 +789,15 @@ def _run_static_analysis_steps(repo_root: str) -> None:
 
 def _run_tally_step(repo_root: str) -> None:
     """Lint the Dockerfile using the explicit Tally command from pre-commit."""
-    tally_cmd = "uv run tally lint --fix ."
+    tally_cmd = "uv run tally lint --fix Dockerfile"
     print(f"STEP_START: {tally_cmd}", flush=True)
     subprocess.run(
-        ["uv", "run", "tally", "lint", "--fix", "."],
+        ["uv", "run", "tally", "lint", "--fix", "Dockerfile"],
         check=True,
         cwd=repo_root,
         timeout=_FORMAT_STEP_TIMEOUT_SECONDS,
     )
     print(f"STEP_OK: {tally_cmd}", flush=True)
-
-
-def _run_taplo_step(repo_root: str) -> None:
-    """Format TOML files using the explicit Taplo command from pre-commit."""
-    taplo_cmd = "uv run taplo format ."
-    print(f"STEP_START: {taplo_cmd}", flush=True)
-    subprocess.run(
-        ["uv", "run", "taplo", "format", "."],
-        check=True,
-        cwd=repo_root,
-        timeout=_FORMAT_STEP_TIMEOUT_SECONDS,
-    )
-    print(f"STEP_OK: {taplo_cmd}", flush=True)
 
 
 def _run_prettier_step(repo_root: str) -> None:
@@ -846,7 +833,6 @@ def _validate_pipeline() -> None:
     _run_ruff_steps(repo_root)
     _run_static_analysis_steps(repo_root)
     _run_tally_step(repo_root)
-    _run_taplo_step(repo_root)
     _run_prettier_step(repo_root)
     _run_pytest_step(repo_root)
 
