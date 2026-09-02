@@ -165,7 +165,7 @@ TTS_VOICES = (
     ),
     _voice(
         "adam",
-        "Adam",
+        "adam",
         "90e73d171447825fa8442fea8bf39c54bcfb206958f05170361e0fa3ba5c48eb",
     ),
 )

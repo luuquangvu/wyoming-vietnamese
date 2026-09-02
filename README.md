@@ -93,7 +93,7 @@ Các giọng có sẵn:
 | `tran-thanh`           | Trấn Thành           |          |
 | `tai-an`               | Tài An               |          |
 | `viet-thao`            | Việt Thảo            |          |
-| `adam`                 | Adam                 |          |
+| `adam`                 | adam                 |          |
 
 ## Các cách chạy khác
 

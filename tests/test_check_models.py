@@ -45,7 +45,7 @@ def _fake_urlopen(request: Request, **_kwargs: object) -> AbstractContextManager
     """Serve deterministic catalogue, tree, and artifact responses."""
     url = request.full_url
     if url.endswith("/api/models"):
-        return _response({"models": [voice.name for voice in TTS_VOICES] + ["adam"]})
+        return _response({"models": [voice.name for voice in TTS_VOICES] + ["test-voice"]})
     if "/tree/" in url:
         return _response(
             [
@@ -57,10 +57,10 @@ def _fake_urlopen(request: Request, **_kwargs: object) -> AbstractContextManager
         return _response({"sha": STT_MODEL.revision})
 
     artifact_name = unquote(url.rsplit("/", 1)[-1])
-    if artifact_name == "adam.onnx":
-        return _response(b"adam-model")
-    if artifact_name == "adam.onnx.json":
-        return _response(b"adam-config")
+    if artifact_name == "test-voice.onnx":
+        return _response(b"test-voice-model")
+    if artifact_name == "test-voice.onnx.json":
+        return _response(b"test-voice-config")
     for voice in TTS_VOICES:
         for artifact in voice.artifacts:
             if artifact.remote_name == artifact_name:
@@ -83,18 +83,20 @@ def test_compare_models_reports_new_voice_and_matching_stt(
                 for artifact in voice.artifacts
                 if artifact.remote_name == unquote(url.rsplit("/", 1)[-1])
             )
-            if unquote(url.rsplit("/", 1)[-1]) not in {"adam.onnx", "adam.onnx.json"}
-            else sha256(b"adam-model" if url.endswith("adam.onnx") else b"adam-config").hexdigest()
+            if unquote(url.rsplit("/", 1)[-1]) not in {"test-voice.onnx", "test-voice.onnx.json"}
+            else sha256(
+                b"test-voice-model" if url.endswith("test-voice.onnx") else b"test-voice-config"
+            ).hexdigest()
         ),
     )
 
     report = check_models.compare_models(timeout=1)
 
-    assert report.tts.added_names == ("adam",)
+    assert report.tts.added_names == ("test-voice",)
     assert report.tts.removed_names == ()
-    adam_voice = next(voice for voice in report.tts.voices if voice.name == "adam")
-    assert adam_voice.status == "NEW"
-    assert all(voice.status == "MATCH" for voice in report.tts.voices if voice.name != "adam")
+    test_voice = next(voice for voice in report.tts.voices if voice.name == "test-voice")
+    assert test_voice.status == "NEW"
+    assert all(voice.status == "MATCH" for voice in report.tts.voices if voice.name != "test-voice")
     assert report.stt.revision_changed is False
     assert all(artifact.status == "MATCH" for artifact in report.stt.artifacts)
     assert report.needs_update is True
@@ -107,7 +109,7 @@ def test_skip_tts_hashes_still_compares_catalogue_and_stt(monkeypatch) -> None:
     report = check_models.compare_models(timeout=1, hash_tts=False)
 
     assert report.tts.voices[0].artifacts[0].status == "UNKNOWN"
-    assert report.tts.added_names == ("adam",)
+    assert report.tts.added_names == ("test-voice",)
     assert report.stt.needs_update is False
 
 
