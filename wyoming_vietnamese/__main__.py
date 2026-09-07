@@ -170,7 +170,7 @@ async def run_server(
         write_timeout=server_config.write_timeout,
         sentence_silence_ms=server_config.tts_sentence_silence_ms,
         clause_silence_ms=server_config.tts_clause_silence_ms,
-        silence_jitter_percent=server_config.tts_silence_jitter_percent,
+        paragraph_silence_ms=server_config.tts_paragraph_silence_ms,
         inference_executor=inference_executor,
     )
 

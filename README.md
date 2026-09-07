@@ -1,109 +1,164 @@
 # Wyoming Vietnamese
 
-Để Assist của Home Assistant nghe và trả lời bằng tiếng Việt tự nhiên, ngay trong mạng nhà bạn.
+Giải pháp nhận diện giọng nói (STT) và phát giọng đọc (TTS) tiếng Việt **cục bộ (local)**, riêng tư và tự nhiên cho trợ lý **Home Assistant (Assist)** qua giao thức [Wyoming Protocol](https://github.com/OHF-Voice/wyoming).
 
-Wyoming Vietnamese cung cấp cả dịch vụ **chuyển giọng nói thành văn bản (STT)** và **chuyển văn bản thành giọng nói (TTS)** qua Wyoming Protocol. Home Assistant chỉ cần kết nối tới một địa chỉ và một cổng (port) duy nhất; sau đó bạn có thể chọn dịch vụ này làm chuỗi xử lý (pipeline) giọng nói cho Assist.
+Toàn bộ quá trình xử lý giọng nói và suy luận diễn ra ngay trên thiết bị trong mạng nội bộ (LAN) của bạn: không cần tài khoản đám mây, không tốn phí API và không gửi dữ liệu ra bên ngoài (lưu ý: dịch vụ hoạt động ngoại tuyến sau khi tất cả mô hình và giọng đang sử dụng đã được tải xuống; nếu đổi `TTS_VOICE` hoặc thêm mô hình chưa có trong volume, cần kết nối Internet để tải chúng).
+
+---
 
 ## Điểm nổi bật
 
-- Nhận diện tiếng Việt và chuyển văn bản thành giọng nói ngay trong mạng nhà bạn.
-- Không cần tài khoản đám mây hoặc khóa API (API key); âm thanh và văn bản không phải gửi tới dịch vụ bên ngoài trong quá trình sử dụng.
-- Có 20 giọng TTS tiếng Việt để chọn. Giọng đầu tiên trong cấu hình là giọng mặc định.
-- Chạy bằng một container Docker duy nhất và dùng chung cổng Wyoming `10300` cho cả STT lẫn TTS.
-- Mô hình (model) được tải một lần rồi lưu trong phân vùng lưu trữ (volume) Docker, nên các lần khởi động sau nhanh hơn. Sau khi tải xong, dịch vụ có thể chạy hoàn toàn ngoại tuyến (offline).
+- **2 trong 1 (STT + TTS)**: Tích hợp cả nhận diện giọng nói (Speech-to-Text) lẫn phát giọng đọc (Text-to-Speech) trong một container duy nhất, dùng chung một cổng mạng (`10300`).
+- **Cục bộ và Riêng tư**: Dữ liệu giọng nói và văn bản của gia đình bạn không bao giờ rời khỏi mạng nội bộ (quá trình suy luận chạy 100% offline sau khi đã nạp mô hình ở lần khởi động đầu).
+- **Tốc độ cao và Tiết kiệm tài nguyên**: Sử dụng mô hình Zipformer tiếng Việt (STT) và VITS NghiTTS chạy qua bộ suy luận C++ tối ưu `sherpa-onnx`, phản hồi nhanh ngay cả trên các thiết bị có cấu hình vừa và yếu (Raspberry Pi 4/5, Mini PC, NAS).
+- **20 giọng đọc tiếng Việt phong phú**: Đầy đủ giọng miền Bắc, miền Nam, nam và nữ với ngữ điệu tự nhiên, rõ ràng.
+- **Ngắt nghỉ tự nhiên theo chuẩn ngữ pháp**: Tự động căn chỉnh khoảng nghỉ giữa đoạn văn, câu và vế câu (dấu phẩy), giúp câu văn mạch lạc, không bị dồn chữ.
+- **Tự động tải và Sẵn sàng chạy ngoại tuyến**: Tự động tải mô hình ở lần khởi động đầu tiên, lưu vào Docker volume và có thể hoạt động hoàn toàn không cần Internet sau khi các mô hình/giọng cần dùng đã được tải.
 
-## Trước khi bắt đầu
+---
 
-Bạn cần:
+## Yêu cầu chuẩn bị
 
-- Một máy chạy Docker và Docker Compose, nằm trên cùng mạng với Home Assistant.
-- Kết nối Internet ở lần khởi động đầu tiên để tải mô hình STT và các giọng TTS.
-- Một cổng mạng (TCP port) chưa được sử dụng. Mặc định dịch vụ dùng cổng `10300`.
+- Một thiết bị cài đặt **Docker** và **Docker Compose** (Raspberry Pi 4/5, x86 Mini PC, máy chủ Linux, NAS Synology/QNAP...).
+- Home Assistant và thiết bị chạy container có thể kết nối với nhau qua mạng nội bộ.
+- Khoảng **2 GB dung lượng trống** để lưu trữ mô hình STT và các giọng đọc TTS.
+- Kết nối Internet ở lần chạy đầu tiên để nạp mô hình.
+- Cổng TCP `10300` chưa bị chiếm dụng (nếu đổi cổng host ở mục `ports` trong Docker Compose, ví dụ `"10303:10300"`, bạn cần nhập cổng mới này vào ô **Port** khi kết nối với Home Assistant).
 
-Home Assistant không cần chạy Docker trên cùng máy với Wyoming Vietnamese. Nếu chạy container trên máy khác, bạn chỉ cần dùng địa chỉ IP của máy đó khi thêm tích hợp (integration) Wyoming trong Home Assistant.
+---
 
 ## Cài đặt nhanh bằng Docker Compose
 
-Đây là cách phù hợp với hầu hết người dùng. Tệp Compose (Compose file) dùng ảnh Docker dựng sẵn (pre-built Docker image), nên bạn không cần tải mã nguồn về hoặc tự dựng ảnh.
+Đây là phương thức khuyến nghị và tiện lợi nhất cho phần lớn người dùng. Tệp Compose sử dụng ảnh Docker dựng sẵn (pre-built image), bạn không cần tải mã nguồn hay tự biên dịch.
+
+### 1. Tải tệp cấu hình và khởi chạy
+
+Chạy lệnh sau trên máy chủ Docker của bạn:
 
 ```bash
 curl -LO https://raw.githubusercontent.com/luuquangvu/wyoming-vietnamese/main/docker-compose.online.yaml
 docker compose -f docker-compose.online.yaml up -d
 ```
 
-Xem nhật ký (log) khởi động bằng:
+### 2. Theo dõi quá trình nạp mô hình
+
+Ở lần chạy đầu tiên, container sẽ tự động tải mô hình nhận diện giọng nói và các giọng TTS được cấu hình (thường mất 1-3 phút tùy tốc độ mạng):
 
 ```bash
 docker logs -f wyoming-vietnamese
 ```
 
-Lần đầu container có thể mất vài phút vì phải tải mô hình. Hãy chờ tới khi container khởi động hoàn tất trước khi kết nối Home Assistant.
+Khi nhật ký hiển thị thông báo sẵn sàng (ví dụ):
 
-### Kết nối với Home Assistant
+```text
+Wyoming STT/TTS service is ready at tcp://0.0.0.0:10300
+```
 
-Trong Home Assistant:
+(hoặc dòng nhật ký chứa `Wyoming STT/TTS service is ready at ...`), dịch vụ đã sẵn sàng để kết nối với Home Assistant!
 
-1. Mở **Cài đặt → Thiết bị & dịch vụ**.
-2. Chọn **Thêm tích hợp** và tìm **Wyoming Protocol**.
-3. Nhập địa chỉ IP hoặc tên máy đang chạy container.
-4. Nhập cổng `10300`, rồi hoàn tất việc thêm tích hợp.
-5. Mở **Cài đặt → Trợ lý giọng nói**, chọn chuỗi xử lý Assist bạn đang dùng và đặt Wyoming Vietnamese làm dịch vụ STT và TTS.
+---
 
-Sau đó, thử một câu đơn giản trong Assist. Dịch vụ sẽ xuất hiện với cả khả năng nhận diện tiếng Việt và các giọng đọc TTS đã cấu hình.
+## Kết nối với Home Assistant
 
-## Chọn giọng đọc
+Sau khi container đã khởi động thành công:
 
-Mở `docker-compose.online.yaml` và sửa `TTS_VOICE`. Bạn có thể đặt một hoặc nhiều mã giọng, ngăn cách bằng dấu phẩy hoặc khoảng trắng. Mã đầu tiên là giọng mặc định; các mã còn lại sẽ được Home Assistant hiển thị để lựa chọn.
+1. Trong Home Assistant, vào **Cài đặt (Settings) > Thiết bị & Dịch vụ (Devices & Services)**.
+2. Nhấn nút **Thêm tích hợp (Add Integration)** ở góc dưới bên phải.
+3. Tìm kiếm **Wyoming Protocol** và chọn nó.
+4. Điền thông tin kết nối:
+   - **Host**: Địa chỉ IP của máy đang chạy Docker (ví dụ: `192.168.1.100`; nếu Home Assistant chạy chung trên cùng một máy, bạn có thể nhập IP nội bộ của máy đó).
+   - **Port**: `10300` (hoặc cổng host đã ánh xạ ở mục `ports` trong Docker Compose).
+5. Nhấn **Gửi (Submit)**. Home Assistant sẽ tự động nhận diện cả 2 dịch vụ STT và TTS tiếng Việt.
+6. Vào **Cài đặt (Settings) > Trợ lý giọng nói (Voice Assistants)**, chọn trợ lý bạn đang dùng (Assist pipeline):
+   - **Chuyển lời nói thành văn bản (Speech-to-text)**: Chọn `wyoming-vietnamese`.
+   - **Chuyển văn bản thành lời nói (Text-to-speech)**: Chọn `wyoming-vietnamese` và chọn giọng đọc ưa thích.
+7. Nhấn vào biểu tượng **Assist** ở góc trên cùng bên phải giao diện Home Assistant để thử ra lệnh (ví dụ: _"Mấy giờ rồi?"_, _"Bật đèn phòng khách"_).
 
-Ví dụ:
+---
+
+## Danh sách giọng đọc và tùy chỉnh giọng
+
+Mở tệp `docker-compose.online.yaml` và chỉnh sửa biến `TTS_VOICE`. Bạn có thể khai báo một hoặc nhiều mã giọng, ngăn cách bằng dấu phẩy hoặc khoảng trắng:
+
+- Mã giọng đứng **đầu tiên** sẽ là giọng đọc mặc định.
+- Các giọng còn lại sẽ xuất hiện trong danh sách lựa chọn của Home Assistant.
 
 ```yaml
 environment:
+  WYOMING_PORT: 10300
   TTS_VOICE: "ngoc-huyen-moi, duy-onyx-moi, thanh-phuong-viettel, ngoc-ngan, mai-phuong"
+  LOG_LEVEL: "info"
 ```
 
-Các biến môi trường (environment variable) chỉ được đọc khi container được tạo. Vì vậy, sau khi sửa `TTS_VOICE` hoặc bất kỳ biến nào khác trong phần `environment`, hãy **tạo lại (recreate) container**. Chỉ khởi động lại (restart) bằng `docker restart` sẽ không áp dụng cấu hình mới.
+> [!TIP]
+> Biến môi trường chỉ được nạp khi container được tạo mới. Sau khi thay đổi `TTS_VOICE`, hãy chạy lệnh sau để áp dụng:
+>
+> ```bash
+> docker compose -f docker-compose.online.yaml up -d --force-recreate
+> ```
 
-Áp dụng cấu hình mới bằng:
+### Bảng mã giọng đọc có sẵn
 
-```bash
-docker compose -f docker-compose.online.yaml up -d --force-recreate
-```
+| Mã giọng (`id`)        | Tên hiển thị         | Vùng miền / Đặc trưng                                                  | Mặc định |
+| :--------------------- | :------------------- | :--------------------------------------------------------------------- | :------: |
+| `ngoc-huyen-moi`       | Ngọc Huyền (mới)     | Nữ miền Bắc (tự nhiên, trong trẻo, phong cách đọc truyện và review)    |  **Có**  |
+| `ban-mai`              | Ban Mai              | Nữ miền Bắc (dịu dàng, truyền cảm, phong cách phát thanh viên)         |          |
+| `thanh-phuong-viettel` | Thanh Phương Viettel | Nữ miền Bắc (rõ ràng, lưu loát, chuẩn phong cách trợ lý và tổng đài)   |          |
+| `mai-phuong`           | Mai Phương           | Nữ miền Bắc (nhẹ nhàng, ấm áp, phong cách đọc sách nói)                |          |
+| `phuong-trang`         | Phương Trang         | Nữ miền Bắc (trầm ấm, truyền cảm, phong cách thuyết minh)              |          |
+| `duy-onyx-moi`         | Duy Onyx (mới)       | Nam miền Bắc (trầm ấm, tự nhiên, phong cách trợ lý nam)                |          |
+| `duy-oryx`             | Duy Oryx             | Nam miền Bắc (trầm, đĩnh đạc)                                          |          |
+| `minh-khang`           | Minh Khang           | Nam miền Bắc (trẻ trung, cuốn hút, phong cách kênh Kiến Giải Mã)       |          |
+| `minh-quang`           | Minh Quang           | Nam miền Bắc (chững chạc, rõ ràng, phong cách đọc tin tức)             |          |
+| `manh-dung`            | Mạnh Dũng            | Nam miền Bắc (hào sảng, dứt khoát, phong cách ký sự và tài liệu)       |          |
+| `chieu-thanh`          | Chiếu Thành          | Nam miền Nam (trầm ấm, phong cách kể chuyện kiếm hiệp và dã sử)        |          |
+| `thien-tam`            | Thiện Tâm            | Nam miền Nam (từ tốn, sâu lắng, phong cách tâm sự và audio Phật giáo)  |          |
+| `ngoc-ngan`            | Ngọc Ngạn            | Nam miền Bắc (trầm, hóm hỉnh, phong cách MC dẫn chuyện Paris By Night) |          |
+| `tran-thanh`           | Trấn Thành           | Nam miền Nam (hoạt ngôn, biểu cảm, phong cách nghệ sĩ hài hước)        |          |
+| `viet-thao`            | Việt Thảo            | Nam miền Nam (hóm hỉnh, gần gũi, phong cách MC sân khấu)               |          |
+| `tai-an`               | Tài An               | Nam miền Bắc (rành mạch, phong cách thuyết minh lịch sử CD Media)      |          |
+| `lac-phi`              | Lạc Phi              | Nữ miền Bắc (truyền cảm, phong cách thuyết minh và review phim)        |          |
+| `my-tam`               | Mỹ Tâm               | Nữ miền Nam / Miền Trung (giọng ca sĩ Mỹ Tâm, âm vị chuẩn toàn quốc)   |          |
+| `my-tam-real`          | Mỹ Tâm Real          | Nữ miền Nam (giọng ca sĩ Mỹ Tâm, ngữ điệu miền Nam chân thực)          |          |
+| `adam`                 | adam                 | Nam quốc tế (chất giọng ElevenLabs Adam đọc tiếng Việt)                |          |
 
-Các giọng có sẵn:
+---
 
-| Mã                     | Tên hiển thị         | Mặc định |
-| ---------------------- | -------------------- | :------: |
-| `ban-mai`              | Ban Mai              |          |
-| `chieu-thanh`          | Chiếu Thành          |          |
-| `duy-onyx-moi`         | Duy Onyx (mới)       |          |
-| `duy-oryx`             | Duy Oryx             |          |
-| `lac-phi`              | Lạc Phi              |          |
-| `mai-phuong`           | Mai Phương           |          |
-| `minh-khang`           | Minh Khang           |          |
-| `minh-quang`           | Minh Quang           |          |
-| `manh-dung`            | Mạnh Dũng            |          |
-| `my-tam`               | Mỹ Tâm               |          |
-| `my-tam-real`          | Mỹ Tâm Real          |          |
-| `ngoc-huyen-moi`       | Ngọc Huyền (mới)     |    ✓     |
-| `ngoc-ngan`            | Ngọc Ngạn            |          |
-| `phuong-trang`         | Phương Trang         |          |
-| `thanh-phuong-viettel` | Thanh Phương Viettel |          |
-| `thien-tam`            | Thiện Tâm            |          |
-| `tran-thanh`           | Trấn Thành           |          |
-| `tai-an`               | Tài An               |          |
-| `viet-thao`            | Việt Thảo            |          |
-| `adam`                 | adam                 |          |
+## Cấu hình chi tiết và tùy chọn nâng cao
 
-## Các cách chạy khác
+### Các thiết lập mặc định trong Compose
 
-### Cài đặt dưới dạng Home Assistant Add-on
+- `WYOMING_PORT`: Cổng TCP dịch vụ lắng nghe (mặc định: `10300`).
+- `TTS_VOICE`: Danh sách các giọng TTS được tải và kích hoạt (giọng đầu tiên là mặc định).
+- `LOG_LEVEL`: Mức độ chi tiết của nhật ký (`info`, `debug`, `warning`, `error`).
 
-Nếu bạn đang sử dụng Home Assistant OS hoặc Supervised và muốn cài đặt trực tiếp dưới dạng App (Add-on) thay vì chạy container Docker độc lập, vui lòng xem hướng dẫn chi tiết tại kho lưu trữ [luuquangvu/ha-addons](https://github.com/luuquangvu/ha-addons).
+### Tùy chọn nâng cao (Dành cho người dùng chuyên sâu)
 
-### Chạy trực tiếp bằng Docker
+Khi cần tối ưu hóa hoặc kiểm soát chi tiết hơn, bạn có thể thêm các biến môi trường sau vào phần `environment` của tệp Compose:
 
-Nếu bạn không dùng Docker Compose, có thể chạy trực tiếp ảnh Docker:
+| Biến môi trường            |      Mặc định      | Ý nghĩa và Hướng dẫn                                                                                                            |
+| :------------------------- | :----------------: | :------------------------------------------------------------------------------------------------------------------------------ |
+| `TZ`                       | `Asia/Ho_Chi_Minh` | Múi giờ địa phương để hiển thị thời gian trong log chính xác.                                                                   |
+| `CPU_THREADS`              |        `0`         | Số luồng CPU sử dụng cho suy luận (`0` là tự động dùng tất cả luồng khả dụng).                                                  |
+| `OFFLINE`                  |      `false`       | Đặt `"true"` sau khi đã tải đủ mô hình để chỉ nạp mô hình từ bộ nhớ đệm cục bộ (báo lỗi nếu thiếu file thay vì kết nối tải về). |
+| `TTS_PARAGRAPH_SILENCE_MS` |       `700`        | Khoảng lặng tối thiểu giữa các đoạn văn hoặc ngắt dòng (đơn vị: mili-giây).                                                     |
+| `TTS_SENTENCE_SILENCE_MS`  |       `500`        | Khoảng lặng tối thiểu giữa các câu kết thúc bằng dấu `.`, `!`, `?`. Tăng giá trị này nếu muốn giọng đọc chậm rãi hơn.           |
+| `TTS_CLAUSE_SILENCE_MS`    |       `300`        | Khoảng lặng tối thiểu sau dấu phẩy `,`, chấm phẩy `;`, hai chấm `:` trong câu.                                                  |
+
+> [!IMPORTANT]
+> Hai volume `cache` và `models` lưu trữ toàn bộ mô hình đã tải về. Không nên xóa hai volume này để container khởi động tức thì ở các lần sau và có thể hoạt động ngoại tuyến.
+
+---
+
+## Các phương án triển khai khác
+
+### 1. Cài đặt dưới dạng Home Assistant Add-on
+
+Nếu bạn đang dùng **Home Assistant OS** (HAOS) hoặc **Supervised** và muốn cài đặt trực tiếp dạng Add-on từ giao diện Home Assistant, vui lòng tham khảo kho Add-on: [luuquangvu/ha-addons](https://github.com/luuquangvu/ha-addons).
+
+### 2. Chạy nhanh bằng lệnh `docker run`
+
+Nếu không muốn dùng Docker Compose:
 
 ```bash
 docker run -d \
@@ -116,13 +171,15 @@ docker run -d \
   ghcr.io/luuquangvu/wyoming-vietnamese:latest
 ```
 
-Nếu thay đổi một biến `-e`, hãy xóa container cũ rồi chạy lại lệnh trên. Hai phân vùng lưu trữ có tên (named volume) vẫn được giữ nguyên, nên bạn không phải tải lại mô hình:
+Nếu thay đổi một biến `-e` hoặc cập nhật ảnh container, hãy xóa container cũ rồi chạy lại lệnh trên. Hai volume có tên (`wyoming-vietnamese-cache` và `wyoming-vietnamese-models`) vẫn được giữ nguyên, nên mô hình đã tải về không bị mất:
 
 ```bash
 docker rm -f wyoming-vietnamese
 ```
 
-### Tự dựng ảnh Docker (build image) từ mã nguồn
+### 3. Tự dựng ảnh Docker từ mã nguồn
+
+Dành cho lập trình viên hoặc người muốn tùy biến mã nguồn:
 
 ```bash
 git clone https://github.com/luuquangvu/wyoming-vietnamese.git
@@ -130,61 +187,52 @@ cd wyoming-vietnamese
 docker compose up --build -d
 ```
 
-Tệp [`docker-compose.yaml`](docker-compose.yaml) chứa cùng nhóm cấu hình môi trường như ảnh dựng sẵn và phù hợp khi bạn muốn tự dựng phiên bản của riêng mình.
+---
 
-## Chạy ngoại tuyến sau lần đầu
+## Xử lý sự cố thường gặp
 
-Sau khi container đã khởi động thành công và tải đủ mô hình, đặt:
+### Home Assistant báo lỗi không kết nối được tới Wyoming Protocol
 
-```yaml
-environment:
-  OFFLINE: "true"
-```
+- Kiểm tra container có đang chạy không: `docker ps`.
+- Xem nhật ký container: `docker logs wyoming-vietnamese`.
+- Đảm bảo cổng `10300` không bị chặn bởi tường lửa (UFW, iptables, Windows Firewall...).
+- Nhập chính xác địa chỉ IP của máy chủ Docker, tránh dùng `localhost` nếu Home Assistant và Docker nằm trên hai thiết bị khác nhau.
 
-Tạo lại container để áp dụng; chỉ khởi động lại container là chưa đủ. Ở chế độ này, dịch vụ chỉ sử dụng các tệp đã có trong phân vùng lưu trữ (volume); nếu thiếu mô hình, container sẽ báo lỗi thay vì cố kết nối Internet.
+### Container khởi động chậm hoặc dừng đột ngột ở lần đầu
 
-## Tùy chỉnh thường gặp
+- Kiểm tra kết nối Internet của máy chủ Docker. Lần đầu cần tải mô hình nhận diện giọng nói (~150MB) và các giọng đọc (~60MB mỗi giọng).
+- Nếu bạn vô tình bật `OFFLINE: "true"` trước khi tải đủ mô hình, container sẽ báo lỗi. Đổi lại `OFFLINE: "false"`, chạy lại và đợi nạp xong.
 
-Các giá trị sau có sẵn trong tệp Compose:
+### Đã đổi giọng trong TTS_VOICE nhưng Home Assistant không hiện giọng mới
 
-- `CPU_THREADS`: số luồng CPU dùng cho suy luận; để `0` để tự động dùng số luồng phù hợp.
-- `TTS_SENTENCE_SILENCE_MS`: khoảng nghỉ giữa các câu. Tăng giá trị này nếu giọng đọc hơi nhanh.
-- `TTS_CLAUSE_SILENCE_MS`: khoảng nghỉ sau dấu phẩy và các dấu câu trong mệnh đề.
-- `TTS_SILENCE_JITTER_PERCENT`: thêm một chút thay đổi ngẫu nhiên vào khoảng nghỉ để câu đọc tự nhiên hơn.
-- `LOG_LEVEL`: đặt `debug` khi cần xem nhật ký chi tiết; thông thường nên giữ `info`.
+- Biến môi trường chỉ được nạp lại khi tái tạo container. Hãy chạy:
 
-Không nên xóa hai phân vùng lưu trữ (volume) `cache` và `models` nếu bạn muốn giữ mô hình đã tải. Docker Compose sẽ giữ chúng qua các lần cập nhật hoặc tạo lại container.
+  ```bash
+  docker compose -f docker-compose.online.yaml up -d --force-recreate
+  ```
 
-## Xử lý sự cố
+- Sau đó, vào Home Assistant, mở tích hợp **Wyoming Protocol** và chọn **Tải lại (Reload)**.
 
-> **Không thêm được Wyoming trong Home Assistant**
+---
 
-- Kiểm tra container đang chạy: `docker ps`.
-- Xem nhật ký: `docker logs wyoming-vietnamese`.
-- Đảm bảo Home Assistant truy cập được máy chạy Docker và cổng TCP `10300` không bị tường lửa (firewall) chặn.
-- Nếu container chạy trên máy khác, hãy nhập IP của máy đó, không phải `localhost` của Home Assistant.
+## Đóng góp và Hỗ trợ
 
-> **Container vẫn đang tải hoặc khởi động chưa xong**
+- Báo lỗi hoặc đề xuất tính năng mới qua [GitHub Issues](https://github.com/luuquangvu/wyoming-vietnamese/issues). Vui lòng đính kèm nhật ký liên quan (và che đi các thông tin nhạy cảm).
+- Mọi đóng góp cải tiến mã nguồn (Pull Requests) đều được chào đón!
 
-Theo dõi nhật ký bằng `docker logs -f wyoming-vietnamese`. Lần đầu cần Internet và có thể lâu hơn những lần sau. Nếu bật `OFFLINE: "true"` trước khi tải đủ mô hình, hãy đổi lại thành `"false"`, tạo lại container, rồi chờ quá trình tải hoàn tất.
+---
 
-> **Đổi giọng nhưng Home Assistant vẫn đọc bằng giọng cũ**
+## Lời cảm ơn
 
-Kiểm tra mã giọng trong bảng trên, tạo lại container để nạp biến `TTS_VOICE`, rồi mở lại trang Trợ lý giọng nói trong Home Assistant.
+Dự án được xây dựng dựa trên các công trình mã nguồn mở xuất sắc:
 
-## Đóng góp
+- [nghimestudio/nghitts](https://github.com/nghimestudio/nghitts): Cung cấp các mô hình giọng nói tiếng Việt (TTS) chất lượng cao.
+- [hynt](https://huggingface.co/hynt): Cung cấp mô hình nhận diện giọng nói tiếng Việt `Zipformer-30M-RNNT-6000h` (STT).
+- [k2-fsa/sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx): Bộ máy suy luận offline tối ưu cao cho cả STT và TTS.
+- [Wyoming Protocol](https://github.com/OHF-Voice/wyoming): Chuẩn giao tiếp giọng nói mở cho hệ sinh thái Home Assistant.
 
-Nếu bạn gặp lỗi, hãy gửi một báo cáo lỗi kèm cấu hình và nhật ký liên quan. Nhớ xóa thông tin riêng tư trước khi đăng để cộng đồng dễ dàng hỗ trợ và cải thiện dự án.
-
-## Ghi công
-
-Dự án sử dụng các công trình mã nguồn mở sau:
-
-- [nghimestudio/nghitts](https://github.com/nghimestudio/nghitts) cung cấp các mô hình giọng đọc tiếng Việt.
-- [hynt](https://huggingface.co/hynt) cung cấp mô hình nhận diện `Zipformer-30M-RNNT-6000h`.
-- [k2-fsa/sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) cung cấp bộ máy suy luận STT và TTS.
-- [Wyoming Protocol](https://github.com/OHF-Voice/wyoming) giúp kết nối dịch vụ với hệ sinh thái Home Assistant Voice.
+---
 
 ## Giấy phép
 
-Dự án được phát hành dưới **Giấy phép MIT**. Xem tệp [LICENSE](LICENSE) để biết thêm thông tin chi tiết.
+Dự án được phát hành dưới giấy phép mã nguồn mở **MIT License**. Xem chi tiết tại tệp [LICENSE](LICENSE).

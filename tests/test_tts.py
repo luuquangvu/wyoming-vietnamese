@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import random
 import sys
 import threading
 import types
@@ -31,7 +30,6 @@ from wyoming.tts import (
 from tests.helpers import MemoryWriter, make_reader, stream_writer, written_events
 from wyoming_vietnamese.cache import BoundedLruCache
 from wyoming_vietnamese.const import (
-    MAX_TTS_SILENCE_MS,
     TTS_CONFIG_FILE,
     TTS_MODEL_FILE,
     TTS_SAMPLE_RATE,
@@ -47,7 +45,6 @@ from wyoming_vietnamese.tts import (
     TTSEventHandler,
     _audio_to_pcm_bytes,
     _boundary_kind,
-    _jittered_silence_ms,
     _next_pcm_chunk,
     _resolve_nghitts_espeak_data,
     _silence_pcm,
@@ -150,8 +147,7 @@ def make_handler(
     write_timeout: float = 5,
     sentence_silence_ms: int = 0,
     clause_silence_ms: int = 0,
-    silence_jitter_percent: int = 0,
-    rng: random.Random | None = None,
+    paragraph_silence_ms: int = 0,
 ) -> tuple[TTSEventHandler, asyncio.StreamWriter]:
     """Build test support for make handler."""
     tts = cast(TTSEngine, engine or FakeTTS())
@@ -175,8 +171,7 @@ def make_handler(
         write_timeout=write_timeout,
         sentence_silence_ms=sentence_silence_ms,
         clause_silence_ms=clause_silence_ms,
-        silence_jitter_percent=silence_jitter_percent,
-        rng=rng,
+        paragraph_silence_ms=paragraph_silence_ms,
     )
     return handler, stream
 
@@ -404,6 +399,11 @@ def test_boundary_kind_classifies_trailing_punctuation() -> None:
     assert _boundary_kind("Sài Gòn\u2014Hà Nội") == "none"
     assert _boundary_kind("một; hai") == "none"
     assert _boundary_kind("   ") == "none"
+    assert _boundary_kind("Đoạn một", "\n") == "paragraph"
+    assert _boundary_kind("Câu một.", "\n\n") == "paragraph"
+    assert _boundary_kind("Đoạn một\nĐoạn hai,") == "clause"
+    assert _boundary_kind("Đoạn một\nĐoạn hai.") == "sentence"
+    assert _boundary_kind("Đoạn một\nĐoạn hai") == "none"
 
 
 def test_silence_pcm_matches_requested_duration() -> None:
@@ -414,50 +414,95 @@ def test_silence_pcm_matches_requested_duration() -> None:
         _silence_pcm(-1, 22050)
 
 
-def test_jittered_silence_stays_inside_the_configured_spread() -> None:
-    """Test randomized pauses vary around the base duration without leaving its bounds."""
-    rng = random.Random(1234)
-    draws = {_jittered_silence_ms(200, 25, rng) for _ in range(200)}
-    assert len(draws) > 1
-    assert min(draws) >= 150
-    assert max(draws) <= 250
-
-    assert _jittered_silence_ms(200, 0, rng) == 200
-    assert _jittered_silence_ms(0, 50, rng) == 0
-    assert _jittered_silence_ms(MAX_TTS_SILENCE_MS, 100, random.Random(0)) <= MAX_TTS_SILENCE_MS
-    with pytest.raises(ValueError, match="Silence duration must not be negative"):
-        _jittered_silence_ms(-1, 25, rng)
-    with pytest.raises(ValueError, match="Silence jitter must not be negative"):
-        _jittered_silence_ms(200, -1, rng)
-
-
-async def test_tts_randomizes_each_boundary_pause() -> None:
-    """Test consecutive sentence boundaries receive independently drawn pauses."""
+async def test_tts_pads_deterministic_boundary_pauses() -> None:
+    """Test consecutive sentence, clause, and paragraph boundaries receive exact pauses."""
     engine = FakeTTS([np.array([0.5], dtype=np.float32)])
     handler, writer = make_handler(
         engine,
+        clause_silence_ms=100,
         sentence_silence_ms=200,
-        silence_jitter_percent=25,
-        rng=random.Random(7),
+        paragraph_silence_ms=300,
     )
     assert await handler.handle_event(SynthesizeStart().event()) is True
-    text = "Một hai ba. Bốn năm sáu. Bảy tám chín. Mười mười một"
+    text = "Một hai ba bốn năm sáu, bảy tám chín mười. Mười một mười hai.\n\nMười ba mười bốn"
     assert await handler.handle_event(SynthesizeChunk(text=text).event()) is True
     assert await handler.handle_event(SynthesizeStop().event()) is True
 
     speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
     pause_lengths = [len(part) for part in written_audio(writer).split(speech) if part]
     assert len(pause_lengths) == 3
-    assert len(set(pause_lengths)) > 1
-    minimum = round(engine.sample_rate * 0.150) * TTS_SAMPLE_WIDTH
-    maximum = round(engine.sample_rate * 0.250) * TTS_SAMPLE_WIDTH
-    assert all(minimum <= length <= maximum for length in pause_lengths)
+    clause_bytes = round(engine.sample_rate * 0.100) * TTS_SAMPLE_WIDTH
+    sentence_bytes = round(engine.sample_rate * 0.200) * TTS_SAMPLE_WIDTH
+    paragraph_bytes = round(engine.sample_rate * 0.300) * TTS_SAMPLE_WIDTH
+    assert pause_lengths == [clause_bytes, sentence_bytes, paragraph_bytes]
 
 
-async def test_tts_pads_line_breaks_like_sentence_boundaries() -> None:
-    """Test unpunctuated lines are separated instead of being concatenated bare."""
+@pytest.mark.parametrize(
+    ("clause_silence_ms", "sentence_silence_ms", "paragraph_silence_ms"),
+    [
+        (0, 0, 0),
+        (0, 200, 300),
+        (100, 0, 300),
+        (100, 200, 0),
+    ],
+)
+async def test_tts_pads_zero_duration_boundary_pauses(
+    clause_silence_ms: int,
+    sentence_silence_ms: int,
+    paragraph_silence_ms: int,
+) -> None:
+    """Test zero-duration pauses insert no extra PCM bytes for boundary tiers."""
     engine = FakeTTS([np.array([0.5], dtype=np.float32)])
-    handler, writer = make_handler(engine, sentence_silence_ms=100, clause_silence_ms=20)
+    handler, writer = make_handler(
+        engine,
+        clause_silence_ms=clause_silence_ms,
+        sentence_silence_ms=sentence_silence_ms,
+        paragraph_silence_ms=paragraph_silence_ms,
+    )
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    text = "Một hai ba bốn năm sáu, bảy tám chín mười. Mười một mười hai.\n\nMười ba mười bốn"
+    assert await handler.handle_event(SynthesizeChunk(text=text).event()) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+
+    speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+    assert engine.calls == [
+        ("Một hai ba bốn năm sáu,", None),
+        ("bảy tám chín mười.", None),
+        ("Mười một mười hai.", None),
+        ("Mười ba mười bốn", None),
+    ]
+    clause_silence = bytes(
+        round(engine.sample_rate * (clause_silence_ms / 1000)) * TTS_SAMPLE_WIDTH
+    )
+    sentence_silence = bytes(
+        round(engine.sample_rate * (sentence_silence_ms / 1000)) * TTS_SAMPLE_WIDTH
+    )
+    paragraph_silence = bytes(
+        round(engine.sample_rate * (paragraph_silence_ms / 1000)) * TTS_SAMPLE_WIDTH
+    )
+
+    expected_audio = (
+        speech + clause_silence + speech + sentence_silence + speech + paragraph_silence + speech
+    )
+    audio = written_audio(writer)
+    assert audio == expected_audio
+
+    expected_pause_lengths = [
+        len(silence) for silence in (clause_silence, sentence_silence, paragraph_silence) if silence
+    ]
+    pause_lengths = [len(part) for part in audio.split(speech) if part]
+    assert pause_lengths == expected_pause_lengths
+
+
+async def test_tts_pads_line_breaks_as_paragraph_boundaries() -> None:
+    """Test unpunctuated lines are separated by paragraph silence instead of being bare."""
+    engine = FakeTTS([np.array([0.5], dtype=np.float32)])
+    handler, writer = make_handler(
+        engine,
+        paragraph_silence_ms=100,
+        sentence_silence_ms=50,
+        clause_silence_ms=20,
+    )
     assert await handler.handle_event(SynthesizeStart().event()) is True
     assert await handler.handle_event(SynthesizeChunk(text="Một\nHai\nBa").event()) is True
     assert await handler.handle_event(SynthesizeStop().event()) is True
@@ -466,6 +511,79 @@ async def test_tts_pads_line_breaks_like_sentence_boundaries() -> None:
     silence = bytes(round(engine.sample_rate * 0.1) * TTS_SAMPLE_WIDTH)
     assert engine.calls == [("Một", None), ("Hai", None), ("Ba", None)]
     assert written_audio(writer) == speech + silence + speech + silence + speech
+
+
+async def test_tts_pads_paragraph_silence_when_newline_arrives_in_later_chunk() -> None:
+    """Test paragraph silence is padded when the line break arrives in a separate chunk."""
+    engine = FakeTTS([np.array([0.5], dtype=np.float32)])
+    handler, writer = make_handler(
+        engine,
+        paragraph_silence_ms=100,
+        sentence_silence_ms=50,
+        clause_silence_ms=20,
+    )
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Đoạn thứ nhất").event()) is True
+    assert engine.calls == []
+
+    assert await handler.handle_event(SynthesizeChunk(text="\n\n").event()) is True
+    assert engine.calls == [("Đoạn thứ nhất", None)]
+
+    assert await handler.handle_event(SynthesizeChunk(text="Đoạn thứ hai").event()) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+    assert engine.calls == [("Đoạn thứ nhất", None), ("Đoạn thứ hai", None)]
+
+    speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+    paragraph_silence = bytes(round(engine.sample_rate * 0.100) * TTS_SAMPLE_WIDTH)
+    assert written_audio(writer) == speech + paragraph_silence + speech
+
+
+async def test_tts_pads_paragraph_silence_when_crlf_split_across_chunks() -> None:
+    """Test paragraph silence is padded when CRLF is split across chunk boundaries."""
+    engine = FakeTTS([np.array([0.5], dtype=np.float32)])
+    handler, writer = make_handler(
+        engine,
+        paragraph_silence_ms=100,
+        sentence_silence_ms=50,
+        clause_silence_ms=20,
+    )
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Đoạn thứ nhất\r").event()) is True
+    assert engine.calls == []
+
+    assert await handler.handle_event(SynthesizeChunk(text="\nĐoạn thứ hai").event()) is True
+    assert engine.calls == [("Đoạn thứ nhất", None)]
+
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+    assert engine.calls == [("Đoạn thứ nhất", None), ("Đoạn thứ hai", None)]
+
+    speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+    paragraph_silence = bytes(round(engine.sample_rate * 0.100) * TTS_SAMPLE_WIDTH)
+    assert written_audio(writer) == speech + paragraph_silence + speech
+
+
+async def test_tts_pads_paragraph_silence_when_repeated_newlines_span_chunks() -> None:
+    """Test paragraph silence is padded without extra pauses when newlines span chunks."""
+    engine = FakeTTS([np.array([0.5], dtype=np.float32)])
+    handler, writer = make_handler(
+        engine,
+        paragraph_silence_ms=100,
+        sentence_silence_ms=50,
+        clause_silence_ms=20,
+    )
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Đoạn thứ nhất\n").event()) is True
+    assert engine.calls == [("Đoạn thứ nhất", None)]
+
+    assert await handler.handle_event(SynthesizeChunk(text="\n\nĐoạn thứ hai").event()) is True
+    assert engine.calls == [("Đoạn thứ nhất", None)]
+
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+    assert engine.calls == [("Đoạn thứ nhất", None), ("Đoạn thứ hai", None)]
+
+    speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+    paragraph_silence = bytes(round(engine.sample_rate * 0.100) * TTS_SAMPLE_WIDTH)
+    assert written_audio(writer) == speech + paragraph_silence + speech
 
 
 async def test_tts_pads_sentence_pause_between_streamed_segments() -> None:
@@ -1230,8 +1348,14 @@ def test_split_clause_text_merges_a_short_tail_without_rewriting_it() -> None:
     spaced = "Tuyến đường Sài Gòn - Hà Nội dài"
     assert StreamClauseDetector.split_clause_text(spaced) == [spaced]
 
+    clause_tail = "Một câu đủ dài để tách,   đuôi"
+    assert StreamClauseDetector.split_clause_text(clause_tail) == [clause_tail]
+
     newline = "Một câu đủ dài để tách,\nđuôi"
-    assert StreamClauseDetector.split_clause_text(newline) == [newline]
+    assert StreamClauseDetector.split_clause_text(newline) == [
+        "Một câu đủ dài để tách,",
+        "đuôi",
+    ]
 
 
 def test_stream_clause_detector_still_splits_punctuation_after_digits() -> None:
@@ -1250,6 +1374,137 @@ def test_stream_clause_detector_waits_for_a_number_split_across_chunks() -> None
     assert not list(detector.add_chunk("Nhiệt độ ngoài trời là 33,"))
     assert list(detector.add_chunk("8 độ C. Trời đẹp")) == ["Nhiệt độ ngoài trời là 33,8 độ C."]
     assert detector.finish() == "Trời đẹp"
+
+
+def test_stream_clause_detector_splits_distinct_paragraph_sentence_clause_tiers() -> None:
+    """Test paragraph, sentence, and clause tiers are detected distinctly."""
+    detector = StreamClauseDetector(min_clause_chars=15)
+    text = "Vế câu này đủ dài, câu tiếp theo ngắn vừa. Dòng này ngắt tiếp\nĐoạn mới"
+    pairs = detector.add_chunk_with_separators(text)
+    assert pairs == [
+        ("Vế câu này đủ dài,", " "),
+        ("câu tiếp theo ngắn vừa.", " "),
+        ("Dòng này ngắt tiếp", "\n"),
+    ]
+    assert [_boundary_kind(clause, sep) for clause, sep in pairs] == [
+        "clause",
+        "sentence",
+        "paragraph",
+    ]
+    assert detector.finish() == "Đoạn mới"
+
+
+def test_stream_clause_detector_splits_paragraph_separator_across_chunks() -> None:
+    """Test multi-character paragraph separators split across chunk boundaries."""
+    detector = StreamClauseDetector()
+
+    # Case 1: CRLF multi-character separator split across chunk boundaries (\r then \n).
+    assert detector.add_chunk_with_separators("Đoạn một này đủ dài\r") == []
+    pairs1 = detector.add_chunk_with_separators("\nĐoạn hai bắt đầu")
+    assert pairs1 == [("Đoạn một này đủ dài", "\r\n")]
+    assert _boundary_kind(pairs1[0][0], pairs1[0][1]) == "paragraph"
+
+    # Case 2: Consecutive newlines (\n\n) split across chunks (\n in chunk 2, \n in chunk 3).
+    # Chunk 2 emits paragraph boundary (\n) immediately; chunk 3 consumes the next \n
+    # without emitting an empty segment or extra pause.
+    pairs2 = detector.add_chunk_with_separators(" tiếp tục đoạn hai\n")
+    assert pairs2 == [("Đoạn hai bắt đầu tiếp tục đoạn hai", "\n")]
+    assert _boundary_kind(pairs2[0][0], pairs2[0][1]) == "paragraph"
+
+    pairs3 = detector.add_chunk_with_separators("\nĐoạn ba cuối cùng")
+    assert pairs3 == []
+    assert detector.finish() == "Đoạn ba cuối cùng"
+
+
+def test_split_clause_text_with_separators_preserves_distinct_tiers() -> None:
+    """Test static text splitting extracts clause, sentence, and paragraph separators."""
+    text = (
+        "Vế câu này đủ dài, câu tiếp theo ngắn vừa. Dòng này ngắt tiếp\n"
+        "Đoạn mới kết thúc ở đây đủ dài"
+    )
+    pairs = StreamClauseDetector.split_clause_text_with_separators(text)
+    assert pairs == [
+        ("Vế câu này đủ dài,", " "),
+        ("câu tiếp theo ngắn vừa.", " "),
+        ("Dòng này ngắt tiếp", "\n"),
+        ("Đoạn mới kết thúc ở đây đủ dài", ""),
+    ]
+    assert [_boundary_kind(clause, sep) for clause, sep in pairs[:-1]] == [
+        "clause",
+        "sentence",
+        "paragraph",
+    ]
+    assert pairs[-1][1] == ""
+
+
+def test_split_clause_text_with_separators_handles_crlf_repeated_and_trailing_breaks() -> None:
+    """Test static splitting handles CRLF, repeated, and trailing paragraph separators."""
+    text = (
+        "Vế câu này đủ dài,\r\ncâu tiếp theo ngắn vừa.\n\n\nĐoạn ba này kết thúc ở đây đủ dài.\n\n"
+    )
+    pairs = StreamClauseDetector.split_clause_text_with_separators(text)
+    assert pairs == [
+        ("Vế câu này đủ dài,", "\r\n"),
+        ("câu tiếp theo ngắn vừa.", "\n\n\n"),
+        ("Đoạn ba này kết thúc ở đây đủ dài.", ""),
+    ]
+    assert [_boundary_kind(clause, sep) for clause, sep in pairs[:-1]] == [
+        "paragraph",
+        "paragraph",
+    ]
+    # Trailing paragraph breaks are consumed without adding a trailing segment or pause.
+    assert pairs[-1][1] == ""
+
+
+def test_split_clause_text_with_separators_merges_short_tail() -> None:
+    """Test split_clause_text_with_separators merges a short remainder into the last clause."""
+    text = "Vế một này đủ dài, vế hai này cũng đủ dài, đuôi"
+    pairs = StreamClauseDetector.split_clause_text_with_separators(text)
+    assert pairs == [
+        ("Vế một này đủ dài,", " "),
+        ("vế hai này cũng đủ dài, đuôi", ""),
+    ]
+    assert _boundary_kind(pairs[0][0], pairs[0][1]) == "clause"
+    assert pairs[1][1] == ""
+
+
+def test_split_clause_text_with_separators_preserves_paragraph_boundary_before_short_tail() -> None:
+    """Test paragraph boundary is preserved before a short tail to retain silence."""
+    text = "Vế một này đủ dài, vế hai này cũng đủ dài.\nđuôi"
+    pairs = StreamClauseDetector.split_clause_text_with_separators(text)
+    assert pairs == [
+        ("Vế một này đủ dài,", " "),
+        ("vế hai này cũng đủ dài.", "\n"),
+        ("đuôi", ""),
+    ]
+    assert [_boundary_kind(clause, sep) for clause, sep in pairs[:-1]] == [
+        "clause",
+        "paragraph",
+    ]
+    assert pairs[-1] == ("đuôi", "")
+
+
+async def test_tts_pads_paragraph_silence_before_final_short_tail() -> None:
+    """Test line break preceding a short final segment receives paragraph silence."""
+    engine = FakeTTS([np.array([0.5], dtype=np.float32)])
+    handler, writer = make_handler(
+        engine,
+        paragraph_silence_ms=100,
+        sentence_silence_ms=50,
+        clause_silence_ms=20,
+    )
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    text = "Một câu đủ dài để tách một đoạn,\nđuôi"
+    assert await handler.handle_event(SynthesizeChunk(text=text).event()) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+
+    assert engine.calls == [
+        ("Một câu đủ dài để tách một đoạn,", None),
+        ("đuôi", None),
+    ]
+    speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+    paragraph_silence = bytes(round(engine.sample_rate * 0.100) * TTS_SAMPLE_WIDTH)
+    assert written_audio(writer) == speech + paragraph_silence + speech
 
 
 async def test_tts_disconnect_log_when_stream_started() -> None:

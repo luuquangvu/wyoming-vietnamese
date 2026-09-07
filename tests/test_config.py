@@ -1,5 +1,6 @@
 """Configuration parsing tests."""
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,12 @@ from wyoming_vietnamese.config import (
     get_env_bool,
     resolve_cpu_threads,
 )
-from wyoming_vietnamese.const import DEFAULT_PORT
+from wyoming_vietnamese.const import (
+    DEFAULT_PORT,
+    DEFAULT_TTS_CLAUSE_SILENCE_MS,
+    DEFAULT_TTS_PARAGRAPH_SILENCE_MS,
+    DEFAULT_TTS_SENTENCE_SILENCE_MS,
+)
 from wyoming_vietnamese.tts_model import DEFAULT_TTS_VOICE_ID
 
 
@@ -106,6 +112,9 @@ def test_server_config_defaults() -> None:
     assert config.tts_cache_max_entries == 128
     assert config.tts_cache_max_bytes == 64 * 1024 * 1024
     assert config.tts_cache_max_item_bytes == 4 * 1024 * 1024
+    assert config.tts_sentence_silence_ms == DEFAULT_TTS_SENTENCE_SILENCE_MS
+    assert config.tts_clause_silence_ms == DEFAULT_TTS_CLAUSE_SILENCE_MS
+    assert config.tts_paragraph_silence_ms == DEFAULT_TTS_PARAGRAPH_SILENCE_MS
 
 
 def test_server_config_custom_values() -> None:
@@ -123,7 +132,7 @@ def test_server_config_custom_values() -> None:
             "MAX_TTS_TEXT_CHARS": "50",
             "TTS_SENTENCE_SILENCE_MS": "450",
             "TTS_CLAUSE_SILENCE_MS": "0",
-            "TTS_SILENCE_JITTER_PERCENT": "40",
+            "TTS_PARAGRAPH_SILENCE_MS": "800",
             "INFERENCE_QUEUE_TIMEOUT": "1.25",
             "WYOMING_EVENT_TIMEOUT": "2.5",
             "WYOMING_WRITE_TIMEOUT": "0.75",
@@ -153,7 +162,7 @@ def test_server_config_custom_values() -> None:
     assert config.max_tts_text_chars == 50
     assert config.tts_sentence_silence_ms == 450
     assert config.tts_clause_silence_ms == 0
-    assert config.tts_silence_jitter_percent == 40
+    assert config.tts_paragraph_silence_ms == 800
     assert config.inference_queue_timeout == 1.25
     assert config.event_timeout == 2.5
     assert config.write_timeout == 0.75
@@ -197,8 +206,8 @@ def test_server_config_accepts_tts_voice_separators(value: str) -> None:
         ({"MAX_TTS_TEXT_CHARS": "0"}, "must be at least"),
         ({"TTS_SENTENCE_SILENCE_MS": "-1"}, "must be at least"),
         ({"TTS_CLAUSE_SILENCE_MS": "3001"}, "at most"),
-        ({"TTS_SILENCE_JITTER_PERCENT": "-1"}, "must be at least"),
-        ({"TTS_SILENCE_JITTER_PERCENT": "101"}, "at most"),
+        ({"TTS_PARAGRAPH_SILENCE_MS": "-1"}, "must be at least"),
+        ({"TTS_PARAGRAPH_SILENCE_MS": "3001"}, "at most"),
         ({"INFERENCE_QUEUE_TIMEOUT": "0"}, "must be greater"),
         ({"WYOMING_EVENT_TIMEOUT": "0"}, "must be greater"),
         ({"WYOMING_WRITE_TIMEOUT": "-1"}, "must be greater"),
@@ -218,3 +227,16 @@ def test_server_config_rejects_invalid_values(environment: dict[str, str], messa
     """Test server config rejects invalid values."""
     with pytest.raises(ValueError, match=message):
         ServerConfig.from_env(environment)
+
+
+@pytest.mark.parametrize("value", ["20", "not-an-integer", "-1", ""])
+def test_server_config_logs_warning_on_deprecated_jitter_setting(
+    value: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test setting TTS_SILENCE_JITTER_PERCENT logs a warning regardless of value."""
+    with caplog.at_level(logging.WARNING):
+        ServerConfig.from_env({"TTS_SILENCE_JITTER_PERCENT": value})
+    assert "TTS_SILENCE_JITTER_PERCENT is deprecated and has been removed" in caplog.text
+    assert "consult the up-to-date README and use default settings" in caplog.text
+    assert ServerConfig.from_env({"TTS_SILENCE_JITTER_PERCENT": value}) == ServerConfig.from_env({})
