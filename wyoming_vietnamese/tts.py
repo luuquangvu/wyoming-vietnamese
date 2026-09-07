@@ -462,7 +462,7 @@ class StreamClauseDetector:
         if (
             not pairs
             or len(remainder) >= _MIN_CLAUSE_CHARS
-            or _boundary_kind(pairs[-1][0], pairs[-1][1]) == "paragraph"
+            or _boundary_kind(pairs[-1][0], pairs[-1][1]) in ("paragraph", "sentence")
         ):
             pairs.append((remainder, ""))
             return pairs

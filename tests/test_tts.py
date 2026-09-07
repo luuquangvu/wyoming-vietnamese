@@ -1357,6 +1357,12 @@ def test_split_clause_text_merges_a_short_tail_without_rewriting_it() -> None:
         "đuôi",
     ]
 
+    sentence_tail = "Một câu đủ dài để tách.   đuôi"
+    assert StreamClauseDetector.split_clause_text(sentence_tail) == [
+        "Một câu đủ dài để tách.",
+        "đuôi",
+    ]
+
 
 def test_stream_clause_detector_still_splits_punctuation_after_digits() -> None:
     """Test a digit before a delimiter does not disable a real boundary."""
@@ -1505,6 +1511,49 @@ async def test_tts_pads_paragraph_silence_before_final_short_tail() -> None:
     speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
     paragraph_silence = bytes(round(engine.sample_rate * 0.100) * TTS_SAMPLE_WIDTH)
     assert written_audio(writer) == speech + paragraph_silence + speech
+
+
+@pytest.mark.parametrize("separator", [" ", "   ", "\t "])
+def test_split_clause_text_with_separators_preserves_sentence_boundary_before_short_tail(
+    separator: str,
+) -> None:
+    """Test sentence boundary is preserved before a short tail across arbitrary separators."""
+    text = f"Vế một này đủ dài, vế hai này cũng đủ dài.{separator}đuôi"
+    pairs = StreamClauseDetector.split_clause_text_with_separators(text)
+    assert pairs == [
+        ("Vế một này đủ dài,", " "),
+        ("vế hai này cũng đủ dài.", separator),
+        ("đuôi", ""),
+    ]
+    assert [_boundary_kind(clause, sep) for clause, sep in pairs[:-1]] == [
+        "clause",
+        "sentence",
+    ]
+    assert pairs[-1] == ("đuôi", "")
+
+
+@pytest.mark.parametrize("separator", [" ", "   "])
+async def test_tts_pads_sentence_silence_before_final_short_tail(separator: str) -> None:
+    """Test sentence boundary preceding a short final segment receives sentence silence."""
+    engine = FakeTTS([np.array([0.5], dtype=np.float32)])
+    handler, writer = make_handler(
+        engine,
+        paragraph_silence_ms=100,
+        sentence_silence_ms=50,
+        clause_silence_ms=20,
+    )
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    text = f"Một câu đủ dài để tách một đoạn.{separator}đuôi"
+    assert await handler.handle_event(SynthesizeChunk(text=text).event()) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+
+    assert engine.calls == [
+        ("Một câu đủ dài để tách một đoạn.", None),
+        ("đuôi", None),
+    ]
+    speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+    sentence_silence = bytes(round(engine.sample_rate * 0.050) * TTS_SAMPLE_WIDTH)
+    assert written_audio(writer) == speech + sentence_silence + speech
 
 
 async def test_tts_disconnect_log_when_stream_started() -> None:
