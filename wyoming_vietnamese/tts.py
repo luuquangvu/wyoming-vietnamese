@@ -6,7 +6,6 @@ import asyncio
 import logging
 import os
 import queue
-import random
 import re
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -38,10 +37,9 @@ from .config import resolve_cpu_threads
 from .const import (
     DEFAULT_EVENT_TIMEOUT,
     DEFAULT_TTS_CLAUSE_SILENCE_MS,
+    DEFAULT_TTS_PARAGRAPH_SILENCE_MS,
     DEFAULT_TTS_SENTENCE_SILENCE_MS,
-    DEFAULT_TTS_SILENCE_JITTER_PERCENT,
     DEFAULT_WRITE_TIMEOUT,
-    MAX_TTS_SILENCE_MS,
     PROGRAM_NAME,
     TTS_CHUNK_SIZE,
     TTS_CONFIG_FILE,
@@ -363,8 +361,9 @@ def _delimiter_pattern(boundary_chars: frozenset[str]) -> re.Pattern[str]:
     return re.compile(f"([{char_class}]+)(\\s*)")
 
 
-_CLAUSE_DELIM_RE = _delimiter_pattern(_CLAUSE_END_CHARS | _LINE_BREAK_CHARS)
-_SENTENCE_DELIM_RE = _delimiter_pattern(_SENTENCE_END_CHARS | _LINE_BREAK_CHARS)
+_PARAGRAPH_DELIM_RE = _delimiter_pattern(_LINE_BREAK_CHARS)
+_SENTENCE_DELIM_RE = _delimiter_pattern(_SENTENCE_END_CHARS)
+_CLAUSE_DELIM_RE = _delimiter_pattern(_CLAUSE_END_CHARS)
 
 
 def _is_numeric_separator(text: str, start: int, end: int) -> bool:
@@ -405,21 +404,10 @@ def _silence_pcm(milliseconds: int, sample_rate: int) -> bytes:
     return bytes(samples * TTS_SAMPLE_WIDTH * TTS_SAMPLE_CHANNELS)
 
 
-def _jittered_silence_ms(base_ms: int, jitter_percent: int, rng: random.Random) -> int:
-    """Spread a pause around its configured duration so boundaries stop sounding metronomic."""
-    if base_ms < 0:
-        raise ValueError("Silence duration must not be negative")
-    if jitter_percent < 0:
-        raise ValueError("Silence jitter must not be negative")
-    if not base_ms or not jitter_percent:
-        return base_ms
-    spread = base_ms * jitter_percent / 100
-    jittered = round(rng.uniform(base_ms - spread, base_ms + spread))
-    return min(max(jittered, 0), MAX_TTS_SILENCE_MS)
-
-
-def _boundary_kind(text: str) -> str:
+def _boundary_kind(text: str, separator: str = "") -> str:
     """Classify the punctuation that a synthesized segment ends on."""
+    if any(char in separator for char in _LINE_BREAK_CHARS):
+        return "paragraph"
     trimmed = text.rstrip().rstrip(_TRAILING_WRAPPER_CHARS).rstrip()
     if not trimmed:
         return "none"
@@ -432,7 +420,7 @@ def _boundary_kind(text: str) -> str:
 class StreamClauseDetector:
     """Incremental text boundary detector for real-time TTS synthesis.
 
-    Yields chunks incrementally at configured sentence, clause, and line boundaries.
+    Yields chunks incrementally at configured paragraph, sentence, and clause boundaries.
     Unpunctuated text remains intact until the stream finishes so synthesis does not
     sound clipped.
     """
@@ -445,10 +433,14 @@ class StreamClauseDetector:
         # final tail can be restored without rewriting the requested text.
         self.trailing_separator = ""
 
-    def add_chunk(self, text: str) -> Iterable[str]:
-        """Buffer incoming streaming text and yield synthesis-ready clauses."""
+    def add_chunk_with_separators(self, text: str) -> list[tuple[str, str]]:
+        """Buffer incoming streaming text and yield clauses with their trailing separators."""
         self.buffer += text
         return self._drain()
+
+    def add_chunk(self, text: str) -> Iterable[str]:
+        """Buffer incoming streaming text and yield synthesis-ready clauses."""
+        return (clause for clause, _ in self.add_chunk_with_separators(text))
 
     def finish(self) -> str:
         """Flush all remaining text at stream end."""
@@ -457,27 +449,39 @@ class StreamClauseDetector:
         return text
 
     @staticmethod
-    def split_clause_text(text: str) -> list[str]:
-        """Split a static block only at configured text boundaries."""
+    def split_clause_text_with_separators(text: str) -> list[tuple[str, str]]:
+        """Split a static block into clauses and trailing separators."""
         trimmed = text.strip()
         if not trimmed:
             return []
         detector = StreamClauseDetector()
-        clauses = list(detector.add_chunk(trimmed))
+        pairs = detector.add_chunk_with_separators(trimmed)
         remainder = detector.finish()
         if not remainder:
-            return clauses
-        if not clauses or len(remainder) >= _MIN_CLAUSE_CHARS:
-            clauses.append(remainder)
-            return clauses
+            return pairs
+        if (
+            not pairs
+            or len(remainder) >= _MIN_CLAUSE_CHARS
+            or _boundary_kind(pairs[-1][0], pairs[-1][1]) == "paragraph"
+        ):
+            pairs.append((remainder, ""))
+            return pairs
         # Re-attach a short tail using the separator the boundary discarded, so the
         # engine receives the requested text rather than a reconstruction of it.
-        clauses[-1] = f"{clauses[-1]}{detector.trailing_separator}{remainder}"
-        return clauses
+        last_clause, last_sep = pairs[-1]
+        pairs[-1] = (f"{last_clause}{last_sep}{remainder}", "")
+        return pairs
 
-    def _drain(self) -> list[str]:
+    @staticmethod
+    def split_clause_text(text: str) -> list[str]:
+        """Split a static block only at configured text boundaries."""
+        return [
+            clause for clause, _ in StreamClauseDetector.split_clause_text_with_separators(text)
+        ]
+
+    def _drain(self) -> list[tuple[str, str]]:
         """Extract configured text boundaries without length-based splitting."""
-        yielded: list[str] = []
+        yielded: list[tuple[str, str]] = []
         while self.buffer:
             match = self._find_natural_boundary()
             if match is None:
@@ -491,7 +495,7 @@ class StreamClauseDetector:
             self.buffer = window[end_pos:].lstrip()
             self.trailing_separator = window[leading + len(piece) : len(window) - len(self.buffer)]
             if piece:
-                yielded.append(piece)
+                yielded.append((piece, self.trailing_separator))
         return yielded
 
     def _first_text_boundary(self, matches: Iterable[re.Match[str]]) -> re.Match[str] | None:
@@ -502,16 +506,19 @@ class StreamClauseDetector:
         )
 
     def _find_natural_boundary(self) -> re.Match[str] | None:
-        """Find the earliest sentence or sufficiently long clause delimiter."""
+        """Find the earliest paragraph, sentence, or sufficiently long clause delimiter."""
+        paragraph_match = self._first_text_boundary(_PARAGRAPH_DELIM_RE.finditer(self.buffer))
         sentence_match = self._first_text_boundary(_SENTENCE_DELIM_RE.finditer(self.buffer))
         clause_match = self._first_text_boundary(
             match
             for match in _CLAUSE_DELIM_RE.finditer(self.buffer)
             if match.end() >= self.min_clause_chars
         )
-        if sentence_match is not None and clause_match is not None:
-            return sentence_match if sentence_match.start() < clause_match.start() else clause_match
-        return sentence_match or clause_match
+        if candidates := [
+            match for match in (paragraph_match, sentence_match, clause_match) if match is not None
+        ]:
+            return min(candidates, key=lambda match: match.start())
+        return None
 
 
 class TTSEventHandler(SafeAsyncEventHandler):
@@ -532,8 +539,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
         write_timeout: float = DEFAULT_WRITE_TIMEOUT,
         sentence_silence_ms: int = DEFAULT_TTS_SENTENCE_SILENCE_MS,
         clause_silence_ms: int = DEFAULT_TTS_CLAUSE_SILENCE_MS,
-        silence_jitter_percent: int = DEFAULT_TTS_SILENCE_JITTER_PERCENT,
-        rng: random.Random | None = None,
+        paragraph_silence_ms: int = DEFAULT_TTS_PARAGRAPH_SILENCE_MS,
         inference_executor: Executor | None = None,
     ) -> None:
         """Initialize per-connection state around the shared TTS engine."""
@@ -553,8 +559,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
         self.sample_rate = get_tts_sample_rate(tts)
         self.sentence_silence_ms = sentence_silence_ms
         self.clause_silence_ms = clause_silence_ms
-        self.silence_jitter_percent = silence_jitter_percent
-        self._rng = rng if rng is not None else random.Random()
+        self.paragraph_silence_ms = paragraph_silence_ms
         self.preset_voices = dict(getattr(tts, "_preset_voices", {}))
         self.stream_voice_name: str | None
         # Survives _reset_stream() so a late compatibility request cannot restart a
@@ -696,7 +701,8 @@ class TTSEventHandler(SafeAsyncEventHandler):
                 "text-too-long",
             )
 
-        for clause in self.sentence_boundary.add_chunk(stream_chunk.text):
+        detector = self.sentence_boundary
+        for clause, separator in detector.add_chunk_with_separators(stream_chunk.text):
             self.stream_segment_count += 1
             _LOGGER.debug(
                 "TTS step=sentence-ready segment=%d text_chars=%d",
@@ -708,6 +714,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
                 self.stream_voice_name,
                 send_start=not self.stream_audio_started,
                 send_stop=False,
+                separator=separator,
             ):
                 await self.write_event(SynthesizeStopped().event())
                 self._reset_stream()
@@ -734,10 +741,10 @@ class TTSEventHandler(SafeAsyncEventHandler):
             len(final_text),
         )
         if final_text:
-            clauses = StreamClauseDetector.split_clause_text(final_text)
-            for idx, clause in enumerate(clauses):
+            clause_pairs = StreamClauseDetector.split_clause_text_with_separators(final_text)
+            for idx, (clause, separator) in enumerate(clause_pairs):
                 self.stream_segment_count += 1
-                is_last_clause = idx == len(clauses) - 1
+                is_last_clause = idx == len(clause_pairs) - 1
                 _LOGGER.debug(
                     "TTS step=sentence-ready segment=%d text_chars=%d final=%s",
                     self.stream_segment_count,
@@ -749,6 +756,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
                     self.stream_voice_name,
                     send_start=not self.stream_audio_started,
                     send_stop=is_last_clause,
+                    separator=separator,
                 ):
                     await self.write_event(SynthesizeStopped().event())
                     self._reset_stream()
@@ -832,19 +840,19 @@ class TTSEventHandler(SafeAsyncEventHandler):
         return voice_name
 
     def _silence_pcm(self, base_ms: int) -> bytes:
-        """Draw one randomized pause of the configured length as PCM silence."""
-        return _silence_pcm(
-            _jittered_silence_ms(base_ms, self.silence_jitter_percent, self._rng),
-            self.sample_rate,
-        )
+        """Draw one pause of the configured length as PCM silence."""
+        return _silence_pcm(base_ms, self.sample_rate)
 
-    def _boundary_silence_pcm(self, text: str) -> bytes:
+    def _boundary_silence_pcm(self, text: str, separator: str = "") -> bytes:
         """Return padding for a completed segment when another segment follows.
 
         Non-final segments end at a recognized sentence, clause, or line boundary;
         the boundary type selects the configured pause.
         """
-        if _boundary_kind(text) == "clause":
+        kind = _boundary_kind(text, separator)
+        if kind == "paragraph":
+            return self._silence_pcm(self.paragraph_silence_ms)
+        if kind == "clause":
             return self._silence_pcm(self.clause_silence_ms)
         return self._silence_pcm(self.sentence_silence_ms)
 
@@ -878,6 +886,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
         *,
         send_start: bool = True,
         send_stop: bool = True,
+        separator: str = "",
     ) -> _TTSProduction | None:
         """Pipeline inference and bounded network output around the shared lock."""
         segment_started = perf_counter()
@@ -1046,7 +1055,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
                 await producer
 
             if not send_stop:
-                pause_pcm = self._boundary_silence_pcm(text)
+                pause_pcm = self._boundary_silence_pcm(text, separator)
                 pause_bytes = len(pause_pcm)
                 output_seconds += await self._write_silence(pause_pcm)
 

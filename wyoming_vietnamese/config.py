@@ -25,13 +25,14 @@ from .const import (
     DEFAULT_TTS_CACHE_MAX_ITEM_MB,
     DEFAULT_TTS_CACHE_MAX_MB,
     DEFAULT_TTS_CLAUSE_SILENCE_MS,
+    DEFAULT_TTS_PARAGRAPH_SILENCE_MS,
     DEFAULT_TTS_SENTENCE_SILENCE_MS,
-    DEFAULT_TTS_SILENCE_JITTER_PERCENT,
     DEFAULT_WRITE_TIMEOUT,
-    MAX_TTS_SILENCE_JITTER_PERCENT,
     MAX_TTS_SILENCE_MS,
 )
 from .tts_model import DEFAULT_TTS_VOICE_ID, TtsVoiceSpec, get_voice
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def get_env_bool(
@@ -167,9 +168,9 @@ class ServerConfig:
     log_level: str
     max_stt_audio_seconds: float
     max_tts_text_chars: int
+    tts_paragraph_silence_ms: int
     tts_sentence_silence_ms: int
     tts_clause_silence_ms: int
-    tts_silence_jitter_percent: int
     inference_queue_timeout: float
     event_timeout: float
     write_timeout: float
@@ -184,6 +185,12 @@ class ServerConfig:
     def from_env(cls, environ: Mapping[str, str] | None = None) -> ServerConfig:
         """Build configuration from an environment mapping."""
         env = os.environ if environ is None else environ
+
+        if "TTS_SILENCE_JITTER_PERCENT" in env:
+            _LOGGER.warning(
+                "TTS_SILENCE_JITTER_PERCENT is deprecated and has been removed; silence jitter "
+                "is no longer used. Please consult the up-to-date README and use default settings."
+            )
 
         tts_cache_max_mb = _get_int(
             env,
@@ -222,6 +229,13 @@ class ServerConfig:
                 DEFAULT_MAX_TTS_TEXT_CHARS,
                 minimum=1,
             ),
+            tts_paragraph_silence_ms=_get_int(
+                env,
+                "TTS_PARAGRAPH_SILENCE_MS",
+                DEFAULT_TTS_PARAGRAPH_SILENCE_MS,
+                minimum=0,
+                maximum=MAX_TTS_SILENCE_MS,
+            ),
             tts_sentence_silence_ms=_get_int(
                 env,
                 "TTS_SENTENCE_SILENCE_MS",
@@ -235,13 +249,6 @@ class ServerConfig:
                 DEFAULT_TTS_CLAUSE_SILENCE_MS,
                 minimum=0,
                 maximum=MAX_TTS_SILENCE_MS,
-            ),
-            tts_silence_jitter_percent=_get_int(
-                env,
-                "TTS_SILENCE_JITTER_PERCENT",
-                DEFAULT_TTS_SILENCE_JITTER_PERCENT,
-                minimum=0,
-                maximum=MAX_TTS_SILENCE_JITTER_PERCENT,
             ),
             inference_queue_timeout=_get_float(
                 env,
