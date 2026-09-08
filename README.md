@@ -141,9 +141,9 @@ Khi cần tối ưu hóa hoặc kiểm soát chi tiết hơn, bạn có thể th
 | `TZ`                       | `Asia/Ho_Chi_Minh` | Múi giờ địa phương để hiển thị thời gian trong log chính xác.                                                                   |
 | `CPU_THREADS`              |        `0`         | Số luồng CPU sử dụng cho suy luận (`0` là tự động dùng tất cả luồng khả dụng).                                                  |
 | `OFFLINE`                  |      `false`       | Đặt `"true"` sau khi đã tải đủ mô hình để chỉ nạp mô hình từ bộ nhớ đệm cục bộ (báo lỗi nếu thiếu file thay vì kết nối tải về). |
-| `TTS_PARAGRAPH_SILENCE_MS` |       `700`        | Khoảng lặng tối thiểu giữa các đoạn văn hoặc ngắt dòng (đơn vị: mili-giây).                                                     |
-| `TTS_SENTENCE_SILENCE_MS`  |       `500`        | Khoảng lặng tối thiểu giữa các câu kết thúc bằng dấu `.`, `!`, `?`. Tăng giá trị này nếu muốn giọng đọc chậm rãi hơn.           |
-| `TTS_CLAUSE_SILENCE_MS`    |       `300`        | Khoảng lặng tối thiểu sau dấu phẩy `,`, chấm phẩy `;`, hai chấm `:` trong câu.                                                  |
+| `TTS_PARAGRAPH_SILENCE_MS` |       `600`        | Khoảng lặng tối thiểu giữa các đoạn văn hoặc ngắt dòng (đơn vị: mili-giây).                                                     |
+| `TTS_SENTENCE_SILENCE_MS`  |       `400`        | Khoảng lặng tối thiểu giữa các câu kết thúc bằng dấu `.`, `!`, `?`. Tăng giá trị này nếu muốn giọng đọc chậm rãi hơn.           |
+| `TTS_CLAUSE_SILENCE_MS`    |       `200`        | Khoảng lặng tối thiểu sau dấu phẩy `,`, chấm phẩy `;`, hai chấm `:` trong câu.                                                  |
 
 > [!IMPORTANT]
 > Hai volume `cache` và `models` lưu trữ toàn bộ mô hình đã tải về. Không nên xóa hai volume này để container khởi động tức thì ở các lần sau và có thể hoạt động ngoại tuyến.
