@@ -31,8 +31,8 @@ async def check_port(
             has_stt = any(program.installed for program in info.asr)
             has_tts = any(program.installed for program in info.tts)
             return has_stt and has_tts
-    except (TimeoutError, ConnectionError, KeyError, OSError, TypeError, ValueError) as err:
-        _LOGGER.error("Healthcheck failed on port %d: %s", port, err)
+    except (KeyError, OSError, TypeError, ValueError) as err:
+        _LOGGER.exception("Healthcheck failed on port %d: %s", port, err)
         return False
     finally:
         if writer is not None:

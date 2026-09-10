@@ -8,10 +8,10 @@ from time import monotonic
 
 
 @dataclass(slots=True)
-class _CacheEntry[Value]:
+class _CacheEntry[ValueT]:
     """Store one cached value and its accounting metadata."""
 
-    value: Value
+    value: ValueT
     size_bytes: int
     expires_at: float
 

@@ -11,8 +11,7 @@ on:
       - "uv.lock"
   pull_request: *ci_trigger
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -22,6 +21,9 @@ jobs:
   static-checks:
     runs-on: ubuntu-latest
     name: "Static Checks (Synced with Local Environment)"
+    permissions:
+      contents: read
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -32,25 +34,25 @@ jobs:
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
 
       - name: Install dependencies
-        run: uv sync --locked --all-groups
+        run: uv sync --locked --all-groups --no-build
 
       - name: Run Ruff
-        run: uv run ruff check
+        run: uv run --locked --no-build ruff check
 
       - name: Run Ruff Format
-        run: uv run ruff format --check
+        run: uv run --locked --no-build ruff format --check
 
       - name: Run Ty Check
-        run: uv run ty check
+        run: uv run --locked --no-build ty check
 
       - name: Run Pyright
-        run: uv run pyright
+        run: uv run --locked --no-build pyright
 
       - name: Run Interrogate
-        run: uv run interrogate
+        run: uv run --locked --no-build interrogate
 
       - name: Run Tally
-        run: uv run tally lint --format github-actions Dockerfile
+        run: uv run --locked --no-build tally lint --format github-actions Dockerfile
 
       - name: Run Pytest
-        run: uv run pytest
+        run: uv run --locked --no-build pytest

@@ -16,9 +16,7 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
-permissions:
-  contents: read
-  packages: write
+permissions: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -35,6 +33,9 @@ jobs:
           - platform: linux/arm64
             runner: ubuntu-26.04-arm
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
 
     steps:
       - name: Checkout repository
@@ -91,6 +92,8 @@ jobs:
   merge:
     needs: build
     runs-on: ubuntu-26.04
+    permissions:
+      packages: write
 
     steps:
       - name: Download digests
