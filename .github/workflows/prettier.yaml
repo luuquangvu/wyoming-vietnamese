@@ -12,8 +12,7 @@ on:
       - "**.toml"
   pull_request: *ci_trigger
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -23,6 +22,9 @@ jobs:
   prettier:
     runs-on: ubuntu-latest
     name: "Prettier Format Check"
+    permissions:
+      contents: read
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -36,7 +38,7 @@ jobs:
           cache: "npm"
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Run Prettier
-        run: npx prettier --check .
+        run: npx --no-install prettier --check .

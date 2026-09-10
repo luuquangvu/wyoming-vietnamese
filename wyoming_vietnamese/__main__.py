@@ -220,7 +220,7 @@ async def run_server(
             try:
                 await server.stop()
             except Exception as err:
-                _LOGGER.error("Server shutdown failed: %s", err)
+                _LOGGER.exception("Server shutdown failed: %s", err)
             if not await connection_limiter.wait_idle(SHUTDOWN_DRAIN_TIMEOUT):
                 _LOGGER.warning(
                     "Releasing models while %d client handler(s) are still active",
