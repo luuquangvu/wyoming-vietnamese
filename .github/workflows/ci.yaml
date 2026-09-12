@@ -34,25 +34,25 @@ jobs:
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
 
       - name: Install dependencies
-        run: uv sync --locked --all-groups --no-build
+        run: uv sync --locked --all-groups
 
       - name: Run Ruff
-        run: uv run --locked --no-build ruff check
+        run: uv run --locked ruff check
 
       - name: Run Ruff Format
-        run: uv run --locked --no-build ruff format --check
+        run: uv run --locked ruff format --check
 
       - name: Run Ty Check
-        run: uv run --locked --no-build ty check
+        run: uv run --locked ty check
 
       - name: Run Pyright
-        run: uv run --locked --no-build pyright
+        run: uv run --locked pyright
 
       - name: Run Interrogate
-        run: uv run --locked --no-build interrogate
+        run: uv run --locked interrogate
 
       - name: Run Tally
-        run: uv run --locked --no-build tally lint --format github-actions Dockerfile
+        run: uv run --locked tally lint --format github-actions Dockerfile
 
       - name: Run Pytest
-        run: uv run --locked --no-build pytest
+        run: uv run --locked pytest
