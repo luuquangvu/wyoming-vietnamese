@@ -43,7 +43,7 @@ class SttModelSpec:
 # Verified against the repository at the pinned commit on 2026-08-11.
 STT_MODEL = SttModelSpec(
     repo="hynt/Zipformer-30M-RNNT-6000h",
-    revision="24ed30248e1c96bb690c81c24ab4e056f8cd9fce",
+    revision="ad6f873b5f5b6ed083821253a88d81afed2505c4",
     graphs=(
         SttArtifact(
             "encoder-epoch-20-avg-10.int8.onnx",

@@ -11,7 +11,7 @@ COPY pyproject.toml uv.lock ./
 
 RUN --mount=type=cache,target=/root/.cache/uv <<EOF
 set -eux
-uv sync --locked --no-install-project --no-default-groups --no-build
+uv sync --locked --no-install-project --no-default-groups
 EOF
 
 COPY wyoming_vietnamese/ ./wyoming_vietnamese/

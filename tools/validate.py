@@ -376,7 +376,7 @@ def _run_uv_sync_check(repo_root: str) -> subprocess.CompletedProcess[str]:
 def _repair_uv_sync(repo_root: str) -> None:
     """Synchronize uv dependencies."""
     subprocess.run(
-        ["uv", "sync", "--locked", "--all-groups", "--no-build"],
+        ["uv", "sync", "--locked", "--all-groups"],
         check=True,
         cwd=repo_root,
         timeout=_DEPENDENCY_SYNC_TIMEOUT_SECONDS,
@@ -398,7 +398,7 @@ def _run_npm_sync_check(repo_root: str) -> subprocess.CompletedProcess[str]:
 def _repair_npm_sync(repo_root: str) -> None:
     """Synchronize npm dependencies."""
     subprocess.run(
-        ["npm", "ci", "--ignore-scripts"],
+        ["npm", "ci"],
         check=True,
         cwd=repo_root,
         timeout=_DEPENDENCY_SYNC_TIMEOUT_SECONDS,
@@ -680,10 +680,8 @@ def _run_dependency_steps(repo_root: str) -> None:
     _run_sync_repair_step(
         repo_root,
         command_label="uv sync --check --all-groups",
-        check_output_label="uv sync --check",
-        repair_message=(
-            "Environment is out of sync. Running 'uv sync --locked --all-groups --no-build'"
-        ),
+        check_output_label="uv sync --check --all-groups",
+        repair_message=("Environment is out of sync. Running 'uv sync --locked --all-groups'"),
         synchronized_message="Environment is already synchronized.",
         run_check=_run_uv_sync_check,
         run_repair=_repair_uv_sync,
@@ -692,7 +690,7 @@ def _run_dependency_steps(repo_root: str) -> None:
         repo_root,
         command_label="npm ls",
         check_output_label="npm ls",
-        repair_message="NPM packages are out of sync. Running 'npm ci --ignore-scripts'",
+        repair_message=("NPM packages are out of sync. Running 'npm ci'"),
         synchronized_message="NPM packages are already synchronized.",
         run_check=_run_npm_sync_check,
         run_repair=_repair_npm_sync,
@@ -713,10 +711,10 @@ def _run_dependency_steps(repo_root: str) -> None:
 
 def _run_ruff_format_step(repo_root: str) -> None:
     """Format Python code with explicit list literal for security audits."""
-    format_cmd = "uv run --locked --no-build ruff format"
+    format_cmd = "uv run --locked ruff format"
     print(f"STEP_START: {format_cmd}", flush=True)
     subprocess.run(
-        ["uv", "run", "--locked", "--no-build", "ruff", "format"],
+        ["uv", "run", "--locked", "ruff", "format"],
         check=True,
         cwd=repo_root,
         timeout=_FORMAT_STEP_TIMEOUT_SECONDS,
@@ -726,10 +724,10 @@ def _run_ruff_format_step(repo_root: str) -> None:
 
 def _run_ruff_check_step(repo_root: str) -> None:
     """Lint Python code with explicit list literal for security audits."""
-    check_cmd = "uv run --locked --no-build ruff check --fix"
+    check_cmd = "uv run --locked ruff check --fix"
     print(f"STEP_START: {check_cmd}", flush=True)
     subprocess.run(
-        ["uv", "run", "--locked", "--no-build", "ruff", "check", "--fix"],
+        ["uv", "run", "--locked", "ruff", "check", "--fix"],
         check=True,
         cwd=repo_root,
         timeout=_FORMAT_STEP_TIMEOUT_SECONDS,
@@ -745,10 +743,10 @@ def _run_ruff_steps(repo_root: str) -> None:
 
 def _run_ty_step(repo_root: str) -> None:
     """Run Ty type check with explicit list literal for security audits."""
-    ty_cmd = "uv run --locked --no-build ty check"
+    ty_cmd = "uv run --locked ty check"
     print(f"STEP_START: {ty_cmd}", flush=True)
     subprocess.run(
-        ["uv", "run", "--locked", "--no-build", "ty", "check"],
+        ["uv", "run", "--locked", "ty", "check"],
         check=True,
         cwd=repo_root,
         timeout=_STATIC_ANALYSIS_STEP_TIMEOUT_SECONDS,
@@ -758,10 +756,10 @@ def _run_ty_step(repo_root: str) -> None:
 
 def _run_pyright_step(repo_root: str) -> None:
     """Run Pyright type check with explicit list literal for security audits."""
-    pyright_cmd = "uv run --locked --no-build pyright"
+    pyright_cmd = "uv run --locked pyright"
     print(f"STEP_START: {pyright_cmd}", flush=True)
     subprocess.run(
-        ["uv", "run", "--locked", "--no-build", "pyright"],
+        ["uv", "run", "--locked", "pyright"],
         check=True,
         cwd=repo_root,
         timeout=_STATIC_ANALYSIS_STEP_TIMEOUT_SECONDS,
@@ -771,10 +769,10 @@ def _run_pyright_step(repo_root: str) -> None:
 
 def _run_interrogate_step(repo_root: str) -> None:
     """Run Interrogate docstring audit with explicit list literal for security audits."""
-    interrogate_cmd = "uv run --locked --no-build interrogate"
+    interrogate_cmd = "uv run --locked interrogate"
     print(f"STEP_START: {interrogate_cmd}", flush=True)
     subprocess.run(
-        ["uv", "run", "--locked", "--no-build", "interrogate"],
+        ["uv", "run", "--locked", "interrogate"],
         check=True,
         cwd=repo_root,
         timeout=_STATIC_ANALYSIS_STEP_TIMEOUT_SECONDS,
@@ -791,10 +789,10 @@ def _run_static_analysis_steps(repo_root: str) -> None:
 
 def _run_tally_step(repo_root: str) -> None:
     """Lint the Dockerfile using the explicit Tally command from pre-commit."""
-    tally_cmd = "uv run --locked --no-build tally lint --fix Dockerfile"
+    tally_cmd = "uv run --locked tally lint --fix Dockerfile"
     print(f"STEP_START: {tally_cmd}", flush=True)
     subprocess.run(
-        ["uv", "run", "--locked", "--no-build", "tally", "lint", "--fix", "Dockerfile"],
+        ["uv", "run", "--locked", "tally", "lint", "--fix", "Dockerfile"],
         check=True,
         cwd=repo_root,
         timeout=_FORMAT_STEP_TIMEOUT_SECONDS,
@@ -817,10 +815,10 @@ def _run_prettier_step(repo_root: str) -> None:
 
 def _run_pytest_step(repo_root: str) -> None:
     """Run test suite using explicit Pytest list literal for security audits."""
-    pytest_cmd = "uv run --locked --no-build pytest"
+    pytest_cmd = "uv run --locked pytest"
     print(f"STEP_START: {pytest_cmd}", flush=True)
     subprocess.run(
-        ["uv", "run", "--locked", "--no-build", "pytest"],
+        ["uv", "run", "--locked", "pytest"],
         check=True,
         cwd=repo_root,
         timeout=_PYTEST_STEP_TIMEOUT_SECONDS,

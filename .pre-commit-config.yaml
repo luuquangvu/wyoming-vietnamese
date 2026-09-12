@@ -3,42 +3,42 @@ repos:
     hooks:
       - id: ruff-check
         name: Run Ruff Check
-        entry: uv run --locked --no-build ruff check --fix
+        entry: uv run --locked ruff check --fix
         language: system
         pass_filenames: false
         always_run: true
 
       - id: ruff-format
         name: Run Ruff Format
-        entry: uv run --locked --no-build ruff format
+        entry: uv run --locked ruff format
         language: system
         pass_filenames: false
         always_run: true
 
       - id: ty-check
         name: Run Ty Check
-        entry: uv run --locked --no-build ty check
+        entry: uv run --locked ty check
         language: system
         pass_filenames: false
         always_run: true
 
       - id: pyright
         name: Run Pyright
-        entry: uv run --locked --no-build pyright
+        entry: uv run --locked pyright
         language: system
         pass_filenames: false
         always_run: true
 
       - id: interrogate
         name: Run Interrogate
-        entry: uv run --locked --no-build interrogate
+        entry: uv run --locked interrogate
         language: system
         pass_filenames: false
         always_run: true
 
       - id: tally
         name: Run Tally
-        entry: uv run --locked --no-build tally lint --fix Dockerfile
+        entry: uv run --locked tally lint --fix Dockerfile
         language: system
         pass_filenames: false
         always_run: true
@@ -52,7 +52,7 @@ repos:
 
       - id: pytest
         name: Run Pytest
-        entry: uv run --locked --no-build pytest
+        entry: uv run --locked pytest
         language: system
         pass_filenames: false
         always_run: true
