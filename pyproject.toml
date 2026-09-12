@@ -32,7 +32,6 @@ dev = [
 ]
 
 [tool.uv]
-python-preference = "only-managed"
 no-build = true
 
 [tool.ruff]
