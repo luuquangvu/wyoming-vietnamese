@@ -12,7 +12,7 @@ from wyoming_vietnamese.combined import CombinedEventHandler, combine_service_in
 from wyoming_vietnamese.protocol import SafeAsyncEventHandler
 from wyoming_vietnamese.stt import get_stt_info
 from wyoming_vietnamese.tts import get_tts_info
-from wyoming_vietnamese.tts_model import DEFAULT_TTS_VOICE
+from wyoming_vietnamese.tts_model import DEFAULT_NGHITTS_VOICE
 
 
 class NoopHandler(SafeAsyncEventHandler):
@@ -27,7 +27,7 @@ async def test_combined_endpoint_serves_discovery_over_real_tcp() -> None:
     """Test combined endpoint serves discovery over real tcp."""
     service_info = combine_service_info(
         get_stt_info("owner/stt"),
-        get_tts_info(DEFAULT_TTS_VOICE),
+        get_tts_info(DEFAULT_NGHITTS_VOICE),
     )
     tasks: set[asyncio.Task[None]] = set()
     factory: Callable[

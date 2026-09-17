@@ -17,14 +17,24 @@ from urllib.request import Request, urlopen
 
 from .config import get_env_bool
 from .const import (
+    DEFAULT_TTS_ENGINE,
     NGHITTS_MODEL_BASE_URL,
-    TTS_CONFIG_FILE,
-    TTS_MODEL_FILE,
-    TTS_SAMPLE_RATE,
-    TTS_TOKENS_FILE,
+    NghiTtsAudio,
+    NghiTtsFile,
+    TtsEngine,
+    ZeroTtsDirectory,
 )
 from .stt_model import STT_MODEL, SttArtifact
-from .tts_model import TtsVoiceSpec
+from .tts import validate_tts_voices_for_engine
+from .tts_model import (
+    ZEROTTS_MODEL,
+    ZEROTTS_VOICES,
+    NghiTtsVoiceSpec,
+    ZeroTtsArtifact,
+    ZeroTtsVoiceSpec,
+)
+
+AnyVoiceSpec = NghiTtsVoiceSpec | ZeroTtsVoiceSpec
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -41,20 +51,36 @@ def setup_hf_environment(cache_dir: Path, offline: bool = False) -> None:
 def download_models(
     cache_dir: Path,
     download_dir: Path,
-    tts_voices: tuple[TtsVoiceSpec, ...],
+    tts_voices: tuple[AnyVoiceSpec, ...],
     offline: bool = False,
+    tts_engine: str = DEFAULT_TTS_ENGINE,
 ) -> dict[str, Path]:
-    """Synchronize required assets and build stable local model paths."""
-    if not tts_voices:
-        raise ValueError("At least one TTS voice must be configured")
+    """Synchronize and verify the selected engine's assets under stable local paths.
+
+    Args:
+        cache_dir: Persistent storage for downloaded model snapshots.
+        download_dir: Destination for the structured STT and TTS model layouts.
+        tts_voices: Voices whose assets are required for startup.
+        offline: Require every model artifact to be available from local caches.
+        tts_engine: Select the NghiTTS or ZeroTTS model source and layout.
+
+    Returns:
+        Stable ``stt`` and ``tts`` model directory paths.
+
+    Raises:
+        ValueError: If no TTS voice is configured or TTS engine is unknown.
+        TypeError: If configured voices do not match the selected TTS engine.
+    """
+    validate_tts_voices_for_engine(tts_voices, tts_engine)
     cache_dir.mkdir(parents=True, exist_ok=True)
     download_dir.mkdir(parents=True, exist_ok=True)
     setup_hf_environment(cache_dir, offline)
 
     _LOGGER.info(
-        "Synchronizing model assets: cache_dir=%s, download_dir=%s",
+        "Synchronizing model assets: cache_dir=%s, download_dir=%s, tts_engine=%s",
         cache_dir,
         download_dir,
+        tts_engine,
     )
     _LOGGER.info(
         "STT model: repo=%s revision=%s files=%d",
@@ -69,19 +95,40 @@ def download_models(
         allow_patterns=STT_MODEL.allow_patterns,
     )
 
-    tts_snapshots = {
-        voice.id: _sync_nghitts_model(cache_dir, offline, voice) for voice in tts_voices
-    }
-
     stt_dest = download_dir / "stt"
     tts_dest = download_dir / "tts"
-    with _model_structure_lock(download_dir):
-        stt_dest.mkdir(parents=True, exist_ok=True)
-        _structure_stt_files(stt_snapshot, stt_dest)
-        for voice in tts_voices:
-            voice_dest = tts_dest / voice.id
-            voice_dest.mkdir(parents=True, exist_ok=True)
-            _structure_nghitts_files(tts_snapshots[voice.id], voice_dest)
+
+    if tts_engine == TtsEngine.ZEROTTS:
+        _LOGGER.info(
+            "ZeroTTS model: repo=%s revision=%s files=%d",
+            ZEROTTS_MODEL.repo,
+            ZEROTTS_MODEL.revision,
+            len(ZEROTTS_MODEL.artifacts),
+        )
+        zerotts_snapshot = _sync_repo(
+            ZEROTTS_MODEL.repo,
+            offline,
+            revision=ZEROTTS_MODEL.revision,
+            allow_patterns=ZEROTTS_MODEL.allow_patterns,
+        )
+        with _model_structure_lock(download_dir):
+            stt_dest.mkdir(parents=True, exist_ok=True)
+            _structure_stt_files(stt_snapshot, stt_dest)
+            _structure_zerotts_files(zerotts_snapshot, tts_dest, tts_voices)
+    elif tts_engine == TtsEngine.NGHITTS:
+        nghitts_voices = tuple(voice for voice in tts_voices if isinstance(voice, NghiTtsVoiceSpec))
+        tts_snapshots = {
+            voice.id: _sync_nghitts_model(cache_dir, offline, voice) for voice in nghitts_voices
+        }
+        with _model_structure_lock(download_dir):
+            stt_dest.mkdir(parents=True, exist_ok=True)
+            _structure_stt_files(stt_snapshot, stt_dest)
+            for voice in nghitts_voices:
+                voice_dest = tts_dest / voice.id
+                voice_dest.mkdir(parents=True, exist_ok=True)
+                _structure_nghitts_files(tts_snapshots[voice.id], voice_dest)
+    else:
+        raise ValueError(f"Unknown TTS engine: {tts_engine}")
 
     _LOGGER.info("Model verification and structure synchronization completed")
     return {"stt": stt_dest, "tts": tts_dest}
@@ -189,7 +236,7 @@ def _download_verified_file(
 def _sync_nghitts_model(
     cache_dir: Path,
     offline: bool,
-    voice: TtsVoiceSpec,
+    voice: NghiTtsVoiceSpec,
     *,
     base_url: str = NGHITTS_MODEL_BASE_URL,
 ) -> Path:
@@ -198,7 +245,7 @@ def _sync_nghitts_model(
     if parsed_url.scheme != "https" or not parsed_url.netloc:
         raise ValueError("The NghiTTS model source must be an absolute HTTPS URL")
 
-    snapshot_path = cache_dir / "nghitts" / voice.id
+    snapshot_path = cache_dir / TtsEngine.NGHITTS / voice.id
     snapshot_path.mkdir(parents=True, exist_ok=True)
     lock_path = snapshot_path / ".download.lock"
     with lock_path.open("a+b") as lock_file:
@@ -405,8 +452,8 @@ def _nghitts_sherpa_metadata(config_path: Path) -> tuple[tuple[str, str], ...]:
     """Build the NghiTTS metadata fields required by Sherpa-ONNX."""
     config = _load_nghitts_configuration(config_path)
     audio = config.get("audio")
-    if not isinstance(audio, dict) or audio.get("sample_rate") != TTS_SAMPLE_RATE:
-        raise ValueError(f"NghiTTS configuration must use {TTS_SAMPLE_RATE} Hz audio")
+    if not isinstance(audio, dict) or audio.get("sample_rate") != NghiTtsAudio.SAMPLE_RATE:
+        raise ValueError(f"NghiTTS configuration must use {NghiTtsAudio.SAMPLE_RATE} Hz audio")
     if config.get("num_speakers") != 1:
         raise ValueError("NghiTTS configuration must contain exactly one speaker")
     if config.get("phoneme_type") != "espeak":
@@ -416,7 +463,7 @@ def _nghitts_sherpa_metadata(config_path: Path) -> tuple[tuple[str, str], ...]:
     if not isinstance(voice, str) or not voice:
         raise ValueError("NghiTTS configuration has no eSpeak voice")
     return (
-        ("sample_rate", str(TTS_SAMPLE_RATE)),
+        ("sample_rate", str(NghiTtsAudio.SAMPLE_RATE)),
         ("n_speakers", "1"),
         ("model_type", "vits"),
         ("comment", "piper"),
@@ -573,17 +620,17 @@ def _structure_stt_files(snapshot_path: Path, dest_dir: Path) -> list[Path]:
 
 def _structure_nghitts_files(snapshot_path: Path, dest_dir: Path) -> list[Path]:
     """Build Sherpa's local layout from a synchronized NghiTTS voice snapshot."""
-    model_source = snapshot_path / TTS_MODEL_FILE
-    config_source = snapshot_path / TTS_CONFIG_FILE
+    model_source = snapshot_path / NghiTtsFile.MODEL
+    config_source = snapshot_path / NghiTtsFile.CONFIG
     if missing := [path.name for path in (model_source, config_source) if not path.is_file()]:
         raise FileNotFoundError(
             f"Incomplete NghiTTS snapshot {snapshot_path!s}; missing: {', '.join(missing)}"
         )
 
     dest_dir.mkdir(parents=True, exist_ok=True)
-    config_destination = dest_dir / TTS_CONFIG_FILE
-    tokens_destination = dest_dir / TTS_TOKENS_FILE
-    model_destination = dest_dir / TTS_MODEL_FILE
+    config_destination = dest_dir / NghiTtsFile.CONFIG
+    tokens_destination = dest_dir / NghiTtsFile.TOKENS
+    model_destination = dest_dir / NghiTtsFile.MODEL
     _copy_or_link(config_source, config_destination)
     _generate_nghitts_tokens(config_destination, tokens_destination)
     _convert_nghitts_model_for_sherpa(
@@ -592,6 +639,106 @@ def _structure_nghitts_files(snapshot_path: Path, dest_dir: Path) -> list[Path]:
         model_destination,
     )
     return [model_destination, config_destination, tokens_destination]
+
+
+def _locate_zerotts_gguf(snapshot_path: Path, artifact: ZeroTtsArtifact) -> Path:
+    """Locate a ZeroTTS GGUF model file across snapshot directories."""
+    expected_name = Path(artifact.remote_name).name
+    candidate = snapshot_path / expected_name
+    gguf_dir = snapshot_path / ZeroTtsDirectory.GGUF
+    if not candidate.is_file() and gguf_dir.is_dir():
+        candidate = gguf_dir / expected_name
+    if candidate.is_file():
+        return candidate
+
+    gguf_candidates = [
+        f for f in snapshot_path.glob("*.gguf") if _is_verified_file(f, artifact.sha256)
+    ]
+    if gguf_dir.is_dir():
+        gguf_candidates.extend(
+            f for f in gguf_dir.glob("*.gguf") if _is_verified_file(f, artifact.sha256)
+        )
+    if gguf_candidates:
+        return gguf_candidates[0]
+    raise FileNotFoundError(f"Missing ZeroTTS GGUF model weights in snapshot: {snapshot_path}")
+
+
+def _verified_zerotts_source(snapshot_path: Path, artifact: ZeroTtsArtifact) -> Path:
+    """Return one pinned ZeroTTS snapshot file, rejecting any content that is not identical."""
+    source = snapshot_path / artifact.remote_name
+    if not source.is_file():
+        alt_source = snapshot_path / artifact.local_name
+        if alt_source.is_file():
+            source = alt_source
+        elif artifact.remote_name.endswith(".gguf"):
+            source = _locate_zerotts_gguf(snapshot_path, artifact)
+        else:
+            raise FileNotFoundError(
+                f"Pinned ZeroTTS artifact is missing from {snapshot_path!s}: {artifact.remote_name}"
+            )
+    if not _is_verified_file(source, artifact.sha256):
+        raise RuntimeError(
+            f"Pinned ZeroTTS artifact {artifact.remote_name!r} does not match its recorded "
+            f"SHA-256 digest"
+        )
+    return source
+
+
+def _structure_zerotts_files(
+    snapshot_path: Path,
+    dest_dir: Path,
+    voices: Sequence[AnyVoiceSpec] | None = None,
+) -> list[Path]:
+    """Verify pinned ZeroTTS assets and expose them under a stable local layout.
+
+    When ``voices`` is provided, every listed ZeroTTS voice must exist in the
+    resulting layout and match its pinned digest.
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    copied_paths: list[Path] = []
+
+    for artifact in ZEROTTS_MODEL.artifacts:
+        source = _verified_zerotts_source(snapshot_path, artifact)
+        dst = dest_dir / artifact.local_name
+        _copy_or_link(source, dst)
+        if not _is_verified_file(dst, artifact.sha256):
+            raise RuntimeError(
+                f"Structured ZeroTTS artifact {artifact.local_name!r} does not match its "
+                f"recorded SHA-256 digest"
+            )
+        copied_paths.append(dst)
+
+    for voice in ZEROTTS_VOICES:
+        source = snapshot_path / voice.artifact.remote_name
+        if not source.is_file():
+            flat_source = snapshot_path / "voices" / f"{voice.id}.npz"
+            if flat_source.is_file():
+                source = flat_source
+            else:
+                continue
+        if not _is_verified_file(source, voice.artifact.sha256):
+            raise RuntimeError(
+                f"Pinned ZeroTTS voice {voice.id!r} does not match its recorded SHA-256 digest"
+            )
+        dst = dest_dir / "voices" / voice.id / "voice.npz"
+        _copy_or_link(source, dst)
+        copied_paths.append(dst)
+
+    if voices:
+        for v in voices:
+            if isinstance(v, ZeroTtsVoiceSpec):
+                expected_dst = dest_dir / "voices" / v.id / "voice.npz"
+                if not expected_dst.is_file():
+                    raise FileNotFoundError(
+                        f"Configured ZeroTTS voice {v.id!r} is missing from {snapshot_path!s}"
+                    )
+                if not _is_verified_file(expected_dst, v.artifact.sha256):
+                    raise RuntimeError(
+                        f"Configured ZeroTTS voice {v.id!r} does not match its recorded "
+                        f"SHA-256 digest"
+                    )
+
+    return copied_paths
 
 
 def _copy_or_link(src: Path, dst: Path) -> None:

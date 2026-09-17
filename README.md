@@ -10,8 +10,10 @@ Toàn bộ quá trình xử lý giọng nói và suy luận diễn ra ngay trên
 
 - **2 trong 1 (STT + TTS)**: Tích hợp cả nhận diện giọng nói (Speech-to-Text) lẫn phát giọng đọc (Text-to-Speech) trong một container duy nhất, dùng chung một cổng mạng (`10300`).
 - **Cục bộ và Riêng tư**: Dữ liệu giọng nói và văn bản của gia đình bạn không bao giờ rời khỏi mạng nội bộ (quá trình suy luận chạy 100% offline sau khi đã nạp mô hình ở lần khởi động đầu).
-- **Tốc độ cao và Tiết kiệm tài nguyên**: Sử dụng mô hình Zipformer tiếng Việt (STT) và VITS NghiTTS chạy qua bộ suy luận C++ tối ưu `sherpa-onnx`, phản hồi nhanh ngay cả trên các thiết bị có cấu hình vừa và yếu (Raspberry Pi 4/5, Mini PC, NAS).
-- **20 giọng đọc tiếng Việt phong phú**: Đầy đủ giọng miền Bắc, miền Nam, nam và nữ với ngữ điệu tự nhiên, rõ ràng.
+- **Linh hoạt 2 engine TTS (NghiTTS vs ZeroTTS)**:
+  - **Engine NghiTTS (`TTS_ENGINE: nghitts`)**: Sử dụng mô hình VITS NghiTTS chạy qua `sherpa-onnx` (22.05 kHz), tốc độ phản hồi cực nhanh, lý tưởng cho Raspberry Pi và phần cứng tiết kiệm điện.
+  - **Engine ZeroTTS (`TTS_ENGINE: zerotts`)**: Sử dụng mô hình ZeroTTS (GGUF Q8_0 + MOSS Codec 48 kHz qua runtime C++ GGML), chất lượng giọng đọc AI neural tự nhiên và biểu cảm vượt trội.
+- **Danh mục giọng đọc phong phú**: 20 giọng đọc NghiTTS và 8 giọng đọc ZeroTTS bao gồm miền Bắc, miền Nam, nam và nữ.
 - **Ngắt nghỉ tự nhiên theo chuẩn ngữ pháp**: Tự động căn chỉnh khoảng nghỉ giữa đoạn văn, câu và vế câu (dấu phẩy), giúp câu văn mạch lạc, không bị dồn chữ.
 - **Tự động tải và Sẵn sàng chạy ngoại tuyến**: Tự động tải mô hình ở lần khởi động đầu tiên, lưu vào Docker volume và có thể hoạt động hoàn toàn không cần Internet sau khi các mô hình/giọng cần dùng đã được tải.
 
@@ -76,28 +78,46 @@ Sau khi container đã khởi động thành công:
 
 ---
 
-## Danh sách giọng đọc và tùy chỉnh giọng
+## Danh sách giọng đọc và tùy chỉnh engine TTS
 
-Mở tệp `docker-compose.online.yaml` và chỉnh sửa biến `TTS_VOICE`. Bạn có thể khai báo một hoặc nhiều mã giọng, ngăn cách bằng dấu phẩy hoặc khoảng trắng:
+Container hỗ trợ 2 engine phát giọng đọc (Text-to-Speech) thông qua biến môi trường `TTS_ENGINE`:
+
+1. **`nghitts` (Mặc định)**: Sử dụng các giọng đọc **NghiTTS** (mô hình VITS 22.05 kHz) qua runtime C++ `sherpa-onnx`. Tốc độ phản hồi cực nhanh, tài nguyên thấp, tối ưu nhất cho Raspberry Pi và mini PC.
+2. **`zerotts`**: Sử dụng các giọng đọc **ZeroTTS** (mô hình Autoregressive Transformer + GGUF Q8_0 + MOSS Codec 48 kHz qua runtime C++ GGML). Chất lượng âm thanh phòng thu 48 kHz, biểu cảm phong phú và tự nhiên vượt bậc.
+
+Mở tệp `docker-compose.online.yaml` và tùy chỉnh `TTS_ENGINE` cùng `TTS_VOICE`. Bạn có thể khai báo một hoặc nhiều mã giọng (tùy theo engine đã chọn), ngăn cách bằng dấu phẩy hoặc khoảng trắng:
 
 - Mã giọng đứng **đầu tiên** sẽ là giọng đọc mặc định.
 - Các giọng còn lại sẽ xuất hiện trong danh sách lựa chọn của Home Assistant.
 
+### Ví dụ cấu hình engine NghiTTS (Mặc định)
+
 ```yaml
 environment:
   WYOMING_PORT: 10300
+  TTS_ENGINE: "nghitts"
   TTS_VOICE: "ngoc-huyen-moi, duy-onyx-moi, thanh-phuong-viettel, ngoc-ngan, mai-phuong"
   LOG_LEVEL: "info"
 ```
 
+### Ví dụ cấu hình engine ZeroTTS (Chất lượng cao)
+
+```yaml
+environment:
+  WYOMING_PORT: 10300
+  TTS_ENGINE: "zerotts"
+  TTS_VOICE: "maichi, baotrang, giahuy, hamy, huuduc"
+  LOG_LEVEL: "info"
+```
+
 > [!TIP]
-> Biến môi trường chỉ được nạp khi container được tạo mới. Sau khi thay đổi `TTS_VOICE`, hãy chạy lệnh sau để áp dụng:
+> Biến môi trường chỉ được nạp khi container được tạo mới. Sau khi thay đổi `TTS_ENGINE` hoặc `TTS_VOICE`, hãy chạy lệnh sau để áp dụng:
 >
 > ```bash
 > docker compose -f docker-compose.online.yaml up -d --force-recreate
 > ```
 
-### Bảng mã giọng đọc có sẵn
+### Bảng mã giọng đọc engine NghiTTS (VITS 22.05 kHz)
 
 | Mã giọng (`id`)        | Tên hiển thị         | Vùng miền / Đặc trưng                                                  | Mặc định |
 | :--------------------- | :------------------- | :--------------------------------------------------------------------- | :------: |
@@ -122,6 +142,19 @@ environment:
 | `my-tam-real`          | Mỹ Tâm Real          | Nữ miền Nam (giọng ca sĩ Mỹ Tâm, ngữ điệu miền Nam chân thực)          |          |
 | `adam`                 | adam                 | Nam quốc tế (chất giọng ElevenLabs Adam đọc tiếng Việt)                |          |
 
+### Bảng mã giọng đọc engine ZeroTTS (Neural 48 kHz)
+
+| Mã giọng (`id`) | Tên hiển thị | Giới tính / Vùng miền | Mặc định |
+| :-------------- | :----------- | :-------------------- | :------: |
+| `maichi`        | Mai Chi      | Nữ miền Bắc           |  **Có**  |
+| `baotrang`      | Bảo Trang    | Nữ miền Bắc           |          |
+| `giahuy`        | Gia Huy      | Nam miền Bắc          |          |
+| `hamy`          | Hà My        | Nữ miền Bắc           |          |
+| `huuduc`        | Hữu Đức      | Nam miền Bắc          |          |
+| `kimoanh`       | Kim Oanh     | Nữ miền Bắc           |          |
+| `quangminh`     | Quang Minh   | Nam miền Bắc          |          |
+| `tiendat`       | Tiến Đạt     | Nam miền Bắc          |          |
+
 ---
 
 ## Cấu hình chi tiết và tùy chọn nâng cao
@@ -129,6 +162,7 @@ environment:
 ### Các thiết lập mặc định trong Compose
 
 - `WYOMING_PORT`: Cổng TCP dịch vụ lắng nghe (mặc định: `10300`).
+- `TTS_ENGINE`: Engine phát giọng đọc (`nghitts` hoặc `zerotts`, mặc định: `nghitts`).
 - `TTS_VOICE`: Danh sách các giọng TTS được tải và kích hoạt (giọng đầu tiên là mặc định).
 - `LOG_LEVEL`: Mức độ chi tiết của nhật ký (`info`, `debug`, `warning`, `error`).
 
@@ -136,14 +170,15 @@ environment:
 
 Khi cần tối ưu hóa hoặc kiểm soát chi tiết hơn, bạn có thể thêm các biến môi trường sau vào phần `environment` của tệp Compose:
 
-| Biến môi trường            |      Mặc định      | Ý nghĩa và Hướng dẫn                                                                                                            |
-| :------------------------- | :----------------: | :------------------------------------------------------------------------------------------------------------------------------ |
-| `TZ`                       | `Asia/Ho_Chi_Minh` | Múi giờ địa phương để hiển thị thời gian trong log chính xác.                                                                   |
-| `CPU_THREADS`              |        `0`         | Số luồng CPU sử dụng cho suy luận (`0` là tự động dùng tất cả luồng khả dụng).                                                  |
-| `OFFLINE`                  |      `false`       | Đặt `"true"` sau khi đã tải đủ mô hình để chỉ nạp mô hình từ bộ nhớ đệm cục bộ (báo lỗi nếu thiếu file thay vì kết nối tải về). |
-| `TTS_PARAGRAPH_SILENCE_MS` |       `600`        | Khoảng lặng tối thiểu giữa các đoạn văn hoặc ngắt dòng (đơn vị: mili-giây).                                                     |
-| `TTS_SENTENCE_SILENCE_MS`  |       `400`        | Khoảng lặng tối thiểu giữa các câu kết thúc bằng dấu `.`, `!`, `?`. Tăng giá trị này nếu muốn giọng đọc chậm rãi hơn.           |
-| `TTS_CLAUSE_SILENCE_MS`    |       `200`        | Khoảng lặng tối thiểu sau dấu phẩy `,`, chấm phẩy `;`, hai chấm `:` trong câu.                                                  |
+| Biến môi trường            |      Mặc định      | Ý nghĩa và Hướng dẫn                                                                                                                                                        |
+| :------------------------- | :----------------: | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TTS_ENGINE`               |     `nghitts`      | Engine phát giọng đọc: `nghitts` (NghiTTS qua sherpa-onnx) hoặc `zerotts` (ZeroTTS GGUF Q8_0 qua GGML C-FFI).                                                               |
+| `TZ`                       | `Asia/Ho_Chi_Minh` | Múi giờ địa phương để hiển thị thời gian trong log chính xác.                                                                                                               |
+| `CPU_THREADS`              |        `0`         | Số luồng CPU sử dụng cho suy luận (`0` là tự động dùng tất cả luồng khả dụng).                                                                                              |
+| `OFFLINE`                  |      `false`       | Đặt `"true"` sau khi đã tải đủ mô hình để chỉ nạp mô hình từ bộ nhớ đệm cục bộ (báo lỗi nếu thiếu file thay vì kết nối tải về).                                             |
+| `TTS_PARAGRAPH_SILENCE_MS` |       `600`        | Khoảng lặng tối thiểu giữa các đoạn văn hoặc ngắt dòng (đơn vị: mili-giây, chỉ áp dụng cho engine `nghitts`).                                                               |
+| `TTS_SENTENCE_SILENCE_MS`  |       `400`        | Khoảng lặng tối thiểu giữa các câu kết thúc bằng dấu `.`, `!`, `?` (đơn vị: mili-giây, chỉ áp dụng cho engine `nghitts`). Tăng giá trị này nếu muốn giọng đọc chậm rãi hơn. |
+| `TTS_CLAUSE_SILENCE_MS`    |       `200`        | Khoảng lặng tối thiểu sau dấu phẩy `,`, chấm phẩy `;`, hai chấm `:` trong câu (đơn vị: mili-giây, chỉ áp dụng cho engine `nghitts`).                                        |
 
 > [!IMPORTANT]
 > Hai volume `cache` và `models` lưu trữ toàn bộ mô hình đã tải về. Không nên xóa hai volume này để container khởi động tức thì ở các lần sau và có thể hoạt động ngoại tuyến.
@@ -182,7 +217,7 @@ docker rm -f wyoming-vietnamese
 Dành cho lập trình viên hoặc người muốn tùy biến mã nguồn:
 
 ```bash
-git clone https://github.com/luuquangvu/wyoming-vietnamese.git
+git clone https://github.com/luuquangvu/wyoming-vietnamese
 cd wyoming-vietnamese
 docker compose up --build -d
 ```
@@ -226,9 +261,10 @@ docker compose up --build -d
 
 Dự án được xây dựng dựa trên các công trình mã nguồn mở xuất sắc:
 
-- [nghimestudio/nghitts](https://github.com/nghimestudio/nghitts): Cung cấp các mô hình giọng nói tiếng Việt (TTS) chất lượng cao.
+- [nghimestudio/nghitts](https://github.com/nghimestudio/nghitts): Cung cấp các mô hình giọng nói tiếng Việt (TTS) chất lượng cao cho engine `nghitts`.
+- [zeroweight-ai/ZeroTTS](https://github.com/zeroweight-ai/ZeroTTS): Cung cấp mô hình ngôn ngữ giọng nói ZeroTTS và runtime C++ GGML cho engine `zerotts`.
 - [hynt](https://huggingface.co/hynt): Cung cấp mô hình nhận diện giọng nói tiếng Việt `Zipformer-30M-RNNT-6000h` (STT).
-- [k2-fsa/sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx): Bộ máy suy luận offline tối ưu cao cho cả STT và TTS.
+- [k2-fsa/sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx): Thư viện suy luận offline tối ưu cao cho cả STT và TTS.
 - [Wyoming Protocol](https://github.com/OHF-Voice/wyoming): Chuẩn giao tiếp giọng nói mở cho hệ sinh thái Home Assistant.
 
 ---

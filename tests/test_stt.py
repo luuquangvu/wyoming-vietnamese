@@ -19,7 +19,7 @@ from wyoming.event import Event
 from wyoming.info import Describe
 
 from tests.helpers import make_reader, stream_writer, written_events
-from wyoming_vietnamese.const import VIETNAMESE_LANGUAGE
+from wyoming_vietnamese.const import PROGRAM_NAME, VIETNAMESE_LANGUAGE
 from wyoming_vietnamese.protocol import ByteBudget
 from wyoming_vietnamese.stt import (
     SherpaSTTEventHandler,
@@ -437,7 +437,7 @@ async def test_stt_disconnect_releases_buffer() -> None:
 def test_stt_info_uses_configured_model() -> None:
     """Test stt info uses configured model."""
     info = get_stt_info("custom/model", "revision")
-    assert info.asr[0].name == "wyoming_vietnamese"
+    assert info.asr[0].name == PROGRAM_NAME
     model = info.asr[0].models[0]
     assert model.name == "custom/model"
     assert model.version == "revision"

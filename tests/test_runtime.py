@@ -17,10 +17,11 @@ from wyoming_vietnamese import healthcheck
 from wyoming_vietnamese.__main__ import _drain_inference, main, run_server
 from wyoming_vietnamese.combined import CombinedEventHandler, combine_service_info
 from wyoming_vietnamese.config import ServerConfig, resolve_cpu_threads
+from wyoming_vietnamese.const import PROGRAM_NAME, TtsEngine
 from wyoming_vietnamese.protocol import ConnectionLimiter
 from wyoming_vietnamese.stt import get_stt_info
 from wyoming_vietnamese.tts import get_tts_info
-from wyoming_vietnamese.tts_model import DEFAULT_TTS_VOICE
+from wyoming_vietnamese.tts_model import DEFAULT_NGHITTS_VOICE, DEFAULT_ZEROTTS_VOICE
 
 
 def _event_bytes(event: Event) -> bytes:
@@ -85,7 +86,7 @@ async def test_healthcheck_accepts_combined_info_and_closes_writer(
     """Test healthcheck accepts combined info and closes writer."""
     info = combine_service_info(
         get_stt_info("owner/stt"),
-        get_tts_info(DEFAULT_TTS_VOICE),
+        get_tts_info(DEFAULT_NGHITTS_VOICE),
     )
     writer = stream_writer()
     reader = make_reader(_event_bytes(info.event()))
@@ -172,6 +173,7 @@ def _patch_runtime(
     monkeypatch.setattr("wyoming_vietnamese.__main__.initialize_stt", Mock(return_value=object()))
     monkeypatch.setattr("wyoming_vietnamese.__main__.warm_up_stt", Mock())
     monkeypatch.setattr("wyoming_vietnamese.__main__.initialize_tts_voices", init_tts)
+    monkeypatch.setattr("wyoming_vietnamese.__main__.initialize_zerotts", Mock(return_value=tts))
     monkeypatch.setattr("wyoming_vietnamese.__main__.warm_up_tts", warm_up)
     monkeypatch.setattr("wyoming_vietnamese.__main__.get_stt_info", Mock(return_value=Info()))
     monkeypatch.setattr("wyoming_vietnamese.__main__.get_tts_info", Mock(return_value=Info()))
@@ -197,15 +199,14 @@ async def test_drain_inference_waits_for_an_active_request() -> None:
 
 
 async def test_drain_inference_reports_a_stuck_request(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Test a request that outlives the drain window is reported instead of ignored."""
-    monkeypatch.setattr("wyoming_vietnamese.__main__.SHUTDOWN_DRAIN_TIMEOUT", 0.01)
     lock = asyncio.Lock()
     await lock.acquire()
     try:
-        with caplog.at_level(logging.WARNING, logger="wyoming_vietnamese"):
-            await _drain_inference(lock, "STT")
+        with caplog.at_level(logging.WARNING, logger=PROGRAM_NAME):
+            await _drain_inference(lock, "STT", timeout=0.01)
     finally:
         lock.release()
     assert any("in-flight STT inference" in message for message in caplog.messages)
@@ -235,12 +236,75 @@ async def test_run_server_starts_one_combined_service(
     assert limiter.accepting is False
     assert server.stopped is True
     assert tts.closed is True
-    warm_up.assert_called_once_with(tts)
+    warm_up.assert_called_once_with(tts, (DEFAULT_NGHITTS_VOICE,), TtsEngine.NGHITTS)
     init_tts.assert_called_once_with(
         tmp_path / "tts",
-        (DEFAULT_TTS_VOICE,),
+        (DEFAULT_NGHITTS_VOICE,),
         resolve_cpu_threads(0),
     )
+
+
+async def test_run_server_starts_zerotts_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test run server starts combined service with ZeroTTS engine."""
+    server = FakeServer()
+    tts = ClosableTTS()
+    warm_up = Mock()
+    init_zerotts = Mock(return_value=tts)
+    init_nghitts = Mock(return_value=tts)
+    download = Mock(return_value={"stt": tmp_path / "stt", "tts": tmp_path / "tts"})
+    get_tts_info_mock = Mock(return_value=Info())
+
+    monkeypatch.setattr("wyoming_vietnamese.__main__.download_models", download)
+    monkeypatch.setattr("wyoming_vietnamese.__main__.initialize_stt", Mock(return_value=object()))
+    monkeypatch.setattr("wyoming_vietnamese.__main__.warm_up_stt", Mock())
+    monkeypatch.setattr("wyoming_vietnamese.__main__.initialize_tts_voices", init_nghitts)
+    monkeypatch.setattr("wyoming_vietnamese.__main__.initialize_zerotts", init_zerotts)
+    monkeypatch.setattr("wyoming_vietnamese.__main__.warm_up_tts", warm_up)
+    monkeypatch.setattr("wyoming_vietnamese.__main__.get_stt_info", Mock(return_value=Info()))
+    monkeypatch.setattr("wyoming_vietnamese.__main__.get_tts_info", get_tts_info_mock)
+    monkeypatch.setattr(
+        "wyoming_vietnamese.__main__.AsyncServer.from_uri",
+        Mock(side_effect=[server]),
+    )
+
+    executor = Mock()
+    monkeypatch.setattr(
+        "wyoming_vietnamese.__main__.create_inference_executor",
+        Mock(return_value=executor),
+    )
+    stop_event = asyncio.Event()
+    stop_event.set()
+
+    config = ServerConfig.from_env(
+        {
+            "WYOMING_PORT": "10300",
+            "CACHE_DIR": str(tmp_path / "cache"),
+            "DOWNLOAD_DIR": str(tmp_path / "models"),
+            "TTS_ENGINE": "zerotts",
+        }
+    )
+    await run_server(config, stop_event)
+
+    executor.shutdown.assert_called_once_with()
+    assert server.stopped is True
+    assert tts.closed is True
+    download.assert_called_once_with(
+        cache_dir=config.cache_dir,
+        download_dir=config.download_dir,
+        tts_voices=(DEFAULT_ZEROTTS_VOICE,),
+        offline=False,
+        tts_engine=TtsEngine.ZEROTTS,
+    )
+    init_zerotts.assert_called_once_with(
+        tmp_path / "tts",
+        (DEFAULT_ZEROTTS_VOICE,),
+        resolve_cpu_threads(0),
+    )
+    init_nghitts.assert_not_called()
+    warm_up.assert_called_once_with(tts, (DEFAULT_ZEROTTS_VOICE,), TtsEngine.ZEROTTS)
+    get_tts_info_mock.assert_called_once_with((DEFAULT_ZEROTTS_VOICE,), engine=TtsEngine.ZEROTTS)
 
 
 async def test_run_server_drains_stt_and_tts_concurrently(

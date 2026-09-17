@@ -11,6 +11,7 @@ dependencies = [
   "sherpa-onnx",
   "sherpa-onnx-core",
   "wyoming",
+  "zerotts",
 ]
 
 [dependency-groups]
@@ -88,4 +89,5 @@ reportUnreachable = "warning"
 [tool.interrogate]
 fail-under = 100
 ignore-nested-functions = true
+ignore-overloaded-functions = true
 exclude = ["scratch"]

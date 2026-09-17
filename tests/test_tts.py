@@ -30,12 +30,16 @@ from wyoming.tts import (
 from tests.helpers import MemoryWriter, make_reader, stream_writer, written_events
 from wyoming_vietnamese.cache import BoundedLruCache
 from wyoming_vietnamese.const import (
-    TTS_CONFIG_FILE,
-    TTS_MODEL_FILE,
-    TTS_SAMPLE_RATE,
-    TTS_SAMPLE_WIDTH,
-    TTS_TOKENS_FILE,
+    PROGRAM_NAME,
     VIETNAMESE_LANGUAGE,
+    NghiTtsAudio,
+    NghiTtsFile,
+    TtsAudio,
+    TtsEngine,
+    TtsProvider,
+    ZeroTtsAudio,
+    ZeroTtsDirectory,
+    ZeroTtsFile,
 )
 from wyoming_vietnamese.tts import (
     MultiVoiceTTSEngine,
@@ -51,10 +55,18 @@ from wyoming_vietnamese.tts import (
     get_tts_info,
     get_tts_sample_rate,
     initialize_tts,
+    initialize_tts_engine,
     initialize_tts_voices,
+    initialize_zerotts,
+    validate_tts_voices_for_engine,
     warm_up_tts,
 )
-from wyoming_vietnamese.tts_model import DEFAULT_TTS_VOICE, get_voice
+from wyoming_vietnamese.tts_model import (
+    DEFAULT_NGHITTS_VOICE,
+    DEFAULT_ZEROTTS_VOICE,
+    ZEROTTS_VOICES,
+    get_voice,
+)
 
 
 class FakeTTS:
@@ -64,13 +76,15 @@ class FakeTTS:
         self,
         chunks: list[np.ndarray] | None = None,
         fail: bool = False,
-        sample_rate: int = 48000,
+        sample_rate: int = ZeroTtsAudio.SAMPLE_RATE,
+        chunks_are_sentences: bool = True,
     ) -> None:
         """Initialize the test double."""
         self._preset_voices = {"voice-a": {"description": "Voice A"}}
         self.chunks = chunks if chunks is not None else [np.array([0.0], dtype=np.float32)]
         self.fail = fail
         self.sample_rate = sample_rate
+        self.chunks_are_sentences = chunks_are_sentences
         self.calls: list[tuple[str, str | None]] = []
         self.options: list[dict[str, object]] = []
         self.closed = False
@@ -100,7 +114,7 @@ class FakeGeneratedAudio:
     def __init__(self, samples: np.ndarray) -> None:
         """Store generated samples and their fixed test sample rate."""
         self.samples = samples
-        self.sample_rate = TTS_SAMPLE_RATE
+        self.sample_rate: int = NghiTtsAudio.SAMPLE_RATE
 
 
 class FakeSherpaTTS:
@@ -109,7 +123,7 @@ class FakeSherpaTTS:
     def __init__(
         self,
         *,
-        sample_rate: int = TTS_SAMPLE_RATE,
+        sample_rate: int = NghiTtsAudio.SAMPLE_RATE,
         num_speakers: int = 1,
     ) -> None:
         """Initialize native metadata and callback tracking."""
@@ -154,7 +168,7 @@ def make_handler(
     stream = stream_writer(writer)
     handler = TTSEventHandler(
         tts,
-        get_tts_info(DEFAULT_TTS_VOICE).event(),
+        get_tts_info(DEFAULT_NGHITTS_VOICE).event(),
         lock or asyncio.Lock(),
         cache
         if cache is not None
@@ -259,11 +273,15 @@ async def test_tts_passes_wyoming_voice_name_to_engine() -> None:
 async def test_tts_resolves_voice_by_catalog_id() -> None:
     """Test a catalog voice ID resolves to its display name before dispatch."""
     engine = FakeTTS()
-    engine._preset_voices = {DEFAULT_TTS_VOICE.name: {"description": "NghiTTS voice"}}
+    engine._preset_voices = {
+        DEFAULT_NGHITTS_VOICE.name: {"description": f"{TtsProvider.NGHITTS} voice"}
+    }
     handler, writer = make_handler(engine)
-    request = Synthesize(text="Xin chào", voice=SynthesizeVoice(name=DEFAULT_TTS_VOICE.id)).event()
+    request = Synthesize(
+        text="Xin chào", voice=SynthesizeVoice(name=DEFAULT_NGHITTS_VOICE.id)
+    ).event()
     assert await handler.handle_event(request) is False
-    assert engine.calls == [("Xin chào", DEFAULT_TTS_VOICE.name)]
+    assert engine.calls == [("Xin chào", DEFAULT_NGHITTS_VOICE.name)]
     assert [event.type for event in written_events(writer)] == [
         "audio-start",
         "audio-chunk",
@@ -286,7 +304,7 @@ async def test_tts_logs_real_time_factor_for_one_shot_request(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Test TTS logs the real-time factor for a one-shot request."""
-    handler, _ = make_handler(FakeTTS([np.zeros(48000, dtype=np.float32)]))
+    handler, _ = make_handler(FakeTTS([np.zeros(ZeroTtsAudio.SAMPLE_RATE, dtype=np.float32)]))
 
     with caplog.at_level(logging.INFO, logger="wyoming_vietnamese.tts"):
         await handler.handle_event(Synthesize(text="Xin chào").event())
@@ -408,10 +426,10 @@ def test_boundary_kind_classifies_trailing_punctuation() -> None:
 
 def test_silence_pcm_matches_requested_duration() -> None:
     """Test silence padding is sized from the engine sample rate."""
-    assert _silence_pcm(0, 22050) == b""
-    assert _silence_pcm(100, 22050) == bytes(2205 * TTS_SAMPLE_WIDTH)
+    assert _silence_pcm(0, NghiTtsAudio.SAMPLE_RATE) == b""
+    assert _silence_pcm(100, NghiTtsAudio.SAMPLE_RATE) == bytes(2205 * TtsAudio.SAMPLE_WIDTH)
     with pytest.raises(ValueError, match="must not be negative"):
-        _silence_pcm(-1, 22050)
+        _silence_pcm(-1, NghiTtsAudio.SAMPLE_RATE)
 
 
 async def test_tts_pads_deterministic_boundary_pauses() -> None:
@@ -431,9 +449,9 @@ async def test_tts_pads_deterministic_boundary_pauses() -> None:
     speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
     pause_lengths = [len(part) for part in written_audio(writer).split(speech) if part]
     assert len(pause_lengths) == 3
-    clause_bytes = round(engine.sample_rate * 0.100) * TTS_SAMPLE_WIDTH
-    sentence_bytes = round(engine.sample_rate * 0.200) * TTS_SAMPLE_WIDTH
-    paragraph_bytes = round(engine.sample_rate * 0.300) * TTS_SAMPLE_WIDTH
+    clause_bytes = round(engine.sample_rate * 0.100) * TtsAudio.SAMPLE_WIDTH
+    sentence_bytes = round(engine.sample_rate * 0.200) * TtsAudio.SAMPLE_WIDTH
+    paragraph_bytes = round(engine.sample_rate * 0.300) * TtsAudio.SAMPLE_WIDTH
     assert pause_lengths == [clause_bytes, sentence_bytes, paragraph_bytes]
 
 
@@ -472,13 +490,13 @@ async def test_tts_pads_zero_duration_boundary_pauses(
         ("Mười ba mười bốn", None),
     ]
     clause_silence = bytes(
-        round(engine.sample_rate * (clause_silence_ms / 1000)) * TTS_SAMPLE_WIDTH
+        round(engine.sample_rate * (clause_silence_ms / 1000)) * TtsAudio.SAMPLE_WIDTH
     )
     sentence_silence = bytes(
-        round(engine.sample_rate * (sentence_silence_ms / 1000)) * TTS_SAMPLE_WIDTH
+        round(engine.sample_rate * (sentence_silence_ms / 1000)) * TtsAudio.SAMPLE_WIDTH
     )
     paragraph_silence = bytes(
-        round(engine.sample_rate * (paragraph_silence_ms / 1000)) * TTS_SAMPLE_WIDTH
+        round(engine.sample_rate * (paragraph_silence_ms / 1000)) * TtsAudio.SAMPLE_WIDTH
     )
 
     expected_audio = (
@@ -508,7 +526,7 @@ async def test_tts_pads_line_breaks_as_paragraph_boundaries() -> None:
     assert await handler.handle_event(SynthesizeStop().event()) is True
 
     speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
-    silence = bytes(round(engine.sample_rate * 0.1) * TTS_SAMPLE_WIDTH)
+    silence = bytes(round(engine.sample_rate * 0.1) * TtsAudio.SAMPLE_WIDTH)
     assert engine.calls == [("Một", None), ("Hai", None), ("Ba", None)]
     assert written_audio(writer) == speech + silence + speech + silence + speech
 
@@ -534,7 +552,7 @@ async def test_tts_pads_paragraph_silence_when_newline_arrives_in_later_chunk() 
     assert engine.calls == [("Đoạn thứ nhất", None), ("Đoạn thứ hai", None)]
 
     speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
-    paragraph_silence = bytes(round(engine.sample_rate * 0.100) * TTS_SAMPLE_WIDTH)
+    paragraph_silence = bytes(round(engine.sample_rate * 0.100) * TtsAudio.SAMPLE_WIDTH)
     assert written_audio(writer) == speech + paragraph_silence + speech
 
 
@@ -558,7 +576,7 @@ async def test_tts_pads_paragraph_silence_when_crlf_split_across_chunks() -> Non
     assert engine.calls == [("Đoạn thứ nhất", None), ("Đoạn thứ hai", None)]
 
     speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
-    paragraph_silence = bytes(round(engine.sample_rate * 0.100) * TTS_SAMPLE_WIDTH)
+    paragraph_silence = bytes(round(engine.sample_rate * 0.100) * TtsAudio.SAMPLE_WIDTH)
     assert written_audio(writer) == speech + paragraph_silence + speech
 
 
@@ -582,7 +600,7 @@ async def test_tts_pads_paragraph_silence_when_repeated_newlines_span_chunks() -
     assert engine.calls == [("Đoạn thứ nhất", None), ("Đoạn thứ hai", None)]
 
     speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
-    paragraph_silence = bytes(round(engine.sample_rate * 0.100) * TTS_SAMPLE_WIDTH)
+    paragraph_silence = bytes(round(engine.sample_rate * 0.100) * TtsAudio.SAMPLE_WIDTH)
     assert written_audio(writer) == speech + paragraph_silence + speech
 
 
@@ -595,9 +613,22 @@ async def test_tts_pads_sentence_pause_between_streamed_segments() -> None:
     assert await handler.handle_event(SynthesizeStop().event()) is True
 
     speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
-    silence = bytes(round(engine.sample_rate * 0.1) * TTS_SAMPLE_WIDTH)
+    silence = bytes(round(engine.sample_rate * 0.1) * TtsAudio.SAMPLE_WIDTH)
     assert engine.calls == [("Xin chào.", None), ("Tạm biệt", None)]
     assert written_audio(writer) == speech + silence + speech
+
+
+async def test_tts_skips_boundary_pause_when_chunks_are_not_sentences() -> None:
+    """Test boundary pauses are skipped for engines where chunks are not sentences."""
+    engine = FakeTTS([np.array([0.5], dtype=np.float32)], chunks_are_sentences=False)
+    handler, writer = make_handler(engine, sentence_silence_ms=100)
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Xin chào. Tạm biệt").event()) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+
+    speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+    assert engine.calls == [("Xin chào.", None), ("Tạm biệt", None)]
+    assert written_audio(writer) == speech + speech
 
 
 async def test_tts_pads_shorter_pause_after_clause_punctuation() -> None:
@@ -610,7 +641,7 @@ async def test_tts_pads_shorter_pause_after_clause_punctuation() -> None:
     assert await handler.handle_event(SynthesizeStop().event()) is True
 
     speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
-    silence = bytes(round(engine.sample_rate * 0.02) * TTS_SAMPLE_WIDTH)
+    silence = bytes(round(engine.sample_rate * 0.02) * TtsAudio.SAMPLE_WIDTH)
     assert engine.calls == [("Ngày mai trời đẹp,", None), ("chúng ta đi", None)]
     assert written_audio(writer) == speech + silence + speech
 
@@ -626,10 +657,29 @@ async def test_tts_pads_between_engine_sentence_chunks() -> None:
     handler, writer = make_handler(engine, sentence_silence_ms=100)
     assert await handler.handle_event(Synthesize(text="Xin chào. Tạm biệt.").event()) is False
 
-    silence = bytes(round(engine.sample_rate * 0.1) * TTS_SAMPLE_WIDTH)
+    silence = bytes(round(engine.sample_rate * 0.1) * TtsAudio.SAMPLE_WIDTH)
     assert written_audio(writer) == (
         _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
         + silence
+        + _audio_to_pcm_bytes(np.array([0.25], dtype=np.float32))
+    )
+
+
+async def test_tts_omits_silence_between_subsentence_engine_chunks() -> None:
+    """Test engines with progressive sub-sentence chunks omit inter-chunk silence."""
+    engine = FakeTTS(
+        [
+            np.array([0.5], dtype=np.float32),
+            np.array([0.25], dtype=np.float32),
+        ],
+        chunks_are_sentences=False,
+    )
+    handler, writer = make_handler(engine, sentence_silence_ms=100)
+    assert handler.chunks_are_sentences is False
+    assert await handler.handle_event(Synthesize(text="Xin chào. Tạm biệt.").event()) is False
+
+    assert written_audio(writer) == (
+        _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
         + _audio_to_pcm_bytes(np.array([0.25], dtype=np.float32))
     )
 
@@ -1005,18 +1055,109 @@ async def test_tts_does_not_cache_oversized_pcm() -> None:
 def test_tts_info_lists_configured_voices() -> None:
     """Test Wyoming discovery advertises all configured models."""
     second_voice = get_voice("chieu-thanh")
-    info = get_tts_info((DEFAULT_TTS_VOICE, second_voice))
+    info = get_tts_info((DEFAULT_NGHITTS_VOICE, second_voice))
     program = info.tts[0]
-    assert program.name == "wyoming_vietnamese"
-    assert program.description == "NghiTTS Vietnamese (Sherpa-ONNX)"
+    assert program.name == PROGRAM_NAME
+    assert program.description == f"{TtsProvider.NGHITTS} Vietnamese (Sherpa-ONNX)"
     assert program.supports_synthesize_streaming is True
-    assert [voice.name for voice in program.voices] == [DEFAULT_TTS_VOICE.name, second_voice.name]
+    assert [voice.name for voice in program.voices] == [
+        DEFAULT_NGHITTS_VOICE.name,
+        second_voice.name,
+    ]
+    assert [voice.description for voice in program.voices] == [
+        DEFAULT_NGHITTS_VOICE.name,
+        second_voice.name,
+    ]
     assert program.voices[0].languages == [VIETNAMESE_LANGUAGE]
+
+
+def test_tts_info_lists_configured_voices_zerotts_engine() -> None:
+    """Test Wyoming discovery advertises ZeroTTS voices and attribution in ZeroTTS engine."""
+    second_voice = get_voice("baotrang", engine=TtsEngine.ZEROTTS)
+    info = get_tts_info(
+        (DEFAULT_ZEROTTS_VOICE, second_voice),
+        engine=TtsEngine.ZEROTTS,
+    )
+    program = info.tts[0]
+    assert program.name == PROGRAM_NAME
+    assert program.description == f"{TtsProvider.ZEROTTS} Vietnamese (GGML Q8_0)"
+    assert program.attribution.name == "ZeroWeight AI"
+    assert [voice.name for voice in program.voices] == [
+        DEFAULT_ZEROTTS_VOICE.name,
+        second_voice.name,
+    ]
+    assert [voice.description for voice in program.voices] == [
+        DEFAULT_ZEROTTS_VOICE.description,
+        second_voice.description,
+    ]
+
+
+def test_initialize_tts_engine_routes_by_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test initialize_tts_engine delegates to the proper engine initializer."""
+    fake_engine = FakeTTS()
+    init_voices = Mock(return_value=fake_engine)
+    init_zerotts = Mock(return_value=fake_engine)
+    monkeypatch.setattr("wyoming_vietnamese.tts.initialize_tts_voices", init_voices)
+    monkeypatch.setattr("wyoming_vietnamese.tts.initialize_zerotts", init_zerotts)
+
+    engine_nghitts = initialize_tts_engine(
+        tmp_path,
+        (DEFAULT_NGHITTS_VOICE,),
+        num_threads=2,
+        engine=TtsEngine.NGHITTS,
+    )
+    assert engine_nghitts is fake_engine
+    init_voices.assert_called_once_with(tmp_path, (DEFAULT_NGHITTS_VOICE,), 2)
+
+    engine_zerotts = initialize_tts_engine(
+        tmp_path,
+        (DEFAULT_ZEROTTS_VOICE,),
+        num_threads=4,
+        engine=TtsEngine.ZEROTTS,
+    )
+    assert engine_zerotts is fake_engine
+    init_zerotts.assert_called_once_with(tmp_path, (DEFAULT_ZEROTTS_VOICE,), 4)
+
+    with pytest.raises(ValueError, match="Unknown TTS engine"):
+        initialize_tts_engine(tmp_path, (DEFAULT_NGHITTS_VOICE,), engine="unknown")
+
+
+def test_initialize_zerotts_initializes_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test initialize_zerotts creates a ZeroTtsGgmlEngine instance."""
+    fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
+    engine_cls = Mock(return_value=fake_engine)
+    monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
+
+    engine = initialize_zerotts(tmp_path, (DEFAULT_ZEROTTS_VOICE,), num_threads=3)
+    assert engine is fake_engine
+    engine_cls.assert_called_once_with(
+        model_dir=tmp_path,
+        gguf_path=tmp_path / ZeroTtsDirectory.GGUF / ZeroTtsFile.DEFAULT_GGUF_MODEL,
+        voices=(DEFAULT_ZEROTTS_VOICE,),
+        num_threads=3,
+        custom_lib_path=None,
+    )
+
+
+async def test_resolve_voice_name_supports_zerotts_id() -> None:
+    """Test _resolve_voice_name resolves ZeroTTS voice ID to display name."""
+    fake_tts = FakeTTS()
+    fake_tts._preset_voices = {"Mai Chi": {}}
+    handler, _ = make_handler(engine=fake_tts)
+    resolved = handler._resolve_voice_name(SynthesizeVoice(name="maichi"))
+    assert resolved == "Mai Chi"
 
 
 def test_get_tts_sample_rate_validates_engine_metadata() -> None:
     """Test sample-rate validation catches invalid engine contracts."""
-    assert get_tts_sample_rate(FakeTTS(sample_rate=TTS_SAMPLE_RATE)) == TTS_SAMPLE_RATE
+    assert (
+        get_tts_sample_rate(FakeTTS(sample_rate=NghiTtsAudio.SAMPLE_RATE))
+        == NghiTtsAudio.SAMPLE_RATE
+    )
     with pytest.raises(ValueError, match="sample rate"):
         get_tts_sample_rate(FakeTTS(sample_rate=0))
 
@@ -1028,7 +1169,7 @@ def test_multi_voice_engine_routes_by_name_and_defaults_to_first() -> None:
     second_native = FakeSherpaTTS()
     engine = MultiVoiceTTSEngine(
         (
-            NghiTTSEngine(default_native, DEFAULT_TTS_VOICE),
+            NghiTTSEngine(default_native, DEFAULT_NGHITTS_VOICE),
             NghiTTSEngine(second_native, second_voice),
         )
     )
@@ -1038,7 +1179,7 @@ def test_multi_voice_engine_routes_by_name_and_defaults_to_first() -> None:
 
     assert default_native.calls == [("Mặc định", 0, 1.0)]
     assert second_native.calls == [("Giọng hai", 0, 1.0)]
-    assert list(engine._preset_voices) == [DEFAULT_TTS_VOICE.name, second_voice.name]
+    assert list(engine._preset_voices) == [DEFAULT_NGHITTS_VOICE.name, second_voice.name]
     with pytest.raises(ValueError, match="Unsupported"):
         list(engine.infer_stream("Lỗi", voice="missing"))
     engine.close()
@@ -1058,12 +1199,59 @@ def test_warm_up_tts_rejects_empty_audio() -> None:
         warm_up_tts(FakeTTS(chunks=[]))
 
 
+def test_warm_up_tts_multi_voice_nghitts() -> None:
+    """Test warm-up iterates across all configured NghiTTS voices."""
+    second_voice = get_voice("duy-onyx-moi", engine=TtsEngine.NGHITTS)
+    engine = FakeTTS([np.array([0.1], dtype=np.float32)])
+    warm_up_tts(engine, voices=(DEFAULT_NGHITTS_VOICE, second_voice), engine=TtsEngine.NGHITTS)
+    assert engine.calls == [
+        ("Xin chào.", DEFAULT_NGHITTS_VOICE.name),
+        ("Xin chào.", second_voice.name),
+    ]
+
+
+def test_warm_up_tts_multi_voice_zerotts() -> None:
+    """Test warm-up iterates across all configured ZeroTTS voices."""
+    voices = (ZEROTTS_VOICES[0], ZEROTTS_VOICES[1])
+    engine = FakeTTS([np.array([0.1], dtype=np.float32)])
+    warm_up_tts(engine, voices=voices, engine=TtsEngine.ZEROTTS)
+    assert engine.calls == [
+        ("Xin chào.", voices[0].name),
+        ("Xin chào.", voices[1].name),
+    ]
+
+
+def test_validate_tts_voices_for_engine() -> None:
+    """Test validation of voice specs against the configured TTS engine."""
+    # Valid NghiTTS voices
+    validate_tts_voices_for_engine((DEFAULT_NGHITTS_VOICE,), TtsEngine.NGHITTS)
+
+    # Valid ZeroTTS voices
+    validate_tts_voices_for_engine((ZEROTTS_VOICES[0],), TtsEngine.ZEROTTS)
+
+    # Unknown engine
+    with pytest.raises(ValueError, match="Unknown TTS engine"):
+        validate_tts_voices_for_engine((DEFAULT_NGHITTS_VOICE,), "unknown")
+
+    # Empty voices
+    with pytest.raises(ValueError, match="At least one TTS voice must be configured"):
+        validate_tts_voices_for_engine((), TtsEngine.NGHITTS)
+
+    # Type mismatch: ZeroTTS voice in NghiTTS engine
+    with pytest.raises(TypeError, match="NghiTTS requires NghiTtsVoiceSpec"):
+        validate_tts_voices_for_engine((ZEROTTS_VOICES[0],), TtsEngine.NGHITTS)
+
+    # Type mismatch: NghiTTS voice in ZeroTTS engine
+    with pytest.raises(TypeError, match="ZeroTTS requires ZeroTtsVoiceSpec"):
+        validate_tts_voices_for_engine((DEFAULT_NGHITTS_VOICE,), TtsEngine.ZEROTTS)
+
+
 def _make_nghitts_model(directory: Path) -> Path:
     """Build minimal NghiTTS assets plus complete local eSpeak data markers."""
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / TTS_MODEL_FILE).write_bytes(b"onnx")
-    (directory / TTS_CONFIG_FILE).write_text("{}", encoding="utf-8")
-    (directory / TTS_TOKENS_FILE).write_text("_ 0\n", encoding="utf-8")
+    (directory / NghiTtsFile.MODEL).write_bytes(b"onnx")
+    (directory / NghiTtsFile.CONFIG).write_text("{}", encoding="utf-8")
+    (directory / NghiTtsFile.TOKENS).write_text("_ 0\n", encoding="utf-8")
     espeak_data = directory / "espeak-ng-data"
     for name in ("phondata", "phontab", "vi_dict", "lang/aav/vi"):
         path = espeak_data / name
@@ -1075,9 +1263,9 @@ def _make_nghitts_model(directory: Path) -> Path:
 def test_nghitts_adapter_streams_callbacks_and_validates_voice() -> None:
     """Test native sentence callbacks are exposed incrementally and bounded."""
     native = FakeSherpaTTS()
-    engine = NghiTTSEngine(native, DEFAULT_TTS_VOICE)
+    engine = NghiTTSEngine(native, DEFAULT_NGHITTS_VOICE)
 
-    chunks = list(engine.infer_stream("Xin chào. Tiếp theo.", voice=DEFAULT_TTS_VOICE.name))
+    chunks = list(engine.infer_stream("Xin chào. Tiếp theo.", voice=DEFAULT_NGHITTS_VOICE.name))
     assert [chunk.tolist() for chunk in chunks] == [
         pytest.approx([0.1, 0.2]),
         pytest.approx([0.3]),
@@ -1095,7 +1283,7 @@ def test_nghitts_adapter_streams_callbacks_and_validates_voice() -> None:
     ("sample_rate", "speakers", "message"),
     [
         (16000, 1, "sample rate"),
-        (TTS_SAMPLE_RATE, 2, "speaker count"),
+        (NghiTtsAudio.SAMPLE_RATE, 2, "speaker count"),
     ],
 )
 def test_nghitts_adapter_rejects_unexpected_native_metadata(
@@ -1107,7 +1295,7 @@ def test_nghitts_adapter_rejects_unexpected_native_metadata(
     with pytest.raises(RuntimeError, match=message):
         NghiTTSEngine(
             FakeSherpaTTS(sample_rate=sample_rate, num_speakers=speakers),
-            DEFAULT_TTS_VOICE,
+            DEFAULT_NGHITTS_VOICE,
         )
 
 
@@ -1144,12 +1332,12 @@ def test_initialize_tts_uses_sherpa_cpu_runtime(
     )
     monkeypatch.setitem(sys.modules, "sherpa_onnx", cast(Any, fake_sherpa))
 
-    engine = initialize_tts(model_dir, num_threads=4, voice=DEFAULT_TTS_VOICE)
+    engine = initialize_tts(model_dir, num_threads=4, voice=DEFAULT_NGHITTS_VOICE)
 
     assert isinstance(engine, NghiTTSEngine)
     vits_config.assert_called_once_with(
-        model=str((model_dir / TTS_MODEL_FILE).resolve()),
-        tokens=str((model_dir / TTS_TOKENS_FILE).resolve()),
+        model=str((model_dir / NghiTtsFile.MODEL).resolve()),
+        tokens=str((model_dir / NghiTtsFile.TOKENS).resolve()),
         data_dir=str(espeak_data.resolve()),
     )
     model_config.assert_called_once_with(
@@ -1174,17 +1362,17 @@ def test_initialize_tts_voices_uses_voice_directories(
     """Test multi-voice initialization loads each configured voice directory."""
     second_voice = get_voice("chieu-thanh")
     engines = (
-        NghiTTSEngine(FakeSherpaTTS(), DEFAULT_TTS_VOICE),
+        NghiTTSEngine(FakeSherpaTTS(), DEFAULT_NGHITTS_VOICE),
         NghiTTSEngine(FakeSherpaTTS(), second_voice),
     )
     initialize = Mock(side_effect=engines)
     monkeypatch.setattr("wyoming_vietnamese.tts.initialize_tts", initialize)
 
-    combined = initialize_tts_voices(tmp_path, (DEFAULT_TTS_VOICE, second_voice), num_threads=2)
+    combined = initialize_tts_voices(tmp_path, (DEFAULT_NGHITTS_VOICE, second_voice), num_threads=2)
 
     assert isinstance(combined, MultiVoiceTTSEngine)
     assert [item.args for item in initialize.call_args_list] == [
-        (tmp_path / DEFAULT_TTS_VOICE.id, 2, DEFAULT_TTS_VOICE),
+        (tmp_path / DEFAULT_NGHITTS_VOICE.id, 2, DEFAULT_NGHITTS_VOICE),
         (tmp_path / second_voice.id, 2, second_voice),
     ]
 
@@ -1509,7 +1697,7 @@ async def test_tts_pads_paragraph_silence_before_final_short_tail() -> None:
         ("đuôi", None),
     ]
     speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
-    paragraph_silence = bytes(round(engine.sample_rate * 0.100) * TTS_SAMPLE_WIDTH)
+    paragraph_silence = bytes(round(engine.sample_rate * 0.100) * TtsAudio.SAMPLE_WIDTH)
     assert written_audio(writer) == speech + paragraph_silence + speech
 
 
@@ -1552,7 +1740,7 @@ async def test_tts_pads_sentence_silence_before_final_short_tail(separator: str)
         ("đuôi", None),
     ]
     speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
-    sentence_silence = bytes(round(engine.sample_rate * 0.050) * TTS_SAMPLE_WIDTH)
+    sentence_silence = bytes(round(engine.sample_rate * 0.050) * TtsAudio.SAMPLE_WIDTH)
     assert written_audio(writer) == speech + sentence_silence + speech
 
 

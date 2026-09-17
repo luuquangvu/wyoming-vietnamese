@@ -13,24 +13,27 @@ from pathlib import Path
 from .const import (
     DEFAULT_CACHE_DIR,
     DEFAULT_DOWNLOAD_DIR,
-    DEFAULT_EVENT_TIMEOUT,
-    DEFAULT_INFERENCE_QUEUE_TIMEOUT,
-    DEFAULT_MAX_ACTIVE_CONNECTIONS,
     DEFAULT_MAX_STT_AUDIO_SECONDS,
     DEFAULT_MAX_STT_BUFFER_MB,
     DEFAULT_MAX_TTS_TEXT_CHARS,
     DEFAULT_PORT,
     DEFAULT_TTS_CACHE_IDLE_SECONDS,
-    DEFAULT_TTS_CACHE_MAX_ENTRIES,
-    DEFAULT_TTS_CACHE_MAX_ITEM_MB,
-    DEFAULT_TTS_CACHE_MAX_MB,
-    DEFAULT_TTS_CLAUSE_SILENCE_MS,
-    DEFAULT_TTS_PARAGRAPH_SILENCE_MS,
-    DEFAULT_TTS_SENTENCE_SILENCE_MS,
-    DEFAULT_WRITE_TIMEOUT,
-    MAX_TTS_SILENCE_MS,
+    DEFAULT_TTS_ENGINE,
+    ConnectionLimit,
+    Timeout,
+    TtsCacheLimit,
+    TtsEngine,
+    TtsSilenceMs,
 )
-from .tts_model import DEFAULT_TTS_VOICE_ID, TtsVoiceSpec, get_voice
+from .tts_model import (
+    DEFAULT_NGHITTS_VOICE_ID,
+    DEFAULT_ZEROTTS_VOICE_ID,
+    NghiTtsVoiceSpec,
+    ZeroTtsVoiceSpec,
+    get_voice,
+)
+
+AnyVoiceSpec = NghiTtsVoiceSpec | ZeroTtsVoiceSpec
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -136,15 +139,29 @@ def _get_required_text(environ: Mapping[str, str], name: str, default: str) -> s
     raise ValueError(f"{name} must not be empty")
 
 
-def _get_tts_voices(environ: Mapping[str, str]) -> tuple[TtsVoiceSpec, ...]:
-    """Read unique TTS voice IDs separated by commas and/or whitespace."""
-    raw_value = _get_required_text(environ, "TTS_VOICE", DEFAULT_TTS_VOICE_ID)
+def _get_tts_engine(environ: Mapping[str, str]) -> str:
+    """Read and validate the TTS engine (nghitts or zerotts)."""
+    raw_engine = environ.get("TTS_ENGINE", DEFAULT_TTS_ENGINE).strip().lower()
+    if raw_engine not in (TtsEngine.NGHITTS, TtsEngine.ZEROTTS):
+        raise ValueError(f"TTS_ENGINE must be one of: {TtsEngine.NGHITTS}, {TtsEngine.ZEROTTS}")
+    return raw_engine
+
+
+def _get_tts_voices(
+    environ: Mapping[str, str],
+    tts_engine: str = DEFAULT_TTS_ENGINE,
+) -> tuple[AnyVoiceSpec, ...]:
+    """Read unique TTS voice IDs separated by commas and/or whitespace for the given engine."""
+    default_voice_id = (
+        DEFAULT_ZEROTTS_VOICE_ID if tts_engine == TtsEngine.ZEROTTS else DEFAULT_NGHITTS_VOICE_ID
+    )
+    raw_value = _get_required_text(environ, "TTS_VOICE", default_voice_id)
     voice_ids = [voice_id.lower() for voice_id in re.split(r"[,\s]+", raw_value) if voice_id]
     if not voice_ids:
         raise ValueError("TTS_VOICE must contain at least one voice ID")
     if len(set(voice_ids)) != len(voice_ids):
         raise ValueError("TTS_VOICE must not contain duplicate voice IDs")
-    return tuple(get_voice(voice_id) for voice_id in voice_ids)
+    return tuple(get_voice(voice_id, engine=tts_engine) for voice_id in voice_ids)
 
 
 def _get_log_level(environ: Mapping[str, str]) -> str:
@@ -160,7 +177,8 @@ class ServerConfig:
     """Validated process configuration derived from environment variables."""
 
     port: int
-    tts_voices: tuple[TtsVoiceSpec, ...]
+    tts_engine: str
+    tts_voices: tuple[AnyVoiceSpec, ...]
     cache_dir: Path
     download_dir: Path
     cpu_threads: int
@@ -183,7 +201,11 @@ class ServerConfig:
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> ServerConfig:
-        """Build configuration from an environment mapping."""
+        """Build validated configuration, defaulting to the process environment.
+
+        Raises:
+            ValueError: If any configured value is invalid.
+        """
         env = os.environ if environ is None else environ
 
         if "TTS_SILENCE_JITTER_PERCENT" in env:
@@ -192,16 +214,17 @@ class ServerConfig:
                 "is no longer used. Please consult the up-to-date README and use default settings."
             )
 
+        tts_engine = _get_tts_engine(env)
         tts_cache_max_mb = _get_int(
             env,
             "TTS_CACHE_MAX_MB",
-            DEFAULT_TTS_CACHE_MAX_MB,
+            TtsCacheLimit.MAX_MB,
             minimum=0,
         )
         tts_cache_max_item_mb = _get_int(
             env,
             "TTS_CACHE_MAX_ITEM_MB",
-            DEFAULT_TTS_CACHE_MAX_ITEM_MB,
+            TtsCacheLimit.MAX_ITEM_MB,
             minimum=0,
         )
         if tts_cache_max_mb and tts_cache_max_item_mb > tts_cache_max_mb:
@@ -209,7 +232,8 @@ class ServerConfig:
 
         return cls(
             port=_get_int(env, "WYOMING_PORT", DEFAULT_PORT, minimum=1, maximum=65535),
-            tts_voices=_get_tts_voices(env),
+            tts_engine=tts_engine,
+            tts_voices=_get_tts_voices(env, tts_engine),
             cache_dir=Path(_get_required_text(env, "CACHE_DIR", DEFAULT_CACHE_DIR)).expanduser(),
             download_dir=Path(
                 _get_required_text(env, "DOWNLOAD_DIR", DEFAULT_DOWNLOAD_DIR)
@@ -232,46 +256,46 @@ class ServerConfig:
             tts_paragraph_silence_ms=_get_int(
                 env,
                 "TTS_PARAGRAPH_SILENCE_MS",
-                DEFAULT_TTS_PARAGRAPH_SILENCE_MS,
+                TtsSilenceMs.PARAGRAPH,
                 minimum=0,
-                maximum=MAX_TTS_SILENCE_MS,
+                maximum=TtsSilenceMs.MAX,
             ),
             tts_sentence_silence_ms=_get_int(
                 env,
                 "TTS_SENTENCE_SILENCE_MS",
-                DEFAULT_TTS_SENTENCE_SILENCE_MS,
+                TtsSilenceMs.SENTENCE,
                 minimum=0,
-                maximum=MAX_TTS_SILENCE_MS,
+                maximum=TtsSilenceMs.MAX,
             ),
             tts_clause_silence_ms=_get_int(
                 env,
                 "TTS_CLAUSE_SILENCE_MS",
-                DEFAULT_TTS_CLAUSE_SILENCE_MS,
+                TtsSilenceMs.CLAUSE,
                 minimum=0,
-                maximum=MAX_TTS_SILENCE_MS,
+                maximum=TtsSilenceMs.MAX,
             ),
             inference_queue_timeout=_get_float(
                 env,
                 "INFERENCE_QUEUE_TIMEOUT",
-                DEFAULT_INFERENCE_QUEUE_TIMEOUT,
+                Timeout.INFERENCE_QUEUE,
                 minimum_exclusive=0,
             ),
             event_timeout=_get_float(
                 env,
                 "WYOMING_EVENT_TIMEOUT",
-                DEFAULT_EVENT_TIMEOUT,
+                Timeout.EVENT,
                 minimum_exclusive=0,
             ),
             write_timeout=_get_float(
                 env,
                 "WYOMING_WRITE_TIMEOUT",
-                DEFAULT_WRITE_TIMEOUT,
+                Timeout.WRITE,
                 minimum_exclusive=0,
             ),
             max_active_connections=_get_int(
                 env,
                 "MAX_ACTIVE_CONNECTIONS",
-                DEFAULT_MAX_ACTIVE_CONNECTIONS,
+                ConnectionLimit.MAX_ACTIVE,
                 minimum=1,
             ),
             max_stt_buffer_bytes=(
@@ -293,7 +317,7 @@ class ServerConfig:
             tts_cache_max_entries=_get_int(
                 env,
                 "TTS_CACHE_MAX_ENTRIES",
-                DEFAULT_TTS_CACHE_MAX_ENTRIES,
+                TtsCacheLimit.MAX_ENTRIES,
                 minimum=0,
             ),
             tts_cache_max_bytes=tts_cache_max_mb * 1024 * 1024,

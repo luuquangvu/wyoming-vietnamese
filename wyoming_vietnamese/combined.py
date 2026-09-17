@@ -14,7 +14,7 @@ from wyoming.event import Event
 from wyoming.info import Describe, Info
 from wyoming.tts import Synthesize, SynthesizeChunk, SynthesizeStart, SynthesizeStop
 
-from .const import DEFAULT_EVENT_TIMEOUT, DEFAULT_WRITE_TIMEOUT
+from .const import Timeout
 from .protocol import ConnectionLimiter, SafeAsyncEventHandler
 
 _LOGGER = logging.getLogger(__name__)
@@ -42,8 +42,8 @@ class CombinedEventHandler(SafeAsyncEventHandler):
         writer: asyncio.StreamWriter,
         *,
         connection_limiter: ConnectionLimiter | None = None,
-        event_timeout: float = DEFAULT_EVENT_TIMEOUT,
-        write_timeout: float = DEFAULT_WRITE_TIMEOUT,
+        event_timeout: float = Timeout.EVENT,
+        write_timeout: float = Timeout.WRITE,
     ) -> None:
         """Create per-connection STT and TTS handlers over shared streams."""
         super().__init__(

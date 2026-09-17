@@ -8,6 +8,7 @@ import signal
 import sys
 from functools import partial
 from pathlib import Path
+from typing import cast
 
 if __name__ == "__main__" and not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -18,20 +19,29 @@ from wyoming.server import AsyncServer, HandlerFactory
 from .cache import BoundedLruCache
 from .combined import CombinedEventHandler, combine_service_info
 from .config import ServerConfig, resolve_cpu_threads
-from .const import SHUTDOWN_DRAIN_TIMEOUT
+from .const import (
+    PROGRAM_NAME,
+    Timeout,
+    TtsEngine,
+    TtsProvider,
+)
 from .download import download_models
 from .inference import create_inference_executor
 from .protocol import ByteBudget, ConnectionLimiter
 from .stt import SherpaSTTEventHandler, get_stt_info, initialize_stt, warm_up_stt
 from .stt_model import STT_MODEL
 from .tts import (
+    TTSEngine,
     TTSEventHandler,
     get_tts_info,
     initialize_tts_voices,
+    initialize_zerotts,
+    validate_tts_voices_for_engine,
     warm_up_tts,
 )
+from .tts_model import NghiTtsVoiceSpec, ZeroTtsVoiceSpec
 
-_LOGGER = logging.getLogger("wyoming_vietnamese")
+_LOGGER = logging.getLogger(PROGRAM_NAME)
 
 
 def _configure_logging(level: str) -> None:
@@ -43,18 +53,82 @@ def _configure_logging(level: str) -> None:
     )
 
 
-async def _drain_inference(lock: asyncio.Lock, label: str) -> None:
+async def _drain_inference(
+    lock: asyncio.Lock,
+    label: str,
+    *,
+    timeout: float = Timeout.SHUTDOWN_DRAIN,
+) -> None:
     """Wait for one in-flight inference to finish before its model is released."""
     try:
-        await asyncio.wait_for(lock.acquire(), SHUTDOWN_DRAIN_TIMEOUT)
+        await asyncio.wait_for(lock.acquire(), timeout)
     except TimeoutError:
         _LOGGER.warning(
             "Timed out after %.1f seconds waiting for in-flight %s inference",
-            SHUTDOWN_DRAIN_TIMEOUT,
+            timeout,
             label,
         )
         return
     lock.release()
+
+
+def _log_startup_configuration(server_config: ServerConfig, cpu_threads: int) -> None:
+    """Log configured server parameters, directory targets, and model sources."""
+    _LOGGER.info(
+        "Configuration: port=%d threads=%d offline=%s tts_engine=%s tts_voices=%s",
+        server_config.port,
+        cpu_threads,
+        server_config.offline,
+        server_config.tts_engine,
+        ",".join(voice.id for voice in server_config.tts_voices),
+    )
+    _LOGGER.info(
+        "Model storage: cache_dir=%s, download_dir=%s",
+        server_config.cache_dir,
+        server_config.download_dir,
+    )
+    tts_provider_name = (
+        TtsProvider.ZEROTTS
+        if server_config.tts_engine == TtsEngine.ZEROTTS
+        else TtsProvider.NGHITTS
+    )
+    _LOGGER.info(
+        "Model sources: stt=%s@%s %s_voices=%s",
+        STT_MODEL.repo,
+        STT_MODEL.revision,
+        tts_provider_name.lower(),
+        ", ".join(voice.name for voice in server_config.tts_voices),
+    )
+    _LOGGER.info(
+        "Transport limits: active_connections=%d event_timeout=%.1fs write_timeout=%.1fs "
+        "stt_buffer_mb=%.1f",
+        server_config.max_active_connections,
+        server_config.event_timeout,
+        server_config.write_timeout,
+        server_config.max_stt_buffer_bytes / (1024 * 1024),
+    )
+
+
+def _initialize_configured_tts(
+    server_config: ServerConfig,
+    tts_path: Path,
+    cpu_threads: int,
+) -> TTSEngine:
+    """Initialize the configured TTS engine according to selected engine."""
+    validate_tts_voices_for_engine(server_config.tts_voices, server_config.tts_engine)
+    if server_config.tts_engine == TtsEngine.ZEROTTS:
+        zerotts_voices = tuple(cast(ZeroTtsVoiceSpec, v) for v in server_config.tts_voices)
+        return initialize_zerotts(
+            tts_path,
+            zerotts_voices,
+            cpu_threads,
+        )
+    nghitts_voices = tuple(cast(NghiTtsVoiceSpec, v) for v in server_config.tts_voices)
+    return initialize_tts_voices(
+        tts_path,
+        nghitts_voices,
+        cpu_threads,
+    )
 
 
 async def run_server(
@@ -69,38 +143,15 @@ async def run_server(
 
     server_config.cache_dir.mkdir(parents=True, exist_ok=True)
     server_config.download_dir.mkdir(parents=True, exist_ok=True)
-    _LOGGER.info(
-        "Configuration: port=%d threads=%d offline=%s tts_voices=%s",
-        server_config.port,
-        cpu_threads,
-        server_config.offline,
-        ",".join(voice.id for voice in server_config.tts_voices),
-    )
-    _LOGGER.info(
-        "Model storage: cache_dir=%s, download_dir=%s",
-        server_config.cache_dir,
-        server_config.download_dir,
-    )
-    _LOGGER.info(
-        "Model sources: stt=%s@%s nghitts_voices=%s",
-        STT_MODEL.repo,
-        STT_MODEL.revision,
-        ", ".join(voice.name for voice in server_config.tts_voices),
-    )
-    _LOGGER.info(
-        "Transport limits: active_connections=%d event_timeout=%.1fs write_timeout=%.1fs "
-        "stt_buffer_mb=%.1f",
-        server_config.max_active_connections,
-        server_config.event_timeout,
-        server_config.write_timeout,
-        server_config.max_stt_buffer_bytes / (1024 * 1024),
-    )
+    _log_startup_configuration(server_config, cpu_threads)
 
+    validate_tts_voices_for_engine(server_config.tts_voices, server_config.tts_engine)
     paths = download_models(
         cache_dir=server_config.cache_dir,
         download_dir=server_config.download_dir,
         tts_voices=server_config.tts_voices,
         offline=server_config.offline,
+        tts_engine=server_config.tts_engine,
     )
 
     _LOGGER.info("Initializing Speech-to-Text engine")
@@ -111,18 +162,19 @@ async def run_server(
     await asyncio.to_thread(warm_up_stt, stt_recognizer)
     stt_info = get_stt_info(STT_MODEL.repo, STT_MODEL.revision)
 
-    _LOGGER.info("Initializing Text-to-Speech engine")
-    tts_engine = initialize_tts_voices(
-        paths["tts"],
-        server_config.tts_voices,
-        cpu_threads,
-    )
+    _LOGGER.info("Initializing Text-to-Speech engine (%s)", server_config.tts_engine)
+    tts_engine = _initialize_configured_tts(server_config, paths["tts"], cpu_threads)
     try:
-        await asyncio.to_thread(warm_up_tts, tts_engine)
+        await asyncio.to_thread(
+            warm_up_tts,
+            tts_engine,
+            server_config.tts_voices,
+            server_config.tts_engine,
+        )
     except Exception:
         await asyncio.to_thread(tts_engine.close)
         raise
-    tts_info = get_tts_info(server_config.tts_voices)
+    tts_info = get_tts_info(server_config.tts_voices, engine=server_config.tts_engine)
     stt_info_event = stt_info.event()
     tts_info_event = tts_info.event()
     combined_info_event = combine_service_info(stt_info, tts_info).event()
@@ -221,7 +273,7 @@ async def run_server(
                 await server.stop()
             except Exception as err:
                 _LOGGER.exception("Server shutdown failed: %s", err)
-            if not await connection_limiter.wait_idle(SHUTDOWN_DRAIN_TIMEOUT):
+            if not await connection_limiter.wait_idle(Timeout.SHUTDOWN_DRAIN):
                 _LOGGER.warning(
                     "Releasing models while %d client handler(s) are still active",
                     connection_limiter.active,
