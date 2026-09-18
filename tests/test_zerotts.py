@@ -58,6 +58,8 @@ def test_build_zerotts_ggml_lib_success(tmp_path: Path, native: bool) -> None:
             assert "-DGGML_NATIVE=OFF" not in cmake_configure_cmd
         else:
             assert "-DGGML_NATIVE=OFF" in cmake_configure_cmd
+            assert "-DGGML_NATIVE_DEFAULT=OFF" in cmake_configure_cmd
+            assert "-DGGML_AVX2=OFF" in cmake_configure_cmd
             assert "-DGGML_AVX512=OFF" in cmake_configure_cmd
         assert "-DCMAKE_BUILD_RPATH=$ORIGIN" in cmake_configure_cmd
         assert "-DCMAKE_INSTALL_RPATH=$ORIGIN" in cmake_configure_cmd
@@ -942,13 +944,10 @@ def test_copy_ggml_libraries_preserves_valid_relative_links(tmp_path: Path) -> N
     assert copied_real.is_file()
     assert copied_real.read_bytes() == b"GGML_CPU_BYTES"
 
-    assert copied_rel.is_file()
-    assert copied_rel.read_bytes() == b"GGML_CPU_BYTES"
-    assert copied_rel.resolve().parent == target_dir.resolve()
-
-    assert copied_abs.is_file()
-    assert copied_abs.read_bytes() == b"GGML_CPU_BYTES"
-    assert copied_abs.resolve().parent == target_dir.resolve()
+    for link in (copied_rel, copied_abs):
+        assert link.is_file()
+        assert link.read_bytes() == b"GGML_CPU_BYTES"
+        assert link.resolve().parent == target_dir.resolve()
 
 
 def test_copy_ggml_libraries_copies_resolved_target_when_symlink_points_outside(

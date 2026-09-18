@@ -120,10 +120,20 @@ def _compile_libraries(clone_dest: Path, staging_dir: Path, *, native: bool = Fa
         cmake_cmd.extend(
             [
                 "-DGGML_NATIVE=OFF",
+                "-DGGML_NATIVE_DEFAULT=OFF",
+                "-DGGML_AVX=OFF",
+                "-DGGML_AVX2=OFF",
+                "-DGGML_FMA=OFF",
+                "-DGGML_F16C=OFF",
+                "-DGGML_BMI2=OFF",
+                "-DGGML_AVX_VNNI=OFF",
                 "-DGGML_AVX512=OFF",
                 "-DGGML_AVX512_VBMI=OFF",
                 "-DGGML_AVX512_VNNI=OFF",
                 "-DGGML_AVX512_BF16=OFF",
+                "-DGGML_AMX_TILE=OFF",
+                "-DGGML_AMX_INT8=OFF",
+                "-DGGML_AMX_BF16=OFF",
             ]
         )
     cmake_cmd.extend(
