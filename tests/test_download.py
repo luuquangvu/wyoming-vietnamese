@@ -14,10 +14,12 @@ import pytest
 
 from wyoming_vietnamese import download as download_module
 from wyoming_vietnamese.const import (
-    TTS_CONFIG_FILE,
-    TTS_MODEL_FILE,
-    TTS_TOKENS_FILE,
     VIETNAMESE_LANGUAGE,
+    ZEROTTS_REPO_ID,
+    NghiTtsFile,
+    TtsEngine,
+    ZeroTtsDirectory,
+    ZeroTtsFile,
 )
 from wyoming_vietnamese.download import (
     _copy_or_link,
@@ -31,6 +33,7 @@ from wyoming_vietnamese.download import (
     _skip_protobuf_field,
     _structure_nghitts_files,
     _structure_stt_files,
+    _structure_zerotts_files,
     _sync_nghitts_model,
     _sync_repo,
     download_models,
@@ -38,9 +41,13 @@ from wyoming_vietnamese.download import (
 )
 from wyoming_vietnamese.stt_model import SttArtifact, SttModelSpec
 from wyoming_vietnamese.tts_model import (
-    DEFAULT_TTS_VOICE,
-    TtsArtifact,
-    TtsVoiceSpec,
+    DEFAULT_NGHITTS_VOICE,
+    DEFAULT_ZEROTTS_VOICE,
+    NghiTtsArtifact,
+    NghiTtsVoiceSpec,
+    ZeroTtsArtifact,
+    ZeroTtsModelSpec,
+    ZeroTtsVoiceSpec,
     get_voice,
 )
 
@@ -98,8 +105,8 @@ def _pin_stt_model(monkeypatch: pytest.MonkeyPatch, spec: SttModelSpec) -> None:
 def _make_nghitts_snapshot(directory: Path) -> None:
     """Build a minimal raw NghiTTS voice snapshot."""
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / TTS_MODEL_FILE).write_bytes(b"onnx")
-    (directory / TTS_CONFIG_FILE).write_text(
+    (directory / NghiTtsFile.MODEL).write_bytes(b"onnx")
+    (directory / NghiTtsFile.CONFIG).write_text(
         json.dumps(
             {
                 "audio": {"sample_rate": 22050},
@@ -164,7 +171,7 @@ def test_download_verified_file_checks_digest(
         "wyoming_vietnamese.download.urlopen",
         lambda *_args, **_kwargs: BytesIO(content),
     )
-    destination = tmp_path / "model.onnx"
+    destination = tmp_path / NghiTtsFile.MODEL
     _download_verified_file(
         "https://models.example/model.onnx",
         destination,
@@ -229,8 +236,8 @@ def test_generate_tokens_from_sentencepiece(tmp_path: Path) -> None:
 
 def test_generate_nghitts_tokens_from_model_configuration(tmp_path: Path) -> None:
     """Test NghiTTS phoneme metadata is converted to Sherpa's ordered token table."""
-    config = tmp_path / "model.onnx.json"
-    tokens = tmp_path / "tokens.txt"
+    config = tmp_path / NghiTtsFile.CONFIG
+    tokens = tmp_path / NghiTtsFile.TOKENS
     config.write_text(
         json.dumps({"phoneme_id_map": {"a": [2], "_": [0], " ": [1]}}),
         encoding="utf-8",
@@ -256,10 +263,10 @@ def test_generate_nghitts_tokens_rejects_invalid_maps(
     message: str,
 ) -> None:
     """Test malformed NghiTTS metadata cannot create a partial token table."""
-    config = tmp_path / "model.onnx.json"
+    config = tmp_path / NghiTtsFile.CONFIG
     config.write_text(json.dumps({"phoneme_id_map": phoneme_map}), encoding="utf-8")
     with pytest.raises(ValueError, match=message):
-        _generate_nghitts_tokens(config, tmp_path / "tokens.txt")
+        _generate_nghitts_tokens(config, tmp_path / NghiTtsFile.TOKENS)
 
 
 @pytest.mark.parametrize(
@@ -405,14 +412,14 @@ def test_structure_nghitts_files_converts_raw_nghitts_model(tmp_path: Path) -> N
     destination = tmp_path / "model"
     _make_nghitts_snapshot(snapshot)
     paths = _structure_nghitts_files(snapshot, destination)
-    converted_model = destination / TTS_MODEL_FILE
-    metadata = _encode_onnx_metadata(_nghitts_sherpa_metadata(destination / TTS_CONFIG_FILE))
+    converted_model = destination / NghiTtsFile.MODEL
+    metadata = _encode_onnx_metadata(_nghitts_sherpa_metadata(destination / NghiTtsFile.CONFIG))
     assert converted_model.read_bytes() == b"onnx" + metadata
-    assert (destination / TTS_CONFIG_FILE).is_file()
-    assert (destination / TTS_TOKENS_FILE).read_text(encoding="utf-8") == ("_ 0\n  1\na 2\n")
+    assert (destination / NghiTtsFile.CONFIG).is_file()
+    assert (destination / NghiTtsFile.TOKENS).read_text(encoding="utf-8") == ("_ 0\n  1\na 2\n")
     assert len(paths) == 3
 
-    (snapshot / TTS_MODEL_FILE).unlink()
+    (snapshot / NghiTtsFile.MODEL).unlink()
     with pytest.raises(FileNotFoundError, match="Incomplete NghiTTS"):
         _structure_nghitts_files(snapshot, tmp_path / "incomplete")
 
@@ -425,7 +432,7 @@ def test_structure_nghitts_files_skips_rehashing_a_prepared_model(
     destination = tmp_path / "model"
     _make_nghitts_snapshot(snapshot)
     _structure_nghitts_files(snapshot, destination)
-    prepared = (destination / TTS_MODEL_FILE).read_bytes()
+    prepared = (destination / NghiTtsFile.MODEL).read_bytes()
 
     digests: list[Path] = []
     original_digest = download_module._file_sha256
@@ -439,12 +446,12 @@ def test_structure_nghitts_files_skips_rehashing_a_prepared_model(
 
     _structure_nghitts_files(snapshot, destination)
     assert not digests
-    assert (destination / TTS_MODEL_FILE).read_bytes() == prepared
+    assert (destination / NghiTtsFile.MODEL).read_bytes() == prepared
 
-    (snapshot / TTS_MODEL_FILE).write_bytes(b"onnx-v2")
+    (snapshot / NghiTtsFile.MODEL).write_bytes(b"onnx-v2")
     _structure_nghitts_files(snapshot, destination)
-    metadata = _encode_onnx_metadata(_nghitts_sherpa_metadata(destination / TTS_CONFIG_FILE))
-    assert (destination / TTS_MODEL_FILE).read_bytes() == b"onnx-v2" + metadata
+    metadata = _encode_onnx_metadata(_nghitts_sherpa_metadata(destination / NghiTtsFile.CONFIG))
+    assert (destination / NghiTtsFile.MODEL).read_bytes() == b"onnx-v2" + metadata
 
 
 def test_structure_nghitts_files_rebuilds_after_a_corrupt_marker(tmp_path: Path) -> None:
@@ -454,13 +461,13 @@ def test_structure_nghitts_files_rebuilds_after_a_corrupt_marker(tmp_path: Path)
     _make_nghitts_snapshot(snapshot)
     _structure_nghitts_files(snapshot, destination)
 
-    marker = download_module._prepared_marker_path(destination / TTS_MODEL_FILE)
+    marker = download_module._prepared_marker_path(destination / NghiTtsFile.MODEL)
     marker.write_text("not json", encoding="utf-8")
-    (destination / TTS_MODEL_FILE).write_bytes(b"corrupted")
+    (destination / NghiTtsFile.MODEL).write_bytes(b"corrupted")
 
     _structure_nghitts_files(snapshot, destination)
-    metadata = _encode_onnx_metadata(_nghitts_sherpa_metadata(destination / TTS_CONFIG_FILE))
-    assert (destination / TTS_MODEL_FILE).read_bytes() == b"onnx" + metadata
+    metadata = _encode_onnx_metadata(_nghitts_sherpa_metadata(destination / NghiTtsFile.CONFIG))
+    assert (destination / NghiTtsFile.MODEL).read_bytes() == b"onnx" + metadata
     recorded = json.loads(marker.read_text(encoding="utf-8"))
     assert recorded["metadata_length"] == len(metadata)
     assert recorded["metadata_sha256"] == sha256(metadata).hexdigest()
@@ -474,10 +481,10 @@ def test_structure_nghitts_files_rebuilds_after_same_length_metadata_change(
     destination = tmp_path / "model"
     _make_nghitts_snapshot(snapshot)
     _structure_nghitts_files(snapshot, destination)
-    prepared_model = destination / TTS_MODEL_FILE
+    prepared_model = destination / NghiTtsFile.MODEL
     original = prepared_model.read_bytes()
 
-    config = snapshot / TTS_CONFIG_FILE
+    config = snapshot / NghiTtsFile.CONFIG
     config.write_text(
         config.read_text(encoding="utf-8").replace(
             f'"voice": "{VIETNAMESE_LANGUAGE}"', '"voice": "en"'
@@ -486,7 +493,7 @@ def test_structure_nghitts_files_rebuilds_after_same_length_metadata_change(
     )
     _structure_nghitts_files(snapshot, destination)
 
-    metadata = _encode_onnx_metadata(_nghitts_sherpa_metadata(destination / TTS_CONFIG_FILE))
+    metadata = _encode_onnx_metadata(_nghitts_sherpa_metadata(destination / NghiTtsFile.CONFIG))
     assert len(prepared_model.read_bytes()) == len(original)
     assert prepared_model.read_bytes() == b"onnx" + metadata
     assert prepared_model.read_bytes() != original
@@ -498,13 +505,13 @@ def test_sync_nghitts_model_caches_pinned_artifacts(
     """Test encoded API names and verified offline reuse for a selected voice."""
     model = b"model"
     config = b"config"
-    voice = TtsVoiceSpec(
+    voice = NghiTtsVoiceSpec(
         "test-voice",
         "Ngọc (mới)",
-        TtsArtifact("Ngọc (mới).onnx", TTS_MODEL_FILE, sha256(model).hexdigest()),
-        TtsArtifact(
+        NghiTtsArtifact("Ngọc (mới).onnx", NghiTtsFile.MODEL, sha256(model).hexdigest()),
+        NghiTtsArtifact(
             "Ngọc (mới).onnx.json",
-            TTS_CONFIG_FILE,
+            NghiTtsFile.CONFIG,
             sha256(config).hexdigest(),
         ),
     )
@@ -517,8 +524,8 @@ def test_sync_nghitts_model_caches_pinned_artifacts(
         voice,
         base_url="https://models.example/api/model",
     )
-    assert (snapshot / TTS_MODEL_FILE).read_bytes() == model
-    assert (snapshot / TTS_CONFIG_FILE).read_bytes() == config
+    assert (snapshot / NghiTtsFile.MODEL).read_bytes() == model
+    assert (snapshot / NghiTtsFile.CONFIG).read_bytes() == config
     assert "%28m%E1%BB%9Bi%29.onnx" in download.call_args_list[0].args[0].full_url
     assert (
         _sync_nghitts_model(
@@ -535,12 +542,14 @@ def test_sync_nghitts_model_caches_pinned_artifacts(
 def test_sync_nghitts_model_rejects_invalid_source_and_offline_miss(tmp_path: Path) -> None:
     """Test model synchronization rejects insecure sources and missing cache files."""
     with pytest.raises(ValueError, match="HTTPS"):
-        _sync_nghitts_model(tmp_path, False, DEFAULT_TTS_VOICE, base_url="http://models.example")
+        _sync_nghitts_model(
+            tmp_path, False, DEFAULT_NGHITTS_VOICE, base_url="http://models.example"
+        )
     with pytest.raises(RuntimeError, match="Offline startup failed"):
         _sync_nghitts_model(
             tmp_path,
             True,
-            DEFAULT_TTS_VOICE,
+            DEFAULT_NGHITTS_VOICE,
             base_url="https://models.example",
         )
 
@@ -564,19 +573,262 @@ def test_download_models_structures_selected_nghitts_voice(
     paths = download_models(
         tmp_path / "cache",
         tmp_path / "models",
-        (DEFAULT_TTS_VOICE, second_voice),
+        (DEFAULT_NGHITTS_VOICE, second_voice),
     )
 
     assert (paths["stt"] / "encoder.onnx").is_file()
     assert paths["tts"] == tmp_path / "models" / "tts"
-    assert (paths["tts"] / DEFAULT_TTS_VOICE.id / TTS_MODEL_FILE).is_file()
-    assert (paths["tts"] / DEFAULT_TTS_VOICE.id / TTS_TOKENS_FILE).is_file()
-    assert (paths["tts"] / second_voice.id / TTS_MODEL_FILE).is_file()
+    assert (paths["tts"] / DEFAULT_NGHITTS_VOICE.id / NghiTtsFile.MODEL).is_file()
+    assert (paths["tts"] / DEFAULT_NGHITTS_VOICE.id / NghiTtsFile.TOKENS).is_file()
+    assert (paths["tts"] / second_voice.id / NghiTtsFile.MODEL).is_file()
     assert set(paths) == {"stt", "tts"}
     assert sync.call_args.args == (spec.repo, False)
     assert sync.call_args.kwargs["revision"] == spec.revision
     assert sync.call_args.kwargs["allow_patterns"] == spec.allow_patterns
     assert [item.args for item in sync_tts.call_args_list] == [
-        (tmp_path / "cache", False, DEFAULT_TTS_VOICE),
+        (tmp_path / "cache", False, DEFAULT_NGHITTS_VOICE),
         (tmp_path / "cache", False, second_voice),
     ]
+
+
+def _make_zerotts_snapshot(directory: Path) -> tuple[ZeroTtsModelSpec, ZeroTtsVoiceSpec]:
+    """Build a ZeroTTS snapshot and pinned specs that match its files."""
+    directory.mkdir(parents=True, exist_ok=True)
+    gguf_content = b"GGUF_TEST_BYTES"
+    gguf_dir = directory / ZeroTtsDirectory.GGUF
+    gguf_dir.mkdir(parents=True, exist_ok=True)
+    (gguf_dir / ZeroTtsFile.DEFAULT_GGUF_MODEL).write_bytes(gguf_content)
+
+    config_content = b"{}"
+    (directory / "config.json").write_bytes(config_content)
+
+    tok_content = b'{"vocab": {}}'
+    (directory / "tokenizer.json").write_bytes(tok_content)
+
+    null_emb_content = b"EMB"
+    (directory / "null_voice_emb.npy").write_bytes(null_emb_content)
+
+    codec_dir = directory / "onnx" / "codec"
+    codec_dir.mkdir(parents=True, exist_ok=True)
+    codec_files = []
+    for name in (
+        "codec_browser_onnx_meta.json",
+        "moss_audio_tokenizer_decode_full.onnx",
+        "moss_audio_tokenizer_decode_shared.data",
+        "moss_audio_tokenizer_decode_step.onnx",
+    ):
+        content = f"CODEC_{name}".encode()
+        (codec_dir / name).write_bytes(content)
+        codec_files.append(
+            ZeroTtsArtifact(
+                f"onnx/codec/{name}",
+                f"onnx/codec/{name}",
+                sha256(content).hexdigest(),
+            )
+        )
+
+    voice_dir = directory / "voices" / DEFAULT_ZEROTTS_VOICE.id
+    voice_dir.mkdir(parents=True, exist_ok=True)
+    voice_content = b"VOICE_NPZ_TEST"
+    (voice_dir / "voice.npz").write_bytes(voice_content)
+    test_voice = ZeroTtsVoiceSpec(
+        id=DEFAULT_ZEROTTS_VOICE.id,
+        name=DEFAULT_ZEROTTS_VOICE.name,
+        gender="nữ",
+        description="test",
+        artifact=ZeroTtsArtifact(
+            f"voices/{DEFAULT_ZEROTTS_VOICE.id}/voice.npz",
+            "voice.npz",
+            sha256(voice_content).hexdigest(),
+        ),
+    )
+
+    spec = ZeroTtsModelSpec(
+        repo=ZEROTTS_REPO_ID,
+        revision="92ca8651645d4733df56620b3aadc768a76f7c46",
+        config=ZeroTtsArtifact("config.json", "config.json", sha256(config_content).hexdigest()),
+        tokenizer=ZeroTtsArtifact(
+            "tokenizer.json", "tokenizer.json", sha256(tok_content).hexdigest()
+        ),
+        null_voice_emb=ZeroTtsArtifact(
+            "null_voice_emb.npy", "null_voice_emb.npy", sha256(null_emb_content).hexdigest()
+        ),
+        gguf_model=ZeroTtsArtifact(
+            f"{ZeroTtsDirectory.GGUF}/{ZeroTtsFile.DEFAULT_GGUF_MODEL}",
+            f"{ZeroTtsDirectory.GGUF}/{ZeroTtsFile.DEFAULT_GGUF_MODEL}",
+            sha256(gguf_content).hexdigest(),
+        ),
+        codec_files=tuple(codec_files),
+    )
+    return spec, test_voice
+
+
+def test_structure_zerotts_files_missing_gguf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test _structure_zerotts_files raises FileNotFoundError when GGUF is missing."""
+    snapshot_dir = tmp_path / "snapshot"
+    tts_spec, _ = _make_zerotts_snapshot(snapshot_dir)
+    gguf_file = snapshot_dir / ZeroTtsDirectory.GGUF / ZeroTtsFile.DEFAULT_GGUF_MODEL
+    if gguf_file.is_file():
+        gguf_file.unlink()
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec)
+    target_dir = tmp_path / "tts"
+
+    with pytest.raises(FileNotFoundError, match="Missing ZeroTTS GGUF model weights"):
+        _structure_zerotts_files(snapshot_dir, target_dir)
+
+
+def test_structure_zerotts_files_missing_artifact(tmp_path: Path) -> None:
+    """Test _structure_zerotts_files raises FileNotFoundError when artifact is missing."""
+    snapshot_dir = tmp_path / "snapshot"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    target_dir = tmp_path / "tts"
+
+    with pytest.raises(FileNotFoundError, match="Pinned ZeroTTS artifact is missing"):
+        _structure_zerotts_files(snapshot_dir, target_dir)
+
+
+def test_structure_zerotts_files_corrupted_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test _structure_zerotts_files raises RuntimeError when artifact digest fails verification."""
+    snapshot_dir = tmp_path / "snapshot"
+    tts_spec, _ = _make_zerotts_snapshot(snapshot_dir)
+    (snapshot_dir / "config.json").write_bytes(b"CORRUPTED_CONFIG")
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec)
+
+    target_dir = tmp_path / "tts"
+    with pytest.raises(RuntimeError, match="does not match its recorded SHA-256 digest"):
+        _structure_zerotts_files(snapshot_dir, target_dir)
+
+
+def test_download_models_structures_zerotts_quality_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test download structures ZeroTTS GGUF weights and voice latents in quality mode."""
+    stt = tmp_path / "stt-snapshot"
+    spec = _make_stt_snapshot(stt)
+    _pin_stt_model(monkeypatch, spec)
+
+    tts_snapshot = tmp_path / "zerotts-snapshot"
+    tts_spec, test_voice = _make_zerotts_snapshot(tts_snapshot)
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec)
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_VOICES", (test_voice,))
+
+    sync = Mock(side_effect=[stt, tts_snapshot])
+    monkeypatch.setattr("wyoming_vietnamese.download._sync_repo", sync)
+    monkeypatch.setattr("wyoming_vietnamese.download.setup_hf_environment", Mock())
+
+    paths = download_models(
+        tmp_path / "cache",
+        tmp_path / "models",
+        (test_voice,),
+        tts_engine=TtsEngine.ZEROTTS,
+    )
+
+    assert paths["tts"] == tmp_path / "models" / "tts"
+    assert (paths["tts"] / ZeroTtsDirectory.GGUF / ZeroTtsFile.DEFAULT_GGUF_MODEL).is_file()
+    assert (paths["tts"] / "config.json").is_file()
+    assert (paths["tts"] / "tokenizer.json").is_file()
+    assert (paths["tts"] / "null_voice_emb.npy").is_file()
+    assert (paths["tts"] / "onnx" / "codec" / "codec_browser_onnx_meta.json").is_file()
+    assert (paths["tts"] / "onnx" / "codec" / "moss_audio_tokenizer_decode_full.onnx").is_file()
+    assert (paths["tts"] / "voices" / test_voice.id / "voice.npz").is_file()
+
+    assert sync.call_count == 2
+    assert sync.call_args_list[1].args[0] == ZEROTTS_REPO_ID
+    assert sync.call_args_list[1].kwargs["revision"] == tts_spec.revision
+    assert sync.call_args_list[1].kwargs["allow_patterns"] == tts_spec.allow_patterns
+
+
+def test_structure_zerotts_files_corrupted_destination_voice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test _structure_zerotts_files raises RuntimeError when destination voice is corrupted."""
+    snapshot_dir = tmp_path / "snapshot"
+    tts_spec, test_voice = _make_zerotts_snapshot(snapshot_dir)
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec)
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_VOICES", (test_voice,))
+
+    target_dir = tmp_path / "tts"
+    corrupted_dst = target_dir / "voices" / test_voice.id / "voice.npz"
+    corrupted_dst.parent.mkdir(parents=True, exist_ok=True)
+    corrupted_dst.write_bytes(b"CORRUPTED_VOICE_DATA")
+
+    snapshot_voice = snapshot_dir / test_voice.artifact.remote_name
+    if snapshot_voice.is_file():
+        snapshot_voice.unlink()
+    flat_voice = snapshot_dir / "voices" / f"{test_voice.id}.npz"
+    if flat_voice.is_file():
+        flat_voice.unlink()
+
+    with pytest.raises(RuntimeError, match="does not match its recorded SHA-256 digest"):
+        _structure_zerotts_files(snapshot_dir, target_dir, voices=(test_voice,))
+
+
+def test_structure_zerotts_files_missing_configured_voice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test _structure_zerotts_files raises FileNotFoundError when configured voice is missing."""
+    snapshot_dir = tmp_path / "snapshot"
+    tts_spec, test_voice = _make_zerotts_snapshot(snapshot_dir)
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec)
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_VOICES", ())
+
+    target_dir = tmp_path / "tts"
+    with pytest.raises(FileNotFoundError, match="is missing from"):
+        _structure_zerotts_files(snapshot_dir, target_dir, voices=(test_voice,))
+
+
+def test_structure_zerotts_files_corrupted_destination_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test _structure_zerotts_files raises RuntimeError when destination artifact is corrupted."""
+    snapshot_dir = tmp_path / "snapshot"
+    tts_spec, test_voice = _make_zerotts_snapshot(snapshot_dir)
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec)
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_VOICES", (test_voice,))
+
+    target_dir = tmp_path / "tts"
+    _structure_zerotts_files(snapshot_dir, target_dir, voices=(test_voice,))
+
+    corrupted_artifact = target_dir / tts_spec.artifacts[0].local_name
+    source_artifact = snapshot_dir / tts_spec.artifacts[0].remote_name
+    if not source_artifact.is_file():
+        source_artifact = (
+            snapshot_dir / ZeroTtsDirectory.GGUF / Path(tts_spec.artifacts[0].remote_name).name
+        )
+    source_stat = source_artifact.stat()
+
+    corrupted_artifact.write_bytes(b"X" * source_stat.st_size)
+    os.utime(corrupted_artifact, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
+
+    with pytest.raises(RuntimeError, match="does not match its recorded SHA-256 digest"):
+        _structure_zerotts_files(snapshot_dir, target_dir, voices=(test_voice,))
+
+
+def test_download_models_rejects_unknown_tts_engine(tmp_path: Path) -> None:
+    """Test download_models rejects unknown TTS engine before any synchronization."""
+    with pytest.raises(ValueError, match="Unknown TTS engine"):
+        download_models(
+            tmp_path / "cache",
+            tmp_path / "models",
+            (DEFAULT_NGHITTS_VOICE,),
+            tts_engine="unknown_engine",
+        )
+    assert not (tmp_path / "cache").exists()
+    assert not (tmp_path / "models").exists()
+
+
+def test_download_models_rejects_mismatched_voice_spec(tmp_path: Path) -> None:
+    """Test download_models rejects voice specifications mismatched to the engine."""
+    with pytest.raises(TypeError, match="requires ZeroTtsVoiceSpec"):
+        download_models(
+            tmp_path / "cache",
+            tmp_path / "models",
+            (DEFAULT_NGHITTS_VOICE,),
+            tts_engine=TtsEngine.ZEROTTS,
+        )
+    assert not (tmp_path / "cache").exists()
+    assert not (tmp_path / "models").exists()

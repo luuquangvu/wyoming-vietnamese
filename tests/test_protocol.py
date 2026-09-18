@@ -10,7 +10,7 @@ import pytest
 from wyoming.event import Event
 
 from tests.helpers import MemoryWriter, make_reader, memory_writer, stream_writer, written_events
-from wyoming_vietnamese.const import MAX_EVENT_HEADER_BYTES
+from wyoming_vietnamese.const import EventLimit
 from wyoming_vietnamese.protocol import (
     ByteBudget,
     ConnectionLimiter,
@@ -79,8 +79,8 @@ async def test_read_event_rejects_bad_external_data(data: bytes) -> None:
 
 async def test_read_event_rejects_oversized_header() -> None:
     """Test read event rejects oversized header."""
-    reader = asyncio.StreamReader(limit=MAX_EVENT_HEADER_BYTES * 2)
-    reader.feed_data(b"{" + (b" " * MAX_EVENT_HEADER_BYTES) + b"}\n")
+    reader = asyncio.StreamReader(limit=EventLimit.MAX_HEADER_BYTES * 2)
+    reader.feed_data(b"{" + (b" " * EventLimit.MAX_HEADER_BYTES) + b"}\n")
     reader.feed_eof()
     with pytest.raises(ProtocolError, match="header is too large"):
         await async_read_event_limited(reader)

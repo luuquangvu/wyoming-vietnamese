@@ -14,10 +14,11 @@ from wyoming.tts import Synthesize, SynthesizeChunk, SynthesizeStart, Synthesize
 
 from tests.helpers import make_reader, memory_writer, stream_writer, written_events
 from wyoming_vietnamese.combined import CombinedEventHandler, combine_service_info
+from wyoming_vietnamese.const import PROGRAM_NAME
 from wyoming_vietnamese.protocol import ConnectionLimiter, SafeAsyncEventHandler
 from wyoming_vietnamese.stt import get_stt_info
 from wyoming_vietnamese.tts import get_tts_info
-from wyoming_vietnamese.tts_model import DEFAULT_TTS_VOICE
+from wyoming_vietnamese.tts_model import DEFAULT_NGHITTS_VOICE
 
 
 class RecordingHandler(SafeAsyncEventHandler):
@@ -78,7 +79,7 @@ def _make_handler(
     memory_writer(writer).peername = peername
     info = combine_service_info(
         get_stt_info("owner/stt"),
-        get_tts_info(DEFAULT_TTS_VOICE),
+        get_tts_info(DEFAULT_NGHITTS_VOICE),
     )
     handler = CombinedEventHandler(
         _factory(stt_events, handlers),
@@ -95,8 +96,8 @@ async def test_combined_handler_advertises_shared_service_name() -> None:
     handler, writer, _, _, _ = _make_handler()
     assert await handler.handle_event(Describe().event()) is True
     info = Info.from_event(written_events(writer)[0])
-    assert info.asr[0].name == "wyoming_vietnamese"
-    assert info.tts[0].name == "wyoming_vietnamese"
+    assert info.asr[0].name == PROGRAM_NAME
+    assert info.tts[0].name == PROGRAM_NAME
     assert info.asr[0].installed is True
     assert info.tts[0].installed is True
 

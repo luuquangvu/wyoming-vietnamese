@@ -10,6 +10,7 @@ on:
       - "uv.lock"
       - "Dockerfile"
       - ".github/workflows/docker.yaml"
+      - "tools/build_zerotts.py"
   workflow_dispatch:
 
 env:

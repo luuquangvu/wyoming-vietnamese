@@ -19,19 +19,16 @@ from wyoming.info import AsrModel, AsrProgram, Attribution, Describe, Info
 
 from .config import resolve_cpu_threads
 from .const import (
-    DEFAULT_EVENT_TIMEOUT,
-    DEFAULT_WRITE_TIMEOUT,
-    MAX_INPUT_SAMPLE_RATE,
-    MIN_INPUT_SAMPLE_RATE,
+    HUGGINGFACE_BASE_URL,
     PROGRAM_NAME,
-    STT_CONVERSION_SLICE_SECONDS,
-    STT_INLINE_CONVERSION_SECONDS,
-    STT_SAMPLE_CHANNELS,
-    STT_SAMPLE_WIDTH,
+    SHERPA_ONNX_REPO_URL,
     SUPPORTED_INPUT_CHANNELS,
     SUPPORTED_INPUT_WIDTHS,
-    TARGET_SAMPLE_RATE,
     VIETNAMESE_LANGUAGE,
+    InputSampleRate,
+    SttAudio,
+    SttConversion,
+    Timeout,
 )
 from .inference import run_inference
 from .protocol import ByteBudget, SafeAsyncEventHandler, is_vietnamese_language
@@ -80,8 +77,8 @@ class SherpaSTTEventHandler(SafeAsyncEventHandler):
         writer: asyncio.StreamWriter,
         *,
         buffer_budget: ByteBudget | None = None,
-        event_timeout: float = DEFAULT_EVENT_TIMEOUT,
-        write_timeout: float = DEFAULT_WRITE_TIMEOUT,
+        event_timeout: float = Timeout.EVENT,
+        write_timeout: float = Timeout.WRITE,
         inference_executor: Executor | None = None,
     ) -> None:
         """Initialize per-connection audio state around a shared recognizer."""
@@ -99,7 +96,10 @@ class SherpaSTTEventHandler(SafeAsyncEventHandler):
         self.queue_timeout = queue_timeout
         self.max_audio_seconds = max_audio_seconds
         self.max_audio_bytes = int(
-            max_audio_seconds * TARGET_SAMPLE_RATE * STT_SAMPLE_WIDTH * STT_SAMPLE_CHANNELS
+            max_audio_seconds
+            * SttAudio.TARGET_SAMPLE_RATE
+            * SttAudio.SAMPLE_WIDTH
+            * SttAudio.SAMPLE_CHANNELS
         )
         self.audio_bytes = bytearray()
         self.buffer_budget = buffer_budget
@@ -179,9 +179,9 @@ class SherpaSTTEventHandler(SafeAsyncEventHandler):
         self.audio_conversion_seconds = 0.0
         self.source_format = (audio_start.rate, audio_start.width, audio_start.channels)
         self.converter = AudioChunkConverter(
-            rate=TARGET_SAMPLE_RATE,
-            width=STT_SAMPLE_WIDTH,
-            channels=STT_SAMPLE_CHANNELS,
+            rate=SttAudio.TARGET_SAMPLE_RATE,
+            width=SttAudio.SAMPLE_WIDTH,
+            channels=SttAudio.SAMPLE_CHANNELS,
         )
         _LOGGER.debug(
             "STT step=audio-start source_rate=%d source_width=%d source_channels=%d "
@@ -189,7 +189,8 @@ class SherpaSTTEventHandler(SafeAsyncEventHandler):
             audio_start.rate,
             audio_start.width,
             audio_start.channels,
-            self.max_audio_bytes / (TARGET_SAMPLE_RATE * STT_SAMPLE_WIDTH * STT_SAMPLE_CHANNELS),
+            self.max_audio_bytes
+            / (SttAudio.TARGET_SAMPLE_RATE * SttAudio.SAMPLE_WIDTH * SttAudio.SAMPLE_CHANNELS),
         )
         return True
 
@@ -228,15 +229,15 @@ class SherpaSTTEventHandler(SafeAsyncEventHandler):
         conversion_started = perf_counter()
         try:
             if self.source_format == (
-                TARGET_SAMPLE_RATE,
-                STT_SAMPLE_WIDTH,
-                STT_SAMPLE_CHANNELS,
+                SttAudio.TARGET_SAMPLE_RATE,
+                SttAudio.SAMPLE_WIDTH,
+                SttAudio.SAMPLE_CHANNELS,
             ):
                 append_error = self._append_audio(chunk.audio)
                 if append_error is not None:
                     text, code = append_error
                     return await self._fail(text, code)
-            elif source_frames / chunk.rate <= STT_INLINE_CONVERSION_SECONDS:
+            elif source_frames / chunk.rate <= SttConversion.INLINE_SECONDS:
                 converted = self._convert_chunk(chunk)
                 append_error = self._append_audio(converted.audio)
                 if append_error is not None:
@@ -245,7 +246,7 @@ class SherpaSTTEventHandler(SafeAsyncEventHandler):
             else:
                 frames_per_slice = max(
                     1,
-                    int(chunk.rate * STT_CONVERSION_SLICE_SECONDS),
+                    int(chunk.rate * SttConversion.SLICE_SECONDS),
                 )
                 bytes_per_slice = frames_per_slice * frame_width
                 converted_parts = await asyncio.to_thread(
@@ -331,7 +332,9 @@ class SherpaSTTEventHandler(SafeAsyncEventHandler):
         self.source_format = None
         self.converter = None
         audio_size = len(self.audio_bytes)
-        audio_seconds = audio_size / (TARGET_SAMPLE_RATE * STT_SAMPLE_WIDTH * STT_SAMPLE_CHANNELS)
+        audio_seconds = audio_size / (
+            SttAudio.TARGET_SAMPLE_RATE * SttAudio.SAMPLE_WIDTH * SttAudio.SAMPLE_CHANNELS
+        )
         _LOGGER.debug(
             "STT step=audio-stop chunks=%d input_bytes=%d normalized_bytes=%d "
             "audio_seconds=%.3f receive_ms=%.3f conversion_ms=%.3f",
@@ -451,17 +454,15 @@ class SherpaSTTEventHandler(SafeAsyncEventHandler):
     def _recognize(self, audio_float: np.ndarray) -> str:
         """Execute one recognition stream and normalize its transcript."""
         stream = self.recognizer.create_stream()
-        stream.accept_waveform(TARGET_SAMPLE_RATE, audio_float)
+        stream.accept_waveform(SttAudio.TARGET_SAMPLE_RATE, audio_float)
         self.recognizer.decode_stream(stream)
         return stream.result.text.strip().lower()
 
     @staticmethod
     def _validate_audio_format(rate: int, width: int, channels: int) -> None:
         """Validate supported PCM format metadata without coercion."""
-        if type(rate) is not int or not MIN_INPUT_SAMPLE_RATE <= rate <= MAX_INPUT_SAMPLE_RATE:
-            raise ValueError(
-                f"sample rate must be {MIN_INPUT_SAMPLE_RATE}-{MAX_INPUT_SAMPLE_RATE} Hz"
-            )
+        if type(rate) is not int or not InputSampleRate.MIN <= rate <= InputSampleRate.MAX:
+            raise ValueError(f"sample rate must be {InputSampleRate.MIN}-{InputSampleRate.MAX} Hz")
         if type(width) is not int or width not in SUPPORTED_INPUT_WIDTHS:
             raise ValueError("sample width must be 1, 2, 3, or 4 bytes")
         if type(channels) is not int or channels not in SUPPORTED_INPUT_CHANNELS:
@@ -515,7 +516,7 @@ def get_stt_info(model_name: str, model_version: str | None = None) -> Info:
             AsrProgram(
                 name=PROGRAM_NAME,
                 description="Sherpa-ONNX Offline Transducer STT",
-                attribution=Attribution(name="k2-fsa", url="https://github.com/k2-fsa/sherpa-onnx"),
+                attribution=Attribution(name="k2-fsa", url=SHERPA_ONNX_REPO_URL),
                 installed=True,
                 version="1.13",
                 models=[
@@ -524,7 +525,7 @@ def get_stt_info(model_name: str, model_version: str | None = None) -> Info:
                         description="Zipformer RNNT STT model",
                         attribution=Attribution(
                             name=model_name.split("/", maxsplit=1)[0],
-                            url=f"https://huggingface.co/{model_name}",
+                            url=f"{HUGGINGFACE_BASE_URL}/{model_name}",
                         ),
                         installed=True,
                         version=model_version,
@@ -543,8 +544,8 @@ def warm_up_stt(recognizer: STTRecognizer) -> None:
     warmup_started = perf_counter()
     stream = recognizer.create_stream()
     stream.accept_waveform(
-        TARGET_SAMPLE_RATE,
-        np.zeros(TARGET_SAMPLE_RATE // 10, dtype=np.float32),
+        SttAudio.TARGET_SAMPLE_RATE,
+        np.zeros(SttAudio.TARGET_SAMPLE_RATE // 10, dtype=np.float32),
     )
     recognizer.decode_stream(stream)
     _LOGGER.info(
@@ -582,7 +583,7 @@ def initialize_stt(
         joiner=str(joiner),
         tokens=str(tokens),
         num_threads=threads,
-        sample_rate=TARGET_SAMPLE_RATE,
+        sample_rate=SttAudio.TARGET_SAMPLE_RATE,
         feature_dim=80,
         decoding_method="modified_beam_search",
         provider="cpu",

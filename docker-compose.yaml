@@ -11,6 +11,10 @@ services:
       - "10300:10300" # Shared STT/TTS Wyoming port
     environment:
       WYOMING_PORT: 10300
+      TTS_ENGINE: "nghitts" # "nghitts" (NghiTTS / VITS) or "zerotts" (ZeroTTS / GGUF Q8_0)
+      # Compatible TTS_VOICE examples by engine (first voice is default):
+      # - nghitts: "ngoc-huyen-moi, duy-onyx-moi, thanh-phuong-viettel, ngoc-ngan, mai-phuong"
+      # - zerotts: "maichi, baotrang, giahuy, hamy, huuduc"
       TTS_VOICE: "ngoc-huyen-moi, duy-onyx-moi, thanh-phuong-viettel, ngoc-ngan, mai-phuong" # Comma and/or whitespace separated; first is default
       LOG_LEVEL: "info" # debug, info, warning, error, critical
     volumes:

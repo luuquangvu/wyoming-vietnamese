@@ -8,14 +8,14 @@ import os
 import queue
 import re
 import threading
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Executor
 from contextlib import suppress
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from time import perf_counter
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol, cast
 
 import numpy as np
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
@@ -35,27 +35,39 @@ from wyoming.tts import (
 from .cache import BoundedLruCache
 from .config import resolve_cpu_threads
 from .const import (
-    DEFAULT_EVENT_TIMEOUT,
-    DEFAULT_TTS_CLAUSE_SILENCE_MS,
-    DEFAULT_TTS_PARAGRAPH_SILENCE_MS,
-    DEFAULT_TTS_SENTENCE_SILENCE_MS,
-    DEFAULT_WRITE_TIMEOUT,
+    DEFAULT_TTS_ENGINE,
+    NGHITTS_REPO_URL,
     PROGRAM_NAME,
-    TTS_CHUNK_SIZE,
-    TTS_CONFIG_FILE,
-    TTS_MODEL_FILE,
-    TTS_OUTPUT_QUEUE_CHUNKS,
-    TTS_SAMPLE_CHANNELS,
-    TTS_SAMPLE_RATE,
-    TTS_SAMPLE_WIDTH,
-    TTS_TOKENS_FILE,
     VIETNAMESE_LANGUAGE,
+    ZEROTTS_REPO_URL,
+    NghiTtsAudio,
+    NghiTtsFile,
+    Timeout,
+    TtsAudio,
+    TtsEngine,
+    TtsProvider,
+    TtsSilenceMs,
+    ZeroTtsDirectory,
+    ZeroTtsFile,
 )
 from .inference import run_inference
 from .protocol import ProtocolWriteError, SafeAsyncEventHandler, is_vietnamese_language
-from .tts_model import DEFAULT_TTS_VOICE, TTS_VOICES_BY_ID, TtsVoiceSpec
+from .tts_model import (
+    DEFAULT_NGHITTS_VOICE,
+    NGHITTS_VOICES_BY_ID,
+    ZEROTTS_VOICES_BY_ID,
+    NghiTtsVoiceSpec,
+    ZeroTtsVoiceSpec,
+)
+
+if TYPE_CHECKING:
+    from .zerotts_engine import ZeroTtsGgmlEngine
+
+AnyVoiceSpec = NghiTtsVoiceSpec | ZeroTtsVoiceSpec
 
 _LOGGER = logging.getLogger(__name__)
+
+_ERR_AT_LEAST_ONE_VOICE = "At least one TTS voice must be configured"
 
 
 class TTSEngine(Protocol):
@@ -69,6 +81,11 @@ class TTSEngine(Protocol):
     @property
     def sample_rate(self) -> int:
         """PCM sample rate produced by the selected engine."""
+        ...
+
+    @property
+    def chunks_are_sentences(self) -> bool:
+        """Whether chunks yielded by infer_stream represent whole sentences."""
         ...
 
     def infer_stream(self, text: str, *, voice: str | None = None) -> Iterator[np.ndarray]:
@@ -198,15 +215,16 @@ class _NghiAudioIterator(Iterator[np.ndarray]):
 class NghiTTSEngine:
     """Adapt a non-autoregressive NghiTTS voice to the service API."""
 
-    def __init__(self, tts: _SherpaOfflineTts, voice: TtsVoiceSpec) -> None:
+    def __init__(self, tts: _SherpaOfflineTts, voice: NghiTtsVoiceSpec) -> None:
         """Validate the native model contract and expose one named preset voice."""
-        if tts.sample_rate != TTS_SAMPLE_RATE:
+        if tts.sample_rate != NghiTtsAudio.SAMPLE_RATE:
             raise RuntimeError("NghiTTS returned an unexpected sample rate")
         if tts.num_speakers != 1:
             raise RuntimeError("NghiTTS returned an unexpected speaker count")
         self._tts: _SherpaOfflineTts | None = tts
         self.voice = voice
         self.sample_rate = tts.sample_rate
+        self.chunks_are_sentences: bool = True
         self._preset_voices: Mapping[str, Mapping[str, object]] = {
             voice.name: {"description": "NghiTTS voice"}
         }
@@ -248,7 +266,7 @@ class MultiVoiceTTSEngine:
         """Validate and retain a non-empty collection of compatible engines."""
         engine_list = list(engines)
         if not engine_list:
-            raise ValueError("At least one TTS voice must be configured")
+            raise ValueError(_ERR_AT_LEAST_ONE_VOICE)
         sample_rates = {engine.sample_rate for engine in engine_list}
         if len(sample_rates) != 1:
             raise ValueError("Configured TTS voices must use the same sample rate")
@@ -257,6 +275,7 @@ class MultiVoiceTTSEngine:
             raise ValueError("Configured TTS voices must have unique names")
         self._default_engine = engine_list[0]
         self.sample_rate = self._default_engine.sample_rate
+        self.chunks_are_sentences: bool = True
         self._preset_voices: Mapping[str, object] = {
             engine.voice.name: {"description": "NghiTTS voice"} for engine in engine_list
         }
@@ -286,8 +305,8 @@ class MultiVoiceTTSEngine:
 
 
 def get_tts_sample_rate(tts: TTSEngine) -> int:
-    """Read and validate the sample rate advertised by an initialized engine."""
-    sample_rate = getattr(tts, "sample_rate", TTS_SAMPLE_RATE)
+    """Return a positive engine sample rate, defaulting to the NghiTTS rate when absent."""
+    sample_rate = getattr(tts, "sample_rate", NghiTtsAudio.SAMPLE_RATE)
     if not isinstance(sample_rate, int) or sample_rate <= 0:
         raise ValueError(f"Invalid TTS engine sample rate: {sample_rate!r}")
     return sample_rate
@@ -401,7 +420,7 @@ def _silence_pcm(milliseconds: int, sample_rate: int) -> bytes:
     if milliseconds < 0:
         raise ValueError("Silence duration must not be negative")
     samples = round(sample_rate * milliseconds / 1000)
-    return bytes(samples * TTS_SAMPLE_WIDTH * TTS_SAMPLE_CHANNELS)
+    return bytes(samples * TtsAudio.SAMPLE_WIDTH * TtsAudio.SAMPLE_CHANNELS)
 
 
 def _boundary_kind(text: str, separator: str = "") -> str:
@@ -535,11 +554,11 @@ class TTSEventHandler(SafeAsyncEventHandler):
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         *,
-        event_timeout: float = DEFAULT_EVENT_TIMEOUT,
-        write_timeout: float = DEFAULT_WRITE_TIMEOUT,
-        sentence_silence_ms: int = DEFAULT_TTS_SENTENCE_SILENCE_MS,
-        clause_silence_ms: int = DEFAULT_TTS_CLAUSE_SILENCE_MS,
-        paragraph_silence_ms: int = DEFAULT_TTS_PARAGRAPH_SILENCE_MS,
+        event_timeout: float = Timeout.EVENT,
+        write_timeout: float = Timeout.WRITE,
+        sentence_silence_ms: int = TtsSilenceMs.SENTENCE,
+        clause_silence_ms: int = TtsSilenceMs.CLAUSE,
+        paragraph_silence_ms: int = TtsSilenceMs.PARAGRAPH,
         inference_executor: Executor | None = None,
     ) -> None:
         """Initialize per-connection state around the shared TTS engine."""
@@ -560,6 +579,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
         self.sentence_silence_ms = sentence_silence_ms
         self.clause_silence_ms = clause_silence_ms
         self.paragraph_silence_ms = paragraph_silence_ms
+        self.chunks_are_sentences = bool(getattr(tts, "chunks_are_sentences", True))
         self.preset_voices = dict(getattr(tts, "_preset_voices", {}))
         self.stream_voice_name: str | None
         # Survives _reset_stream() so a late compatibility request cannot restart a
@@ -623,7 +643,8 @@ class TTSEventHandler(SafeAsyncEventHandler):
         production = await self._synthesize(text, voice_name)
         success = production is not None
         audio_seconds = (
-            production.total_bytes / (self.sample_rate * TTS_SAMPLE_WIDTH * TTS_SAMPLE_CHANNELS)
+            production.total_bytes
+            / (self.sample_rate * TtsAudio.SAMPLE_WIDTH * TtsAudio.SAMPLE_CHANNELS)
             if production is not None
             else 0.0
         )
@@ -775,7 +796,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
         completed_at = perf_counter()
         stream_started = self.stream_started_at or stop_started
         audio_seconds = self.stream_audio_bytes / (
-            self.sample_rate * TTS_SAMPLE_WIDTH * TTS_SAMPLE_CHANNELS
+            self.sample_rate * TtsAudio.SAMPLE_WIDTH * TtsAudio.SAMPLE_CHANNELS
         )
         real_time_factor = self.stream_engine_seconds / audio_seconds if audio_seconds else 0.0
         first_audio_ms = (
@@ -820,7 +841,9 @@ class TTSEventHandler(SafeAsyncEventHandler):
         if voice_name is not None:
             if not isinstance(voice_name, str):
                 raise TypeError("voice name must be text")
-            catalog_voice = TTS_VOICES_BY_ID.get(voice_name)
+            catalog_voice = NGHITTS_VOICES_BY_ID.get(voice_name)
+            if catalog_voice is None:
+                catalog_voice = ZEROTTS_VOICES_BY_ID.get(voice_name)
             if catalog_voice is not None:
                 voice_name = catalog_voice.name
         if voice_name is not None and voice_name not in self.preset_voices:
@@ -859,13 +882,13 @@ class TTSEventHandler(SafeAsyncEventHandler):
     async def _write_silence(self, silence: bytes) -> float:
         """Write padding silence as protocol audio chunks and report elapsed time."""
         write_started = perf_counter()
-        for offset in range(0, len(silence), TTS_CHUNK_SIZE):
+        for offset in range(0, len(silence), TtsAudio.CHUNK_SIZE):
             await self.write_event(
                 AudioChunk(
                     rate=self.sample_rate,
-                    width=TTS_SAMPLE_WIDTH,
-                    channels=TTS_SAMPLE_CHANNELS,
-                    audio=silence[offset : offset + TTS_CHUNK_SIZE],
+                    width=TtsAudio.SAMPLE_WIDTH,
+                    channels=TtsAudio.SAMPLE_CHANNELS,
+                    audio=silence[offset : offset + TtsAudio.CHUNK_SIZE],
                 ).event()
             )
         return perf_counter() - write_started
@@ -979,8 +1002,8 @@ class TTSEventHandler(SafeAsyncEventHandler):
                 production.total_bytes = len(cached_audio)
                 production.cache_parts = None
             else:
-                output_queue = asyncio.Queue(maxsize=TTS_OUTPUT_QUEUE_CHUNKS + 1)
-                output_slots = asyncio.Semaphore(TTS_OUTPUT_QUEUE_CHUNKS)
+                output_queue = asyncio.Queue(maxsize=TtsAudio.OUTPUT_QUEUE_CHUNKS + 1)
+                output_slots = asyncio.Semaphore(TtsAudio.OUTPUT_QUEUE_CHUNKS)
                 abort_production = asyncio.Event()
                 # Eager start hands the inference lock over safely: the producer enters
                 # its try block before this returns, so any later cancellation is
@@ -1007,23 +1030,23 @@ class TTSEventHandler(SafeAsyncEventHandler):
                 await self.write_event(
                     AudioStart(
                         rate=self.sample_rate,
-                        width=TTS_SAMPLE_WIDTH,
-                        channels=TTS_SAMPLE_CHANNELS,
+                        width=TtsAudio.SAMPLE_WIDTH,
+                        channels=TtsAudio.SAMPLE_CHANNELS,
                     ).event()
                 )
                 output_seconds += perf_counter() - write_started
                 audio_started = True
 
             if cached_audio is not None:
-                for offset in range(0, len(cached_audio), TTS_CHUNK_SIZE):
-                    chunk = cached_audio[offset : offset + TTS_CHUNK_SIZE]
+                for offset in range(0, len(cached_audio), TtsAudio.CHUNK_SIZE):
+                    chunk = cached_audio[offset : offset + TtsAudio.CHUNK_SIZE]
                     if chunk:
                         write_started = perf_counter()
                         await self.write_event(
                             AudioChunk(
                                 rate=self.sample_rate,
-                                width=TTS_SAMPLE_WIDTH,
-                                channels=TTS_SAMPLE_CHANNELS,
+                                width=TtsAudio.SAMPLE_WIDTH,
+                                channels=TtsAudio.SAMPLE_CHANNELS,
                                 audio=chunk,
                             ).event()
                         )
@@ -1041,8 +1064,8 @@ class TTSEventHandler(SafeAsyncEventHandler):
                         await self.write_event(
                             AudioChunk(
                                 rate=self.sample_rate,
-                                width=TTS_SAMPLE_WIDTH,
-                                channels=TTS_SAMPLE_CHANNELS,
+                                width=TtsAudio.SAMPLE_WIDTH,
+                                channels=TtsAudio.SAMPLE_CHANNELS,
                                 audio=chunk,
                             ).event()
                         )
@@ -1054,7 +1077,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
                         first_audio_at = perf_counter()
                 await producer
 
-            if not send_stop:
+            if not send_stop and self.chunks_are_sentences:
                 pause_pcm = self._boundary_silence_pcm(text, separator)
                 pause_bytes = len(pause_pcm)
                 output_seconds += await self._write_silence(pause_pcm)
@@ -1148,7 +1171,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
         completed_at = perf_counter()
         segment_seconds = completed_at - segment_started
         audio_seconds = production.total_bytes / (
-            self.sample_rate * TTS_SAMPLE_WIDTH * TTS_SAMPLE_CHANNELS
+            self.sample_rate * TtsAudio.SAMPLE_WIDTH * TtsAudio.SAMPLE_CHANNELS
         )
         real_time_factor = production.engine_seconds / audio_seconds if audio_seconds else 0.0
         first_audio_ms = (
@@ -1234,7 +1257,11 @@ class TTSEventHandler(SafeAsyncEventHandler):
                     break
                 if audio_bytes is None:
                     continue
-                if production.engine_chunk_count and self.sentence_silence_ms:
+                if (
+                    self.chunks_are_sentences
+                    and production.engine_chunk_count
+                    and self.sentence_silence_ms
+                ):
                     # Native chunks are whole sentences that otherwise abut each other.
                     audio_bytes = self._silence_pcm(self.sentence_silence_ms) + audio_bytes
                 production.engine_chunk_count += 1
@@ -1248,8 +1275,8 @@ class TTSEventHandler(SafeAsyncEventHandler):
                 else:
                     production.cache_parts = None
 
-                for offset in range(0, len(audio_bytes), TTS_CHUNK_SIZE):
-                    chunk = audio_bytes[offset : offset + TTS_CHUNK_SIZE]
+                for offset in range(0, len(audio_bytes), TtsAudio.CHUNK_SIZE):
+                    chunk = audio_bytes[offset : offset + TtsAudio.CHUNK_SIZE]
                     if not chunk:
                         continue
                     try:
@@ -1325,8 +1352,8 @@ class TTSEventHandler(SafeAsyncEventHandler):
             await self.write_event(
                 AudioStart(
                     rate=self.sample_rate,
-                    width=TTS_SAMPLE_WIDTH,
-                    channels=TTS_SAMPLE_CHANNELS,
+                    width=TtsAudio.SAMPLE_WIDTH,
+                    channels=TtsAudio.SAMPLE_CHANNELS,
                 ).event()
             )
         await self.write_event(AudioStop().event())
@@ -1390,13 +1417,24 @@ class TTSEventHandler(SafeAsyncEventHandler):
         self._reset_stream()
 
 
-def warm_up_tts(tts: TTSEngine) -> None:
-    """Run a complete streaming synthesis to warm up the TTS engine."""
-    warmup_started = perf_counter()
+def _warm_up_single_voice(tts: TTSEngine, voice_name: str | None) -> float:
+    """Warm up a single TTS voice and return elapsed milliseconds.
+
+    Args:
+        tts: The initialized TTSEngine instance.
+        voice_name: Voice display name or identifier to synthesize, or None for default.
+
+    Returns:
+        Elapsed time in milliseconds for synthesizing the warm-up utterance.
+
+    Raises:
+        RuntimeError: If synthesis produces no audio samples.
+    """
+    started = perf_counter()
     iterator = iter(
         tts.infer_stream(
             "Xin chào.",
-            voice=None,
+            voice=voice_name,
         )
     )
     has_audio = False
@@ -1405,40 +1443,86 @@ def warm_up_tts(tts: TTSEngine) -> None:
             if np.asarray(audio).size:
                 has_audio = True
         if not has_audio:
-            raise RuntimeError("TTS warm-up returned no audio")
+            target = voice_name or "default"
+            raise RuntimeError(f"TTS warm-up returned no audio for voice: {target}")
     finally:
         close = getattr(iterator, "close", None)
         if callable(close):
             with suppress(Exception):
                 close()
 
+    return (perf_counter() - started) * 1000
+
+
+def warm_up_tts(
+    tts: TTSEngine,
+    voices: Sequence[AnyVoiceSpec] | None = None,
+    engine: str = DEFAULT_TTS_ENGINE,
+) -> None:
+    """Warm up the TTS engine for the configured engine and voice list.
+
+    Args:
+        tts: The initialized TTSEngine instance.
+        voices: Sequence of configured voice specifications, or None for default voice.
+        engine: The active TTS engine (nghitts or zerotts).
+
+    Raises:
+        RuntimeError: If synthesis returns no audio for any warmed-up voice.
+    """
+    warmup_started = perf_counter()
+    provider_name = TtsProvider.ZEROTTS if engine == TtsEngine.ZEROTTS else TtsProvider.NGHITTS
+    voice_targets = [v.name for v in voices] if voices else [None]
+
+    for voice_name in voice_targets:
+        duration_ms = _warm_up_single_voice(tts, voice_name)
+        _LOGGER.debug(
+            "Warmed up %s voice %s: duration_ms=%.3f",
+            provider_name,
+            voice_name or "default",
+            duration_ms,
+        )
+
     _LOGGER.info(
-        "Warmed up TTS streaming inference: duration_ms=%.3f",
+        "Warmed up %s engine (%s, %d voice(s)): duration_ms=%.3f",
+        provider_name,
+        engine,
+        len(voice_targets),
         (perf_counter() - warmup_started) * 1000,
     )
 
 
-def get_tts_info(voices: TtsVoiceSpec | Iterable[TtsVoiceSpec]) -> Info:
-    """Build Wyoming discovery information for the configured NghiTTS voices."""
-    voice_specs = (voices,) if isinstance(voices, TtsVoiceSpec) else tuple(voices)
+def get_tts_info(
+    voices: AnyVoiceSpec | Iterable[AnyVoiceSpec],
+    engine: str = DEFAULT_TTS_ENGINE,
+) -> Info:
+    """Build Wyoming discovery information with the selected engine's provider metadata."""
+    voice_specs = tuple(voices) if isinstance(voices, Iterable) else (voices,)
     if not voice_specs:
-        raise ValueError("At least one TTS voice must be configured")
-    attribution = Attribution(
-        name="nghimestudio",
-        url="https://github.com/nghimestudio/nghitts",
-    )
+        raise ValueError(_ERR_AT_LEAST_ONE_VOICE)
+    if engine == TtsEngine.ZEROTTS:
+        attribution = Attribution(
+            name="ZeroWeight AI",
+            url=ZEROTTS_REPO_URL,
+        )
+        description = f"{TtsProvider.ZEROTTS} Vietnamese (GGML Q8_0)"
+    else:
+        attribution = Attribution(
+            name="nghimestudio",
+            url=NGHITTS_REPO_URL,
+        )
+        description = f"{TtsProvider.NGHITTS} Vietnamese (Sherpa-ONNX)"
     return Info(
         tts=[
             TtsProgram(
                 name=PROGRAM_NAME,
-                description="NghiTTS Vietnamese (Sherpa-ONNX)",
+                description=description,
                 attribution=attribution,
                 installed=True,
                 version="medium",
                 voices=[
                     TtsVoice(
                         name=voice.name,
-                        description=voice.name,
+                        description=getattr(voice, "description", None) or voice.name,
                         attribution=attribution,
                         installed=True,
                         version="medium",
@@ -1455,12 +1539,12 @@ def get_tts_info(voices: TtsVoiceSpec | Iterable[TtsVoiceSpec]) -> Info:
 def initialize_tts(
     model_dir: Path,
     num_threads: int = 0,
-    voice: TtsVoiceSpec = DEFAULT_TTS_VOICE,
+    voice: NghiTtsVoiceSpec = DEFAULT_NGHITTS_VOICE,
 ) -> TTSEngine:
     """Initialize one shared NghiTTS engine from required local assets."""
-    model_path = model_dir / TTS_MODEL_FILE
-    config_path = model_dir / TTS_CONFIG_FILE
-    tokens_path = model_dir / TTS_TOKENS_FILE
+    model_path = model_dir / NghiTtsFile.MODEL
+    config_path = model_dir / NghiTtsFile.CONFIG
+    tokens_path = model_dir / NghiTtsFile.TOKENS
     for label, path in (
         ("ONNX model", model_path),
         ("model configuration", config_path),
@@ -1508,12 +1592,12 @@ def initialize_tts(
 
 def initialize_tts_voices(
     model_root: Path,
-    voices: tuple[TtsVoiceSpec, ...],
+    voices: tuple[NghiTtsVoiceSpec, ...],
     num_threads: int = 0,
 ) -> TTSEngine:
     """Initialize and combine all configured voices from voice-specific directories."""
     if not voices:
-        raise ValueError("At least one TTS voice must be configured")
+        raise ValueError(_ERR_AT_LEAST_ONE_VOICE)
     engines: list[NghiTTSEngine] = []
     try:
         for voice in voices:
@@ -1526,6 +1610,88 @@ def initialize_tts_voices(
         for engine in engines:
             engine.close()
         raise
+
+
+def initialize_zerotts(
+    model_dir: Path,
+    voices: Sequence[ZeroTtsVoiceSpec],
+    num_threads: int = 0,
+    custom_lib_path: Path | None = None,
+    gguf_path: Path | None = None,
+) -> ZeroTtsGgmlEngine:
+    """Initialize ZeroTTS using default GGUF and runtime paths unless overridden."""
+    from .zerotts_engine import ZeroTtsGgmlEngine
+
+    threads = resolve_cpu_threads(num_threads)
+    actual_gguf_path = (
+        gguf_path
+        if gguf_path is not None
+        else model_dir / ZeroTtsDirectory.GGUF / ZeroTtsFile.DEFAULT_GGUF_MODEL
+    )
+    _LOGGER.info(
+        "Initializing ZeroTTS GGML: voices=%s threads=%d gguf=%s",
+        ", ".join(v.name for v in voices),
+        threads,
+        actual_gguf_path,
+    )
+    initialization_started = perf_counter()
+    engine = ZeroTtsGgmlEngine(
+        model_dir=model_dir,
+        gguf_path=actual_gguf_path,
+        voices=voices,
+        num_threads=threads,
+        custom_lib_path=custom_lib_path,
+    )
+    _LOGGER.info(
+        "Initialized ZeroTTS GGML: sample_rate=%d duration_ms=%.3f",
+        engine.sample_rate,
+        (perf_counter() - initialization_started) * 1000,
+    )
+    return engine
+
+
+def validate_tts_voices_for_engine(voices: Sequence[AnyVoiceSpec], engine: str) -> None:
+    """Validate that configured voices match the requirements of the selected TTS engine.
+
+    Args:
+        voices: Sequence of voice specifications to validate.
+        engine: The active TTS engine (nghitts or zerotts).
+
+    Raises:
+        ValueError: If engine is unknown or voices sequence is empty.
+        TypeError: If any voice does not match the engine specification type.
+    """
+    if engine not in (TtsEngine.NGHITTS, TtsEngine.ZEROTTS):
+        raise ValueError(f"Unknown TTS engine: {engine}")
+    if not voices:
+        raise ValueError(_ERR_AT_LEAST_ONE_VOICE)
+    for voice in voices:
+        if engine == TtsEngine.ZEROTTS:
+            if not isinstance(voice, ZeroTtsVoiceSpec):
+                raise TypeError(
+                    f"{TtsProvider.ZEROTTS} requires ZeroTtsVoiceSpec, got: {type(voice).__name__}"
+                )
+        elif engine == TtsEngine.NGHITTS and not isinstance(voice, NghiTtsVoiceSpec):
+            raise TypeError(
+                f"{TtsProvider.NGHITTS} requires NghiTtsVoiceSpec, got: {type(voice).__name__}"
+            )
+
+
+def initialize_tts_engine(
+    model_root: Path,
+    voices: Sequence[AnyVoiceSpec],
+    num_threads: int = 0,
+    engine: str = DEFAULT_TTS_ENGINE,
+) -> TTSEngine:
+    """Initialize the configured TTS engine according to selection."""
+    validate_tts_voices_for_engine(voices, engine)
+    if engine == TtsEngine.ZEROTTS:
+        zerotts_voices = tuple(cast(ZeroTtsVoiceSpec, v) for v in voices)
+        return initialize_zerotts(model_root, zerotts_voices, num_threads)
+    if engine == TtsEngine.NGHITTS:
+        nghitts_voices = tuple(cast(NghiTtsVoiceSpec, v) for v in voices)
+        return initialize_tts_voices(model_root, nghitts_voices, num_threads)
+    raise ValueError(f"Unknown TTS engine: {engine}")
 
 
 def _resolve_nghitts_espeak_data(model_dir: Path) -> Path:

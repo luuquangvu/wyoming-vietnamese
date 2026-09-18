@@ -12,13 +12,10 @@ from wyoming.event import Event
 from wyoming.server import AsyncEventHandler
 
 from .const import (
-    DEFAULT_EVENT_TIMEOUT,
-    DEFAULT_LOCAL_CONNECTION_RESERVE,
-    DEFAULT_WRITE_TIMEOUT,
-    MAX_EVENT_DATA_BYTES,
-    MAX_EVENT_HEADER_BYTES,
-    MAX_EVENT_PAYLOAD_BYTES,
     VIETNAMESE_LANGUAGE,
+    ConnectionLimit,
+    EventLimit,
+    Timeout,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -47,7 +44,7 @@ class ConnectionLimiter:
     def __init__(
         self,
         maximum: int,
-        local_reserve: int = DEFAULT_LOCAL_CONNECTION_RESERVE,
+        local_reserve: int = ConnectionLimit.LOCAL_RESERVE,
     ) -> None:
         """Initialize a positive maximum, its local reserve, and an empty active count."""
         if maximum < 1:
@@ -138,7 +135,7 @@ def _read_length(event_dict: dict[str, object], name: str, maximum: int) -> int:
 async def async_read_event_limited(
     reader: asyncio.StreamReader,
     *,
-    max_payload_bytes: int = MAX_EVENT_PAYLOAD_BYTES,
+    max_payload_bytes: int = EventLimit.MAX_PAYLOAD_BYTES,
 ) -> Event | None:
     """Read one Wyoming event while enforcing frame and payload limits."""
     try:
@@ -148,7 +145,7 @@ async def async_read_event_limited(
 
     if not json_line:
         return None
-    if len(json_line) > MAX_EVENT_HEADER_BYTES:
+    if len(json_line) > EventLimit.MAX_HEADER_BYTES:
         raise ProtocolError("event header is too large")
     if not json_line.endswith(b"\n"):
         raise ProtocolError("event header is not newline terminated")
@@ -168,7 +165,7 @@ async def async_read_event_limited(
     if not isinstance(data, dict):
         raise ProtocolError("event data must be a JSON object")
 
-    if data_length := _read_length(event_dict, "data_length", MAX_EVENT_DATA_BYTES):
+    if data_length := _read_length(event_dict, "data_length", EventLimit.MAX_DATA_BYTES):
         data_bytes = await reader.readexactly(data_length)
         try:
             extra_data = json.loads(data_bytes)
@@ -191,8 +188,8 @@ class SafeAsyncEventHandler(AsyncEventHandler):
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         *,
-        event_timeout: float = DEFAULT_EVENT_TIMEOUT,
-        write_timeout: float = DEFAULT_WRITE_TIMEOUT,
+        event_timeout: float = Timeout.EVENT,
+        write_timeout: float = Timeout.WRITE,
     ) -> None:
         """Initialize bounded event reads and writes for one connection."""
         if event_timeout <= 0 or write_timeout <= 0:

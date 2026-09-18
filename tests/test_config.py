@@ -13,11 +13,11 @@ from wyoming_vietnamese.config import (
 )
 from wyoming_vietnamese.const import (
     DEFAULT_PORT,
-    DEFAULT_TTS_CLAUSE_SILENCE_MS,
-    DEFAULT_TTS_PARAGRAPH_SILENCE_MS,
-    DEFAULT_TTS_SENTENCE_SILENCE_MS,
+    DEFAULT_TTS_ENGINE,
+    TtsEngine,
+    TtsSilenceMs,
 )
-from wyoming_vietnamese.tts_model import DEFAULT_TTS_VOICE_ID
+from wyoming_vietnamese.tts_model import DEFAULT_NGHITTS_VOICE_ID
 
 
 def test_get_float_conflicting_bounds() -> None:
@@ -103,7 +103,8 @@ def test_server_config_defaults() -> None:
     assert config.port == DEFAULT_PORT
     assert config.cpu_threads == 0
     assert config.offline is False
-    assert [voice.id for voice in config.tts_voices] == [DEFAULT_TTS_VOICE_ID]
+    assert config.tts_engine == DEFAULT_TTS_ENGINE
+    assert [voice.id for voice in config.tts_voices] == [DEFAULT_NGHITTS_VOICE_ID]
     assert config.event_timeout == 60
     assert config.write_timeout == 5
     assert config.max_active_connections == 64
@@ -112,9 +113,9 @@ def test_server_config_defaults() -> None:
     assert config.tts_cache_max_entries == 128
     assert config.tts_cache_max_bytes == 64 * 1024 * 1024
     assert config.tts_cache_max_item_bytes == 4 * 1024 * 1024
-    assert config.tts_sentence_silence_ms == DEFAULT_TTS_SENTENCE_SILENCE_MS
-    assert config.tts_clause_silence_ms == DEFAULT_TTS_CLAUSE_SILENCE_MS
-    assert config.tts_paragraph_silence_ms == DEFAULT_TTS_PARAGRAPH_SILENCE_MS
+    assert config.tts_sentence_silence_ms == TtsSilenceMs.SENTENCE
+    assert config.tts_clause_silence_ms == TtsSilenceMs.CLAUSE
+    assert config.tts_paragraph_silence_ms == TtsSilenceMs.PARAGRAPH
 
 
 def test_server_config_custom_values() -> None:
@@ -221,12 +222,41 @@ def test_server_config_accepts_tts_voice_separators(value: str) -> None:
         ({"TTS_VOICE": "ngoc-huyen-moi;ngoc-ngan"}, "must be one of"),
         ({"TTS_VOICE": "ngoc-huyen-moi,ngoc-huyen-moi"}, "duplicate"),
         ({"LOG_LEVEL": "verbose"}, "LOG_LEVEL is invalid"),
+        ({"TTS_ENGINE": "invalid"}, "TTS_ENGINE must be one of"),
+        (
+            {"TTS_ENGINE": TtsEngine.ZEROTTS, "TTS_VOICE": "ngoc-huyen-moi"},
+            "TTS_VOICE must be one of",
+        ),
     ],
 )
 def test_server_config_rejects_invalid_values(environment: dict[str, str], message: str) -> None:
     """Test server config rejects invalid values."""
     with pytest.raises(ValueError, match=message):
         ServerConfig.from_env(environment)
+
+
+def test_server_config_tts_engine_nghitts() -> None:
+    """Test server config parses NghiTTS engine explicitly."""
+    config = ServerConfig.from_env({"TTS_ENGINE": TtsEngine.NGHITTS})
+    assert config.tts_engine == TtsEngine.NGHITTS
+
+
+def test_server_config_tts_engine_zerotts() -> None:
+    """Test server config parses ZeroTTS engine and resolves ZeroTTS voices."""
+    config = ServerConfig.from_env({"TTS_ENGINE": TtsEngine.ZEROTTS})
+    assert config.tts_engine == TtsEngine.ZEROTTS
+    assert [voice.id for voice in config.tts_voices] == ["maichi"]
+    assert [voice.name for voice in config.tts_voices] == ["Mai Chi"]
+
+    config_custom = ServerConfig.from_env(
+        {
+            "TTS_ENGINE": TtsEngine.ZEROTTS,
+            "TTS_VOICE": "baotrang, giahuy",
+        }
+    )
+    assert config_custom.tts_engine == TtsEngine.ZEROTTS
+    assert [voice.id for voice in config_custom.tts_voices] == ["baotrang", "giahuy"]
+    assert [voice.name for voice in config_custom.tts_voices] == ["Bảo Trang", "Gia Huy"]
 
 
 @pytest.mark.parametrize("value", ["20", "not-an-integer", "-1", ""])
