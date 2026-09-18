@@ -1087,8 +1087,8 @@ def test_tts_info_lists_configured_voices_zerotts_engine() -> None:
         second_voice.name,
     ]
     assert [voice.description for voice in program.voices] == [
-        DEFAULT_ZEROTTS_VOICE.description,
-        second_voice.description,
+        DEFAULT_ZEROTTS_VOICE.name,
+        second_voice.name,
     ]
 
 

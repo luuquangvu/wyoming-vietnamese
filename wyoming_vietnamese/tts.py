@@ -1519,10 +1519,12 @@ def get_tts_info(
                 attribution=attribution,
                 installed=True,
                 version="medium",
+                # Home Assistant currently uses the description field as the display name,
+                # so we set this field to voice.name. Update it if the logic changes in the future.
                 voices=[
                     TtsVoice(
                         name=voice.name,
-                        description=getattr(voice, "description", None) or voice.name,
+                        description=voice.name,
                         attribution=attribution,
                         installed=True,
                         version="medium",
