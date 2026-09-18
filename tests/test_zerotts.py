@@ -27,7 +27,8 @@ from wyoming_vietnamese.zerotts_engine import (
 )
 
 
-def test_build_zerotts_ggml_lib_success(tmp_path: Path) -> None:
+@pytest.mark.parametrize("native", [False, True])
+def test_build_zerotts_ggml_lib_success(tmp_path: Path, native: bool) -> None:
     """Test _build_zerotts_ggml_lib executes build commands and locates output."""
     target_dir = tmp_path / "lib"
     executed_commands: list[list[str]] = []
@@ -44,11 +45,22 @@ def test_build_zerotts_ggml_lib_success(tmp_path: Path) -> None:
         patch("tools.build_zerotts.subprocess.run", side_effect=fake_subprocess_run),
         patch("tools.build_zerotts.ctypes.CDLL") as mock_cdll,
     ):
-        result = _build_zerotts_ggml_lib(target_dir)
+        result = _build_zerotts_ggml_lib(target_dir, native=native)
         assert result.is_file()
         assert result.name == ZeroTtsFile.LIBZEROTTS_SO
         assert result.parent == target_dir
         assert any("checkout" in cmd and ZEROTTS_SOURCE_COMMIT in cmd for cmd in executed_commands)
+        cmake_configure_cmd = next(
+            cmd for cmd in executed_commands if "cmake" in cmd[0] and "-B" in cmd
+        )
+        if native:
+            assert "-DGGML_NATIVE=ON" in cmake_configure_cmd
+            assert "-DGGML_NATIVE=OFF" not in cmake_configure_cmd
+        else:
+            assert "-DGGML_NATIVE=OFF" in cmake_configure_cmd
+            assert "-DGGML_AVX512=OFF" in cmake_configure_cmd
+        assert "-DCMAKE_BUILD_RPATH=$ORIGIN" in cmake_configure_cmd
+        assert "-DCMAKE_INSTALL_RPATH=$ORIGIN" in cmake_configure_cmd
         mock_cdll.assert_called_once()
         verified_path = Path(mock_cdll.call_args[0][0])
         assert verified_path.name == ZeroTtsFile.LIBZEROTTS_SO
@@ -332,19 +344,29 @@ def test_build_zerotts_ggml_lib_missing_output(tmp_path: Path) -> None:
         _build_zerotts_ggml_lib(target_dir)
 
 
-def test_build_zerotts_cli_main_success(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("extra_args", "expected_native"),
+    [([], False), (["--native"], True)],
+)
+def test_build_zerotts_cli_main_success(
+    tmp_path: Path,
+    extra_args: list[str],
+    expected_native: bool,
+) -> None:
     """Test tools.build_zerotts.main parses arguments and returns 0 on success."""
     from tools.build_zerotts import main as build_zerotts_main
 
     target_dir = tmp_path / "lib"
     fake_lib = target_dir / ZeroTtsFile.LIBZEROTTS_SO
     with (
-        patch("sys.argv", ["build_zerotts.py", str(target_dir)]),
+        patch("sys.argv", ["build_zerotts.py", str(target_dir), *extra_args]),
         patch("tools.build_zerotts.build_zerotts_ggml_lib", return_value=fake_lib) as mock_build,
     ):
         exit_code = build_zerotts_main()
         assert exit_code == 0
         mock_build.assert_called_once()
+        _, kwargs = mock_build.call_args
+        assert kwargs.get("native") is expected_native
 
 
 def test_build_zerotts_cli_main_failure(tmp_path: Path) -> None:

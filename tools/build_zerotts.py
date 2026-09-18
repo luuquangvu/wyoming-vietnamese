@@ -98,22 +98,43 @@ def _checkout_repo(clone_dest: Path, repo_url: str, commit: str) -> None:
     )
 
 
-def _compile_libraries(clone_dest: Path, staging_dir: Path) -> None:
+def _compile_libraries(clone_dest: Path, staging_dir: Path, *, native: bool = False) -> None:
     """Build GGML vendor dependencies and compile libzerotts.so into staging directory.
 
     Args:
         clone_dest: Directory containing checked-out ZeroTTS sources.
         staging_dir: Destination directory where output libraries will be placed.
+        native: Whether to optimize for host processor architecture (native=True)
+            or target a portable instruction set baseline (native=False).
     """
     cmake_build_dir = clone_dest / "cpp" / "build"
-    subprocess.run(
+    cmake_cmd = [
+        "cmake",
+        "-B",
+        str(cmake_build_dir),
+        "-DCMAKE_BUILD_TYPE=Release",
+    ]
+    if native:
+        cmake_cmd.append("-DGGML_NATIVE=ON")
+    else:
+        cmake_cmd.extend(
+            [
+                "-DGGML_NATIVE=OFF",
+                "-DGGML_AVX512=OFF",
+                "-DGGML_AVX512_VBMI=OFF",
+                "-DGGML_AVX512_VNNI=OFF",
+                "-DGGML_AVX512_BF16=OFF",
+            ]
+        )
+    cmake_cmd.extend(
         [
-            "cmake",
-            "-B",
-            str(cmake_build_dir),
-            "-DCMAKE_BUILD_TYPE=Release",
+            "-DCMAKE_BUILD_RPATH=$ORIGIN",
+            "-DCMAKE_INSTALL_RPATH=$ORIGIN",
             str(clone_dest / "cpp"),
-        ],
+        ]
+    )
+    subprocess.run(
+        cmake_cmd,
         check=True,
         capture_output=True,
     )
@@ -367,6 +388,7 @@ def build_zerotts_ggml_lib(
     *,
     repo_url: str = ZEROTTS_REPO_URL,
     commit: str = ZEROTTS_SOURCE_COMMIT,
+    native: bool = False,
 ) -> Path:
     """Build the ZeroTTS GGML shared library from upstream source pinned to a commit.
 
@@ -374,6 +396,7 @@ def build_zerotts_ggml_lib(
         target_dir: Destination directory where the built shared library should be placed.
         repo_url: Git clone URL for the ZeroTTS repository.
         commit: Pinned Git commit SHA to checkout.
+        native: Whether to optimize for host processor architecture instead of portable baseline.
 
     Returns:
         Path to the compiled libzerotts.so file.
@@ -397,7 +420,7 @@ def build_zerotts_ggml_lib(
         )
         print(f"--> Building ZeroTTS GGML shared library into {target_dir} (commit {commit})...")
         _checkout_repo(clone_dest, repo_url, commit)
-        _compile_libraries(clone_dest, staging_dir)
+        _compile_libraries(clone_dest, staging_dir, native=native)
 
         staged_candidate = staging_dir / ZeroTtsFile.LIBZEROTTS_SO
         if not staged_candidate.is_file():
@@ -446,6 +469,12 @@ def main() -> int:
         default=ZEROTTS_REPO_URL,
         help=f"Git repository URL (default: {ZEROTTS_REPO_URL})",
     )
+    parser.add_argument(
+        "--native",
+        action="store_true",
+        default=False,
+        help="Optimize binary for host processor architecture instead of portable baseline",
+    )
     args = parser.parse_args()
 
     target_path = Path(args.target_dir).resolve()
@@ -454,6 +483,7 @@ def main() -> int:
             target_path,
             repo_url=args.repo_url,
             commit=args.commit,
+            native=args.native,
         )
         print(f"Successfully built ZeroTTS GGML library at: {output_so}")
         return 0
