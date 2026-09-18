@@ -59,11 +59,12 @@ class _ZeroTtsHParams(ctypes.Structure):
     ]
 
 
-def _build_zerotts_ggml_lib(target_dir: Path) -> Path:
+def _build_zerotts_ggml_lib(target_dir: Path, *, native: bool = False) -> Path:
     """Build the ZeroTTS GGML shared library from upstream source.
 
     Args:
         target_dir: Destination directory where the built shared library should be placed.
+        native: Whether to optimize for host processor architecture instead of portable baseline.
 
     Returns:
         Path to the compiled libzerotts.so file.
@@ -79,21 +80,25 @@ def _build_zerotts_ggml_lib(target_dir: Path) -> Path:
             target_dir,
             repo_url=ZEROTTS_REPO_URL,
             commit=ZEROTTS_SOURCE_COMMIT,
+            native=native,
         )
     except ImportError as import_err:
         repo_root = Path(__file__).resolve().parent.parent
         build_script = repo_root / "tools" / "build_zerotts.py"
         if build_script.is_file():
+            cmd = [
+                sys.executable,
+                str(build_script),
+                str(target_dir),
+                "--commit",
+                ZEROTTS_SOURCE_COMMIT,
+                "--repo-url",
+                ZEROTTS_REPO_URL,
+            ]
+            if native:
+                cmd.append("--native")
             res = subprocess.run(
-                [
-                    sys.executable,
-                    str(build_script),
-                    str(target_dir),
-                    "--commit",
-                    ZEROTTS_SOURCE_COMMIT,
-                    "--repo-url",
-                    ZEROTTS_REPO_URL,
-                ],
+                cmd,
                 capture_output=True,
                 text=True,
             )
