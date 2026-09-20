@@ -59,6 +59,15 @@ class ZeroTtsDirectory(StrEnum):
     GGUF = "gguf"
 
 
+class ZeroTtsVariant(StrEnum):
+    """Supported CPU architecture optimization variants for ZeroTTS GGML runtime."""
+
+    COMPAT = "compat"
+    AVX2 = "avx2"
+    AVX512 = "avx512"
+    NATIVE = "native"
+
+
 ZEROTTS_REPO_ID = "zeroweight-ai/ZeroTTS-GGUF"
 
 
