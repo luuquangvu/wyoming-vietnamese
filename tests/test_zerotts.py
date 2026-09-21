@@ -21,6 +21,8 @@ from wyoming_vietnamese.const import (
 from wyoming_vietnamese.cpu import (
     _AVX2_CPU_FLAGS,
     _AVX512_CPU_FLAGS,
+    _AVX_CPU_FLAGS,
+    _SSE4_CPU_FLAGS,
     can_host_execute_variant,
     detect_cpu_variant,
     get_host_cpu_flags,
@@ -1068,47 +1070,27 @@ def test_copy_single_library_skips_invalid_candidates(tmp_path: Path) -> None:
         ("x86_64", _AVX512_CPU_FLAGS | {"sse4_2"}, ZeroTtsVariant.AVX512),
         ("x86_64", _AVX2_CPU_FLAGS | {"avx512f", "sse4_2"}, ZeroTtsVariant.AVX2),
         ("x86_64", _AVX2_CPU_FLAGS | {"sse4_2"}, ZeroTtsVariant.AVX2),
+        ("x86_64", _AVX_CPU_FLAGS | {"sse4_2"}, ZeroTtsVariant.AVX),
+        ("x86_64", _SSE4_CPU_FLAGS, ZeroTtsVariant.SSE4),
+        ("x86_64", {"sse4_1", "sse4_2", "popcnt", "ssse3"}, ZeroTtsVariant.SSE4),
         ("x86_64", {"sse4_2", "ssse3"}, ZeroTtsVariant.COMPAT),
+        ("aarch64", {"asimd", "asimddp"}, ZeroTtsVariant.ARM_DOTPROD),
+        ("aarch64", {"asimd", "dotprod"}, ZeroTtsVariant.ARM_DOTPROD),
+        ("aarch64", {"asimd"}, ZeroTtsVariant.COMPAT),
         ("aarch64", set(), ZeroTtsVariant.COMPAT),
     ],
 )
 def test_detect_cpu_variant_host_architecture(
-    monkeypatch: pytest.MonkeyPatch,
     machine: str,
     cpu_flags: set[str],
     expected_variant: str,
 ) -> None:
     """Test detect_cpu_variant evaluates machine architecture and host CPU flags."""
-    monkeypatch.delenv("ZEROTTS_CPU_VARIANT", raising=False)
     with (
         patch("wyoming_vietnamese.cpu.platform.machine", return_value=machine),
         patch("wyoming_vietnamese.cpu.get_host_cpu_flags", return_value=cpu_flags),
     ):
         assert detect_cpu_variant() == expected_variant
-
-
-@pytest.mark.parametrize(
-    ("env_val", "expected"),
-    [
-        ("avx512", ZeroTtsVariant.AVX512),
-        ("AVX2", ZeroTtsVariant.AVX2),
-        ("compat", ZeroTtsVariant.COMPAT),
-        ("native", ZeroTtsVariant.NATIVE),
-        ("invalid_var", ZeroTtsVariant.COMPAT),
-    ],
-)
-def test_detect_cpu_variant_env_override(
-    monkeypatch: pytest.MonkeyPatch,
-    env_val: str,
-    expected: str,
-) -> None:
-    """Test detect_cpu_variant respects ZEROTTS_CPU_VARIANT override."""
-    monkeypatch.setenv("ZEROTTS_CPU_VARIANT", env_val)
-    with (
-        patch("wyoming_vietnamese.cpu.platform.machine", return_value="x86_64"),
-        patch("wyoming_vietnamese.cpu.get_host_cpu_flags", return_value=set()),
-    ):
-        assert detect_cpu_variant() == expected
 
 
 def test_get_proc_cpu_flags_reads_proc(tmp_path: Path) -> None:
@@ -1144,17 +1126,64 @@ def test_get_proc_cpu_flags_darwin_sysctl() -> None:
     with (
         patch("wyoming_vietnamese.cpu.Path.is_file", return_value=False),
         patch("wyoming_vietnamese.cpu.platform.system", return_value="Darwin"),
+        patch("wyoming_vietnamese.cpu.platform.machine", return_value="x86_64"),
         patch(
             "wyoming_vietnamese.cpu.subprocess.run",
             return_value=Mock(
                 returncode=0,
-                stdout="AVX2 FMA F16C BMI2\n",
+                stdout="AVX1.0 AVX2 FMA F16C BMI2 SSE4.1 SSE4.2\n",
             ),
         ),
     ):
         flags = get_host_cpu_flags()
+        assert "avx" in flags
         assert "avx2" in flags
         assert "fma" in flags
+        assert "sse4_1" in flags
+        assert "sse4_2" in flags
+
+
+def test_get_proc_cpu_flags_darwin_arm64_sysctl() -> None:
+    """Test get_host_cpu_flags queries ARM sysctl on macOS Apple Silicon."""
+    with (
+        patch("wyoming_vietnamese.cpu.Path.is_file", return_value=False),
+        patch("wyoming_vietnamese.cpu.platform.system", return_value="Darwin"),
+        patch("wyoming_vietnamese.cpu.platform.machine", return_value="arm64"),
+        patch(
+            "wyoming_vietnamese.cpu.subprocess.run",
+            return_value=Mock(
+                returncode=0,
+                stdout="1\n",
+            ),
+        ),
+    ):
+        flags = get_host_cpu_flags()
+        assert "asimd" in flags
+        assert "asimddp" in flags
+        assert "dotprod" in flags
+        assert can_host_execute_variant(ZeroTtsVariant.ARM_DOTPROD, flags=flags)
+        assert detect_cpu_variant() == ZeroTtsVariant.ARM_DOTPROD
+
+
+def test_get_proc_cpu_flags_darwin_arm64_sysctl_no_dotprod() -> None:
+    """Test get_host_cpu_flags on macOS ARM when FEAT_DotProd is not supported."""
+    with (
+        patch("wyoming_vietnamese.cpu.Path.is_file", return_value=False),
+        patch("wyoming_vietnamese.cpu.platform.system", return_value="Darwin"),
+        patch("wyoming_vietnamese.cpu.platform.machine", return_value="arm64"),
+        patch(
+            "wyoming_vietnamese.cpu.subprocess.run",
+            return_value=Mock(
+                returncode=0,
+                stdout="0\n",
+            ),
+        ),
+    ):
+        flags = get_host_cpu_flags()
+        assert "asimd" in flags
+        assert "asimddp" not in flags
+        assert not can_host_execute_variant(ZeroTtsVariant.ARM_DOTPROD, flags=flags)
+        assert detect_cpu_variant() == ZeroTtsVariant.COMPAT
 
 
 @pytest.mark.parametrize("with_env", [False, True])
@@ -1180,12 +1209,19 @@ def test_get_zerotts_candidate_lib_paths_priority_and_precedence(
         labels = [var for var, _ in candidates]
         assert "default" not in labels
         assert "avx2" in labels
+        assert "avx" in labels
+        assert "sse4" in labels
         assert "compat" in labels
-        assert labels.index("avx2") < labels.index("compat")
+        assert (
+            labels.index("avx2")
+            < labels.index("avx")
+            < labels.index("sse4")
+            < labels.index("compat")
+        )
 
 
 def test_get_zerotts_candidate_lib_paths_avx512() -> None:
-    """Test get_zerotts_candidate_lib_paths includes avx2 and compat when avx512 is optimal."""
+    """Test get_zerotts_candidate_lib_paths includes lower variants when avx512 is optimal."""
     with patch(
         "wyoming_vietnamese.zerotts_engine.detect_cpu_variant",
         return_value=ZeroTtsVariant.AVX512,
@@ -1194,8 +1230,47 @@ def test_get_zerotts_candidate_lib_paths_avx512() -> None:
         var_labels = [var for var, _ in candidates]
         assert "avx512" in var_labels
         assert "avx2" in var_labels
+        assert "avx" in var_labels
+        assert "sse4" in var_labels
         assert "compat" in var_labels
-        assert var_labels.index("avx512") < var_labels.index("avx2") < var_labels.index("compat")
+        assert (
+            var_labels.index("avx512")
+            < var_labels.index("avx2")
+            < var_labels.index("avx")
+            < var_labels.index("sse4")
+            < var_labels.index("compat")
+        )
+
+
+def test_get_zerotts_candidate_lib_paths_sse4() -> None:
+    """Test get_zerotts_candidate_lib_paths includes sse4 and compat when sse4 is optimal."""
+    with patch(
+        "wyoming_vietnamese.zerotts_engine.detect_cpu_variant",
+        return_value=ZeroTtsVariant.SSE4,
+    ):
+        candidates = get_zerotts_candidate_lib_paths()
+        var_labels = [var for var, _ in candidates]
+        assert "sse4" in var_labels
+        assert "compat" in var_labels
+        assert var_labels.index("sse4") < var_labels.index("compat")
+        assert "avx" not in var_labels
+        assert "avx2" not in var_labels
+        assert "avx512" not in var_labels
+
+
+def test_get_zerotts_candidate_lib_paths_arm_dotprod() -> None:
+    """Test get_zerotts_candidate_lib_paths includes arm_dotprod and compat on ARM."""
+    with patch(
+        "wyoming_vietnamese.zerotts_engine.detect_cpu_variant",
+        return_value=ZeroTtsVariant.ARM_DOTPROD,
+    ):
+        candidates = get_zerotts_candidate_lib_paths()
+        var_labels = [var for var, _ in candidates]
+        assert "arm_dotprod" in var_labels
+        assert "compat" in var_labels
+        assert var_labels.index("arm_dotprod") < var_labels.index("compat")
+        assert "avx" not in var_labels
+        assert "sse4" not in var_labels
 
 
 @pytest.mark.parametrize("is_symlink", [True, False])
@@ -1244,6 +1319,8 @@ def test_get_zerotts_candidate_lib_paths_native() -> None:
         assert labels.index("native") < labels.index("compat")
         assert "avx512" not in labels
         assert "avx2" not in labels
+        assert "avx" not in labels
+        assert "sse4" not in labels
 
 
 def test_resolve_zerotts_ggml_lib_selects_optimal_variant(
@@ -1375,11 +1452,51 @@ def test_can_host_execute_variant() -> None:
             return_value=set(_AVX2_CPU_FLAGS),
         ),
     ):
+        assert can_host_execute_variant(ZeroTtsVariant.SSE4) is True
+        assert can_host_execute_variant(ZeroTtsVariant.AVX) is True
         assert can_host_execute_variant(ZeroTtsVariant.AVX2) is True
         assert can_host_execute_variant(ZeroTtsVariant.AVX512) is False
 
-    with patch("wyoming_vietnamese.cpu.platform.machine", return_value="aarch64"):
+    with (
+        patch("wyoming_vietnamese.cpu.platform.machine", return_value="x86_64"),
+        patch(
+            "wyoming_vietnamese.cpu.get_host_cpu_flags",
+            return_value=set(_SSE4_CPU_FLAGS),
+        ),
+    ):
+        assert can_host_execute_variant(ZeroTtsVariant.SSE4) is True
+        assert can_host_execute_variant(ZeroTtsVariant.AVX) is False
         assert can_host_execute_variant(ZeroTtsVariant.AVX2) is False
+
+    with (
+        patch("wyoming_vietnamese.cpu.platform.machine", return_value="aarch64"),
+        patch(
+            "wyoming_vietnamese.cpu.get_host_cpu_flags",
+            return_value={"asimd", "asimddp"},
+        ),
+    ):
+        assert can_host_execute_variant(ZeroTtsVariant.ARM_DOTPROD) is True
+        assert can_host_execute_variant(ZeroTtsVariant.SSE4) is False
+        assert can_host_execute_variant(ZeroTtsVariant.AVX) is False
+        assert can_host_execute_variant(ZeroTtsVariant.AVX2) is False
+
+    with (
+        patch("wyoming_vietnamese.cpu.platform.machine", return_value="aarch64"),
+        patch(
+            "wyoming_vietnamese.cpu.get_host_cpu_flags",
+            return_value={"asimd"},
+        ),
+    ):
+        assert can_host_execute_variant(ZeroTtsVariant.ARM_DOTPROD) is False
+
+    with (
+        patch("wyoming_vietnamese.cpu.platform.machine", return_value="x86_64"),
+        patch(
+            "wyoming_vietnamese.cpu.get_host_cpu_flags",
+            return_value={"asimddp"},
+        ),
+    ):
+        assert can_host_execute_variant(ZeroTtsVariant.ARM_DOTPROD) is False
 
 
 def test_can_host_execute_variant_avx512_positive_and_flags_cache() -> None:
@@ -1403,6 +1520,8 @@ def test_can_host_execute_variant_avx512_positive_and_flags_cache() -> None:
 @pytest.mark.parametrize(
     ("variant", "flag_set"),
     [
+        (ZeroTtsVariant.SSE4, _SSE4_CPU_FLAGS),
+        (ZeroTtsVariant.AVX, _AVX_CPU_FLAGS),
         (ZeroTtsVariant.AVX2, _AVX2_CPU_FLAGS),
         (ZeroTtsVariant.AVX512, _AVX512_CPU_FLAGS),
     ],
@@ -1421,8 +1540,19 @@ def test_can_host_execute_variant_missing_flag(variant: str, flag_set: frozenset
 @pytest.mark.parametrize(
     ("machine", "expected_variants"),
     [
-        ("x86_64", [ZeroTtsVariant.COMPAT, ZeroTtsVariant.AVX2, ZeroTtsVariant.AVX512]),
-        ("aarch64", [ZeroTtsVariant.COMPAT]),
+        (
+            "x86_64",
+            [
+                ZeroTtsVariant.COMPAT,
+                ZeroTtsVariant.SSE4,
+                ZeroTtsVariant.AVX,
+                ZeroTtsVariant.AVX2,
+                ZeroTtsVariant.AVX512,
+            ],
+        ),
+        ("aarch64", [ZeroTtsVariant.COMPAT, ZeroTtsVariant.ARM_DOTPROD]),
+        ("arm64", [ZeroTtsVariant.COMPAT, ZeroTtsVariant.ARM_DOTPROD]),
+        ("riscv64", [ZeroTtsVariant.COMPAT]),
     ],
 )
 def test_get_supported_variants_for_host(machine: str, expected_variants: list[str]) -> None:
@@ -1431,7 +1561,16 @@ def test_get_supported_variants_for_host(machine: str, expected_variants: list[s
         assert get_supported_variants_for_host() == expected_variants
 
 
-def test_build_all_zerotts_variants_success(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("machine", "expected_variants"),
+    [
+        ("x86_64", ["compat", "sse4", "avx", "avx2", "avx512"]),
+        ("aarch64", ["compat", "arm_dotprod"]),
+    ],
+)
+def test_build_all_zerotts_variants_success(
+    tmp_path: Path, machine: str, expected_variants: list[str]
+) -> None:
     """Test build_all_zerotts_variants compiles each supported variant cleanly."""
     from tools.build_zerotts import build_all_zerotts_variants
 
@@ -1454,11 +1593,11 @@ def test_build_all_zerotts_variants_success(tmp_path: Path) -> None:
         patch("tools.build_zerotts._compile_libraries", side_effect=fake_compile),
         patch("tools.build_zerotts._verify_library_loadable"),
         patch("tools.build_zerotts._is_toolchain_variant_supported", return_value=True),
-        patch("platform.machine", return_value="x86_64"),
+        patch("platform.machine", return_value=machine),
     ):
         results = build_all_zerotts_variants(target_dir)
-        assert set(results.keys()) == {"compat", "avx2", "avx512"}
-        assert compiled_variants == ["compat", "avx2", "avx512"]
+        assert set(results.keys()) == set(expected_variants)
+        assert compiled_variants == expected_variants
         default_link = target_dir / ZeroTtsFile.LIBZEROTTS_SO
         assert default_link.is_symlink()
         assert default_link.readlink() == Path(ZeroTtsVariant.COMPAT) / ZeroTtsFile.LIBZEROTTS_SO
@@ -1553,14 +1692,20 @@ def test_build_zerotts_cli_main_all_variants(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("cli_flag", "expected_kwarg"),
+    ("cli_flag", "expected_kwarg", "mock_machine"),
     [
-        (["--variant", "avx2"], {"variant": "avx2"}),
-        (["--native"], {"native": True}),
+        (["--variant", "sse4"], {"variant": "sse4"}, "x86_64"),
+        (["--variant", "avx"], {"variant": "avx"}, "x86_64"),
+        (["--variant", "avx2"], {"variant": "avx2"}, "x86_64"),
+        (["--variant", "arm_dotprod"], {"variant": "arm_dotprod"}, "aarch64"),
+        (["--native"], {"native": True}, "x86_64"),
     ],
 )
 def test_build_zerotts_cli_main_single_variant_options(
-    tmp_path: Path, cli_flag: list[str], expected_kwarg: dict[str, object]
+    tmp_path: Path,
+    cli_flag: list[str],
+    expected_kwarg: dict[str, object],
+    mock_machine: str,
 ) -> None:
     """Test tools.build_zerotts.main handles variant selection CLI options."""
     from tools.build_zerotts import main as build_zerotts_main
@@ -1569,6 +1714,7 @@ def test_build_zerotts_cli_main_single_variant_options(
     fake_so = target_dir / ZeroTtsFile.LIBZEROTTS_SO
     with (
         patch("sys.argv", ["build_zerotts.py", str(target_dir), *cli_flag]),
+        patch("platform.machine", return_value=mock_machine),
         patch(
             "tools.build_zerotts.build_zerotts_ggml_lib",
             return_value=fake_so,
@@ -1615,17 +1761,61 @@ def test_build_zerotts_cli_main_conflicting_options(
     assert expected_err in captured.err
 
 
+@pytest.mark.parametrize(
+    ("flags", "machine", "expected_err"),
+    [
+        (
+            ["--variant", "arm_dotprod"],
+            "x86_64",
+            "Variant 'arm_dotprod' is not supported on host architecture 'x86_64'",
+        ),
+        (
+            ["--variant", "avx2"],
+            "aarch64",
+            "Variant 'avx2' is not supported on host architecture 'aarch64'",
+        ),
+    ],
+)
+def test_build_zerotts_cli_main_unsupported_host_variant(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    flags: list[str],
+    machine: str,
+    expected_err: str,
+) -> None:
+    """Test tools.build_zerotts.main rejects variants unsupported on host architecture."""
+    from tools.build_zerotts import main as build_zerotts_main
+
+    target_dir = tmp_path / "lib"
+    with (
+        patch("sys.argv", ["build_zerotts.py", str(target_dir), *flags]),
+        patch("platform.machine", return_value=machine),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        build_zerotts_main()
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert expected_err in captured.err
+
+
 def test_is_toolchain_variant_supported() -> None:
     """Test _is_toolchain_variant_supported validates compiler flag support."""
     from tools.build_zerotts import _is_toolchain_variant_supported
 
     assert _is_toolchain_variant_supported(ZeroTtsVariant.COMPAT) is True
+    assert _is_toolchain_variant_supported(ZeroTtsVariant.NATIVE) is True
 
     with patch("tools.build_zerotts.subprocess.run", return_value=Mock(returncode=0)):
+        assert _is_toolchain_variant_supported(ZeroTtsVariant.SSE4) is True
+        assert _is_toolchain_variant_supported(ZeroTtsVariant.AVX) is True
         assert _is_toolchain_variant_supported(ZeroTtsVariant.AVX512) is True
+        assert _is_toolchain_variant_supported(ZeroTtsVariant.ARM_DOTPROD) is True
 
     with patch("tools.build_zerotts.subprocess.run", return_value=Mock(returncode=1)):
+        assert _is_toolchain_variant_supported(ZeroTtsVariant.SSE4) is False
+        assert _is_toolchain_variant_supported(ZeroTtsVariant.AVX) is False
         assert _is_toolchain_variant_supported(ZeroTtsVariant.AVX512) is False
+        assert _is_toolchain_variant_supported(ZeroTtsVariant.ARM_DOTPROD) is False
 
     with patch("tools.build_zerotts.subprocess.run", side_effect=OSError("g++ not found")):
         assert _is_toolchain_variant_supported(ZeroTtsVariant.AVX512) is False
@@ -1666,6 +1856,8 @@ def test_build_all_zerotts_variants_skips_unsupported_toolchain_variant(tmp_path
     ):
         results = build_all_zerotts_variants(target_dir)
         assert ZeroTtsVariant.COMPAT in results
+        assert ZeroTtsVariant.SSE4 in results
+        assert ZeroTtsVariant.AVX in results
         assert ZeroTtsVariant.AVX2 in results
         assert ZeroTtsVariant.AVX512 not in results
 
@@ -1780,3 +1972,67 @@ def test_build_all_zerotts_variants_stale_variant_handling(
             assert ZeroTtsVariant.AVX512 not in results
             assert not stale_variant_dir.exists()
             assert not stale_lib.exists()
+
+
+def test_get_variant_build_flags_definitions_and_compiler_options() -> None:
+    """Test _get_variant_build_flags emits expected CMake definitions and g++ flags per variant."""
+    from tools.build_zerotts import _get_variant_build_flags
+
+    # COMPAT
+    compat_cmake, compat_gxx = _get_variant_build_flags(ZeroTtsVariant.COMPAT)
+    assert "-DGGML_SSE42=OFF" in compat_cmake
+    assert "-DGGML_AVX=OFF" in compat_cmake
+    assert "-DGGML_AVX2=OFF" in compat_cmake
+    assert "-DGGML_AVX512=OFF" in compat_cmake
+    assert not compat_gxx
+
+    # SSE4
+    sse4_cmake, sse4_gxx = _get_variant_build_flags(ZeroTtsVariant.SSE4)
+    assert "-DGGML_SSE42=ON" in sse4_cmake
+    assert "-DGGML_AVX=OFF" in sse4_cmake
+    assert "-DGGML_AVX2=OFF" in sse4_cmake
+    assert "-DGGML_AVX512=OFF" in sse4_cmake
+    assert "-msse4.2" in sse4_gxx
+    assert "-mpopcnt" in sse4_gxx
+
+    # AVX
+    avx_cmake, avx_gxx = _get_variant_build_flags(ZeroTtsVariant.AVX)
+    assert "-DGGML_SSE42=ON" in avx_cmake
+    assert "-DGGML_AVX=ON" in avx_cmake
+    assert "-DGGML_AVX2=OFF" in avx_cmake
+    assert "-DGGML_AVX512=OFF" in avx_cmake
+    assert "-mavx" in avx_gxx
+
+    # AVX2
+    avx2_cmake, avx2_gxx = _get_variant_build_flags(ZeroTtsVariant.AVX2)
+    assert "-DGGML_SSE42=ON" in avx2_cmake
+    assert "-DGGML_AVX=ON" in avx2_cmake
+    assert "-DGGML_AVX2=ON" in avx2_cmake
+    assert "-DGGML_AVX512=OFF" in avx2_cmake
+    assert "-mavx2" in avx2_gxx
+    assert "-mfma" in avx2_gxx
+
+    # AVX512
+    avx512_cmake, avx512_gxx = _get_variant_build_flags(ZeroTtsVariant.AVX512)
+    assert "-DGGML_SSE42=ON" in avx512_cmake
+    assert "-DGGML_AVX=ON" in avx512_cmake
+    assert "-DGGML_AVX2=ON" in avx512_cmake
+    assert "-DGGML_AVX512=ON" in avx512_cmake
+    assert "-mavx512f" in avx512_gxx
+    assert "-mavx2" in avx512_gxx
+
+    # ARM_DOTPROD
+    arm_cmake, arm_gxx = _get_variant_build_flags(ZeroTtsVariant.ARM_DOTPROD)
+    assert "-DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod" in arm_cmake
+    assert "-march=armv8.2-a+dotprod" in arm_gxx
+
+    # NATIVE on x86 vs ARM
+    with patch("platform.machine", return_value="x86_64"):
+        native_cmake, native_gxx = _get_variant_build_flags(ZeroTtsVariant.NATIVE)
+        assert "-DGGML_NATIVE=ON" in native_cmake
+        assert "-march=native" in native_gxx
+
+    with patch("platform.machine", return_value="aarch64"):
+        native_arm_cmake, native_arm_gxx = _get_variant_build_flags(ZeroTtsVariant.NATIVE)
+        assert "-DGGML_NATIVE=ON" in native_arm_cmake
+        assert "-mcpu=native" in native_arm_gxx

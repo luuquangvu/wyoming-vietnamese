@@ -12,7 +12,7 @@ import subprocess
 import sys
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 import numpy as np
 
@@ -30,6 +30,18 @@ from .cpu import detect_cpu_variant
 from .tts_model import ZEROTTS_VOICES_BY_ID, ZeroTtsVoiceSpec
 
 _LOGGER = logging.getLogger(__name__)
+
+_X86_VARIANT_FALLBACK_HIERARCHY: Final[tuple[str, ...]] = (
+    ZeroTtsVariant.AVX512,
+    ZeroTtsVariant.AVX2,
+    ZeroTtsVariant.AVX,
+    ZeroTtsVariant.SSE4,
+    ZeroTtsVariant.COMPAT,
+)
+_ARM_VARIANT_FALLBACK_HIERARCHY: Final[tuple[str, ...]] = (
+    ZeroTtsVariant.ARM_DOTPROD,
+    ZeroTtsVariant.COMPAT,
+)
 
 
 class _ZeroTtsSampling(ctypes.Structure):
@@ -68,6 +80,19 @@ class _ZeroTtsHParams(ctypes.Structure):
     ]
 
 
+def _get_variant_fallback_order(optimal_variant: str) -> list[str]:
+    """Return ordered list of fallback variants starting from the detected optimal variant."""
+    if optimal_variant == ZeroTtsVariant.NATIVE:
+        return [ZeroTtsVariant.NATIVE, ZeroTtsVariant.COMPAT]
+    if optimal_variant in _ARM_VARIANT_FALLBACK_HIERARCHY:
+        idx = _ARM_VARIANT_FALLBACK_HIERARCHY.index(optimal_variant)
+        return list(_ARM_VARIANT_FALLBACK_HIERARCHY[idx:])
+    if optimal_variant in _X86_VARIANT_FALLBACK_HIERARCHY:
+        idx = _X86_VARIANT_FALLBACK_HIERARCHY.index(optimal_variant)
+        return list(_X86_VARIANT_FALLBACK_HIERARCHY[idx:])
+    return [optimal_variant, ZeroTtsVariant.COMPAT]
+
+
 def get_zerotts_candidate_lib_paths(
     custom_lib_path: Path | None = None,
 ) -> list[tuple[str, Path]]:
@@ -88,11 +113,7 @@ def get_zerotts_candidate_lib_paths(
         candidates.append(("env", Path(env_path).expanduser()))
 
     optimal_variant = detect_cpu_variant()
-    variant_order: list[str] = [optimal_variant]
-    if optimal_variant == ZeroTtsVariant.AVX512:
-        variant_order.extend([ZeroTtsVariant.AVX2, ZeroTtsVariant.COMPAT])
-    elif optimal_variant in [ZeroTtsVariant.AVX2, ZeroTtsVariant.NATIVE]:
-        variant_order.append(ZeroTtsVariant.COMPAT)
+    variant_order = _get_variant_fallback_order(optimal_variant)
 
     repo_root = Path(__file__).resolve().parent.parent
     base_dirs = [

@@ -7,6 +7,7 @@ import contextlib
 import ctypes
 import logging
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -121,28 +122,55 @@ _COMMON_DISABLED_CMAKE_FLAGS: Final = [
     "-DGGML_AMX_INT8=OFF",
     "-DGGML_AMX_BF16=OFF",
 ]
+_ENABLE_SSE42: Final = "-DGGML_SSE42=ON"
+_DISABLE_AVX2_FAMILY: Final = [
+    "-DGGML_AVX2=OFF",
+    "-DGGML_FMA=OFF",
+    "-DGGML_F16C=OFF",
+    "-DGGML_BMI2=OFF",
+]
+_DISABLE_AVX512_FAMILY: Final = [
+    "-DGGML_AVX_VNNI=OFF",
+    "-DGGML_AVX512=OFF",
+]
+_ENABLE_AVX2_FAMILY: Final = [
+    "-DGGML_AVX=ON",
+    "-DGGML_AVX2=ON",
+    "-DGGML_FMA=ON",
+    "-DGGML_F16C=ON",
+    "-DGGML_BMI2=ON",
+]
 
 
 def _get_variant_build_flags(variant: str) -> tuple[list[str], list[str]]:
     """Return CMake definition flags and extra compiler flags for a build variant.
 
     Args:
-        variant: Variant identifier ('compat', 'avx2', 'avx512', or 'native').
+        variant: Variant identifier ('compat', 'sse4', 'avx', 'avx2', 'avx512',
+            'arm_dotprod', or 'native').
 
     Returns:
         Tuple containing (cmake_definitions, gxx_extra_flags).
     """
     if variant == ZeroTtsVariant.NATIVE:
+        machine = platform.machine().lower()
+        if machine in ("aarch64", "arm64"):
+            return (["-DGGML_NATIVE=ON"], ["-mcpu=native"])
         return (["-DGGML_NATIVE=ON"], ["-march=native"])
+
+    if variant == ZeroTtsVariant.ARM_DOTPROD:
+        cmake_flags = [
+            *_COMMON_DISABLED_CMAKE_FLAGS,
+            "-DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod",
+        ]
+        gxx_flags = ["-march=armv8.2-a+dotprod"]
+        return (cmake_flags, gxx_flags)
 
     if variant == ZeroTtsVariant.AVX512:
         cmake_flags = [
             *_COMMON_DISABLED_CMAKE_FLAGS,
-            "-DGGML_AVX=ON",
-            "-DGGML_AVX2=ON",
-            "-DGGML_FMA=ON",
-            "-DGGML_F16C=ON",
-            "-DGGML_BMI2=ON",
+            _ENABLE_SSE42,
+            *_ENABLE_AVX2_FAMILY,
             "-DGGML_AVX512=ON",
         ]
         gxx_flags = [
@@ -160,27 +188,42 @@ def _get_variant_build_flags(variant: str) -> tuple[list[str], list[str]]:
     if variant == ZeroTtsVariant.AVX2:
         cmake_flags = [
             *_COMMON_DISABLED_CMAKE_FLAGS,
-            "-DGGML_AVX=ON",
-            "-DGGML_AVX2=ON",
-            "-DGGML_FMA=ON",
-            "-DGGML_F16C=ON",
-            "-DGGML_BMI2=ON",
-            "-DGGML_AVX_VNNI=OFF",
-            "-DGGML_AVX512=OFF",
+            _ENABLE_SSE42,
+            *_ENABLE_AVX2_FAMILY,
+            *_DISABLE_AVX512_FAMILY,
         ]
         gxx_flags = ["-mavx2", "-mfma", "-mf16c", "-mbmi2"]
+        return (cmake_flags, gxx_flags)
+
+    if variant == ZeroTtsVariant.AVX:
+        cmake_flags = [
+            *_COMMON_DISABLED_CMAKE_FLAGS,
+            _ENABLE_SSE42,
+            "-DGGML_AVX=ON",
+            *_DISABLE_AVX2_FAMILY,
+            *_DISABLE_AVX512_FAMILY,
+        ]
+        gxx_flags = ["-mavx"]
+        return (cmake_flags, gxx_flags)
+
+    if variant == ZeroTtsVariant.SSE4:
+        cmake_flags = [
+            *_COMMON_DISABLED_CMAKE_FLAGS,
+            _ENABLE_SSE42,
+            "-DGGML_AVX=OFF",
+            *_DISABLE_AVX2_FAMILY,
+            *_DISABLE_AVX512_FAMILY,
+        ]
+        gxx_flags = ["-msse4.2", "-mpopcnt"]
         return (cmake_flags, gxx_flags)
 
     # COMPAT baseline
     cmake_flags = [
         *_COMMON_DISABLED_CMAKE_FLAGS,
+        "-DGGML_SSE42=OFF",
         "-DGGML_AVX=OFF",
-        "-DGGML_AVX2=OFF",
-        "-DGGML_FMA=OFF",
-        "-DGGML_F16C=OFF",
-        "-DGGML_BMI2=OFF",
-        "-DGGML_AVX_VNNI=OFF",
-        "-DGGML_AVX512=OFF",
+        *_DISABLE_AVX2_FAMILY,
+        *_DISABLE_AVX512_FAMILY,
     ]
     return (cmake_flags, [])
 
@@ -189,7 +232,8 @@ def _is_toolchain_variant_supported(variant: str) -> bool:
     """Check if the compiler toolchain supports the compiler flags for a variant.
 
     Args:
-        variant: Optimization variant identifier ('compat', 'avx2', 'avx512', or 'native').
+        variant: Optimization variant identifier ('compat', 'sse4', 'avx', 'avx2',
+            'avx512', 'arm_dotprod', or 'native').
 
     Returns:
         True if the host toolchain can compile with the variant flags, False otherwise.
@@ -519,7 +563,8 @@ def build_zerotts_ggml_lib(
         target_dir: Destination directory where the built shared library should be placed.
         repo_url: Git clone URL for the ZeroTTS repository.
         commit: Pinned Git commit SHA to checkout.
-        variant: CPU architecture optimization variant ('compat', 'avx2', 'avx512', 'native').
+        variant: CPU architecture optimization variant ('compat', 'sse4', 'avx',
+            'avx2', 'avx512', 'arm_dotprod', 'native').
         native: Whether to optimize for host processor architecture instead of portable baseline.
         publish_subdir: Whether to publish into a variant-named subdirectory under target_dir.
 
@@ -757,8 +802,11 @@ def main() -> int:
         "--variant",
         choices=[
             ZeroTtsVariant.COMPAT,
+            ZeroTtsVariant.SSE4,
+            ZeroTtsVariant.AVX,
             ZeroTtsVariant.AVX2,
             ZeroTtsVariant.AVX512,
+            ZeroTtsVariant.ARM_DOTPROD,
             ZeroTtsVariant.NATIVE,
         ],
         default=None,
@@ -782,6 +830,14 @@ def main() -> int:
         parser.error("Cannot combine --all-variants with --variant or --native")
     if args.native and args.variant is not None:
         parser.error("Cannot combine --native with --variant")
+    if args.variant is not None and args.variant != ZeroTtsVariant.NATIVE:
+        supported = get_supported_variants_for_host()
+        if args.variant not in supported:
+            machine = platform.machine().lower()
+            parser.error(
+                f"Variant '{args.variant}' is not supported on host architecture '{machine}' "
+                f"(supported: {', '.join(supported)})"
+            )
 
     target_path = Path(args.target_dir).resolve()
     try:
