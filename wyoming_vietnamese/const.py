@@ -63,8 +63,11 @@ class ZeroTtsVariant(StrEnum):
     """Supported CPU architecture optimization variants for ZeroTTS GGML runtime."""
 
     COMPAT = "compat"
+    SSE4 = "sse4"
+    AVX = "avx"
     AVX2 = "avx2"
     AVX512 = "avx512"
+    ARM_DOTPROD = "arm_dotprod"
     NATIVE = "native"
 
 
