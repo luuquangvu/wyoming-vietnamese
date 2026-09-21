@@ -8,7 +8,7 @@ ENV UV_COMPILE_BYTECODE=1 \
 WORKDIR /app
 
 COPY pyproject.toml uv.lock ./
-COPY wyoming_vietnamese/__init__.py wyoming_vietnamese/const.py ./wyoming_vietnamese/
+COPY wyoming_vietnamese/__init__.py wyoming_vietnamese/const.py wyoming_vietnamese/cpu.py ./wyoming_vietnamese/
 COPY tools/build_zerotts.py ./tools/build_zerotts.py
 
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -18,7 +18,7 @@ set -eux
 apt-get update && apt-get install --yes --no-install-recommends build-essential cmake git
 uv sync --locked --no-install-project --no-default-groups
 mkdir -p /app/lib
-python3 /app/tools/build_zerotts.py /app/lib
+python3 /app/tools/build_zerotts.py /app/lib --all-variants
 EOF
 
 COPY wyoming_vietnamese/ ./wyoming_vietnamese/

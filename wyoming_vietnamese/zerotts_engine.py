@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
+import itertools
 import json
 import logging
 import os
@@ -17,7 +19,14 @@ import numpy as np
 if TYPE_CHECKING:
     from zerotts.codec import MossStreamingDecoder
 
-from .const import ZEROTTS_REPO_URL, ZEROTTS_SOURCE_COMMIT, ZeroTtsAudio, ZeroTtsFile
+from .const import (
+    ZEROTTS_REPO_URL,
+    ZEROTTS_SOURCE_COMMIT,
+    ZeroTtsAudio,
+    ZeroTtsFile,
+    ZeroTtsVariant,
+)
+from .cpu import detect_cpu_variant
 from .tts_model import ZEROTTS_VOICES_BY_ID, ZeroTtsVoiceSpec
 
 _LOGGER = logging.getLogger(__name__)
@@ -59,12 +68,110 @@ class _ZeroTtsHParams(ctypes.Structure):
     ]
 
 
-def _build_zerotts_ggml_lib(target_dir: Path, *, native: bool = False) -> Path:
+def get_zerotts_candidate_lib_paths(
+    custom_lib_path: Path | None = None,
+) -> list[tuple[str, Path]]:
+    """Enumerate candidate ZeroTTS GGML library paths in preference order.
+
+    Args:
+        custom_lib_path: First candidate path; a missing file falls back to configured
+            and default locations.
+
+    Returns:
+        List of tuples containing (variant_description, path_candidate).
+    """
+    candidates: list[tuple[str, Path]] = []
+    if custom_lib_path is not None:
+        candidates.append(("custom", custom_lib_path))
+
+    if env_path := os.environ.get("ZEROTTS_LIB_PATH", "").strip():
+        candidates.append(("env", Path(env_path).expanduser()))
+
+    optimal_variant = detect_cpu_variant()
+    variant_order: list[str] = [optimal_variant]
+    if optimal_variant == ZeroTtsVariant.AVX512:
+        variant_order.extend([ZeroTtsVariant.AVX2, ZeroTtsVariant.COMPAT])
+    elif optimal_variant in [ZeroTtsVariant.AVX2, ZeroTtsVariant.NATIVE]:
+        variant_order.append(ZeroTtsVariant.COMPAT)
+
+    repo_root = Path(__file__).resolve().parent.parent
+    base_dirs = [
+        Path("/app/lib"),
+        repo_root / "lib",
+        Path(__file__).resolve().parent / "lib",
+    ]
+
+    candidates.extend(
+        (var, base_dir / var / ZeroTtsFile.LIBZEROTTS_SO)
+        for var, base_dir in itertools.product(variant_order, base_dirs)
+    )
+    for base_dir in base_dirs:
+        symlink_candidate = base_dir / ZeroTtsFile.LIBZEROTTS_SO
+        if symlink_candidate.is_symlink():
+            with contextlib.suppress(OSError):
+                target_str = os.readlink(symlink_candidate)
+                for var in variant_order:
+                    if var in Path(target_str).parts:
+                        candidates.append((f"symlink-{var}", symlink_candidate))
+                        break
+    return candidates
+
+
+def _run_zerotts_build_script(
+    build_script: Path,
+    target_dir: Path,
+    *,
+    variant: str,
+    native: bool,
+    publish_subdir: bool = False,
+) -> Path:
+    """Execute tools/build_zerotts.py via subprocess to compile libzerotts.so."""
+    actual_variant = ZeroTtsVariant.NATIVE if native else variant
+    dest_dir = target_dir / actual_variant if publish_subdir else target_dir
+    cmd = [
+        sys.executable,
+        str(build_script),
+        str(dest_dir),
+        "--commit",
+        ZEROTTS_SOURCE_COMMIT,
+        "--repo-url",
+        ZEROTTS_REPO_URL,
+    ]
+    if native or variant == ZeroTtsVariant.NATIVE:
+        cmd.append("--native")
+    else:
+        cmd.extend(["--variant", variant])
+    res = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(
+            f"Failed to build ZeroTTS GGML shared library: {res.stderr or res.stdout}"
+        ) from None
+    candidate = dest_dir / ZeroTtsFile.LIBZEROTTS_SO
+    if not candidate.is_file():
+        raise FileNotFoundError(
+            f"{ZeroTtsFile.LIBZEROTTS_SO} not found after build at: {candidate}"
+        ) from None
+    return candidate
+
+
+def _build_zerotts_ggml_lib(
+    target_dir: Path,
+    *,
+    variant: str = ZeroTtsVariant.COMPAT,
+    native: bool = False,
+    publish_subdir: bool = False,
+) -> Path:
     """Build the ZeroTTS GGML shared library from upstream source.
 
     Args:
         target_dir: Destination directory where the built shared library should be placed.
+        variant: CPU architecture optimization variant ('compat', 'avx2', 'avx512', 'native').
         native: Whether to optimize for host processor architecture instead of portable baseline.
+        publish_subdir: Whether to publish into a variant-named subdirectory under target_dir.
 
     Returns:
         Path to the compiled libzerotts.so file.
@@ -73,6 +180,7 @@ def _build_zerotts_ggml_lib(target_dir: Path, *, native: bool = False) -> Path:
         RuntimeError: If building the library fails.
         FileNotFoundError: If the compiled library cannot be found after build.
     """
+    actual_variant = ZeroTtsVariant.NATIVE if native else variant
     try:
         from tools.build_zerotts import build_zerotts_ggml_lib
 
@@ -80,38 +188,21 @@ def _build_zerotts_ggml_lib(target_dir: Path, *, native: bool = False) -> Path:
             target_dir,
             repo_url=ZEROTTS_REPO_URL,
             commit=ZEROTTS_SOURCE_COMMIT,
+            variant=actual_variant,
             native=native,
+            publish_subdir=publish_subdir,
         )
     except ImportError as import_err:
         repo_root = Path(__file__).resolve().parent.parent
         build_script = repo_root / "tools" / "build_zerotts.py"
         if build_script.is_file():
-            cmd = [
-                sys.executable,
-                str(build_script),
-                str(target_dir),
-                "--commit",
-                ZEROTTS_SOURCE_COMMIT,
-                "--repo-url",
-                ZEROTTS_REPO_URL,
-            ]
-            if native:
-                cmd.append("--native")
-            res = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
+            return _run_zerotts_build_script(
+                build_script,
+                target_dir,
+                variant=actual_variant,
+                native=native,
+                publish_subdir=publish_subdir,
             )
-            if res.returncode != 0:
-                raise RuntimeError(
-                    f"Failed to build ZeroTTS GGML shared library: {res.stderr or res.stdout}"
-                ) from None
-            candidate = target_dir / ZeroTtsFile.LIBZEROTTS_SO
-            if not candidate.is_file():
-                raise FileNotFoundError(
-                    f"{ZeroTtsFile.LIBZEROTTS_SO} not found after build at: {candidate}"
-                ) from None
-            return candidate
         raise RuntimeError("ZeroTTS build script tools/build_zerotts.py not found") from import_err
 
 
@@ -130,35 +221,60 @@ def resolve_zerotts_ggml_lib(custom_lib_path: Path | None = None) -> ctypes.CDLL
         RuntimeError: If loading the shared library fails.
     """
     repo_root = Path(__file__).resolve().parent.parent
-    candidate_paths: list[Path] = []
-    if custom_lib_path is not None:
-        candidate_paths.append(custom_lib_path)
+    candidates = get_zerotts_candidate_lib_paths(custom_lib_path)
 
-    if env_path := os.environ.get("ZEROTTS_LIB_PATH", "").strip():
-        candidate_paths.append(Path(env_path).expanduser())
+    loaded_lib: ctypes.CDLL | None = None
+    last_error: OSError | None = None
+    last_attempted_path: Path | None = None
 
-    candidate_paths.extend(
-        [
-            Path("/app/lib") / ZeroTtsFile.LIBZEROTTS_SO,
-            repo_root / "lib" / ZeroTtsFile.LIBZEROTTS_SO,
-            Path(__file__).resolve().parent / "lib" / ZeroTtsFile.LIBZEROTTS_SO,
-        ]
-    )
+    for var_name, cand in candidates:
+        if not cand.is_file():
+            continue
+        last_attempted_path = cand
+        try:
+            loaded_lib = ctypes.CDLL(str(cand.resolve()))
+            _LOGGER.info(
+                "Loaded ZeroTTS GGML runtime shared library (%s variant): %s",
+                var_name,
+                cand,
+            )
+            break
+        except OSError as err:
+            last_error = err
+            _LOGGER.warning(
+                "Failed to load ZeroTTS candidate %s (%s variant): %s",
+                cand,
+                var_name,
+                err,
+            )
 
-    resolved_lib_path: Path | None = next(
-        (cand for cand in candidate_paths if cand.is_file()), None
-    )
-    if resolved_lib_path is None:
+    if loaded_lib is None:
+        if last_error is not None:
+            _LOGGER.warning(
+                "Failed to load candidate ZeroTTS library from %s: %s; falling back to local build",
+                last_attempted_path,
+                last_error,
+            )
+
         target_dir = repo_root / "lib"
-        resolved_lib_path = _build_zerotts_ggml_lib(target_dir)
+        optimal_variant = detect_cpu_variant()
+        resolved_lib_path = _build_zerotts_ggml_lib(
+            target_dir,
+            variant=optimal_variant,
+            publish_subdir=True,
+        )
+        try:
+            loaded_lib = ctypes.CDLL(str(resolved_lib_path.resolve()))
+        except OSError as err:
+            raise RuntimeError(
+                f"Failed to load {ZeroTtsFile.LIBZEROTTS_SO} from {resolved_lib_path}: {err}"
+            ) from err
 
-    try:
-        lib = ctypes.CDLL(str(resolved_lib_path.resolve()))
-    except OSError as err:
-        raise RuntimeError(
-            f"Failed to load {ZeroTtsFile.LIBZEROTTS_SO} from {resolved_lib_path}: {err}"
-        ) from err
+    return _configure_zerotts_lib_signatures(loaded_lib)
 
+
+def _configure_zerotts_lib_signatures(lib: ctypes.CDLL) -> ctypes.CDLL:
+    """Configure ctypes argument and return types for ZeroTTS C API functions."""
     lib.zerotts_init_from_file.argtypes = [ctypes.c_char_p, ctypes.c_int]
     lib.zerotts_init_from_file.restype = ctypes.c_void_p
     lib.zerotts_free.argtypes = [ctypes.c_void_p]
@@ -198,7 +314,6 @@ def resolve_zerotts_ggml_lib(custom_lib_path: Path | None = None) -> ctypes.CDLL
         ctypes.POINTER(ctypes.c_int),
     ]
     lib.zerotts_timings.restype = None
-
     return lib
 
 
