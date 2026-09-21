@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import ctypes
+import re
 import shutil
 import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 import numpy as np
 import pytest
@@ -31,8 +32,11 @@ from wyoming_vietnamese.cpu import (
 from wyoming_vietnamese.tts import warm_up_tts
 from wyoming_vietnamese.tts_model import ZEROTTS_VOICES
 from wyoming_vietnamese.zerotts_engine import (
+    _ZEROTTS_RUNTIME_DEPENDENCIES,
     ZeroTtsGgmlEngine,
     _build_zerotts_ggml_lib,
+    _load_zerotts_candidate,
+    _unload_cdll,
     _ZeroTtsHParams,
     get_zerotts_candidate_lib_paths,
     resolve_zerotts_ggml_lib,
@@ -1351,6 +1355,261 @@ def test_resolve_zerotts_ggml_lib_selects_optimal_variant(
         lib = resolve_zerotts_ggml_lib()
         assert lib is fake_cdll
         mock_cdll.assert_called_once_with(str(avx2_so.resolve()))
+
+
+def test_load_zerotts_candidate_binds_variant_ggml_dependencies(tmp_path: Path) -> None:
+    """Test a variant loads its GGML dependencies from the same directory."""
+    variant_dir = tmp_path / "avx2"
+    variant_dir.mkdir()
+    candidate = variant_dir / ZeroTtsFile.LIBZEROTTS_SO
+    candidate.write_bytes(b"ELF_AVX2")
+    for dependency in _ZEROTTS_RUNTIME_DEPENDENCIES:
+        (variant_dir / dependency).write_bytes(b"ELF_GGML")
+
+    fake_cdll = MagicMock()
+    with patch(
+        "wyoming_vietnamese.zerotts_engine.ctypes.CDLL", return_value=fake_cdll
+    ) as mock_cdll:
+        assert _load_zerotts_candidate(candidate) is fake_cdll
+
+    assert [c.args[0] for c in mock_cdll.call_args_list] == [
+        str((variant_dir / dependency).resolve()) for dependency in _ZEROTTS_RUNTIME_DEPENDENCIES
+    ] + [str(candidate.resolve())]
+    assert not any(
+        "mode" in c.kwargs and c.kwargs["mode"] == getattr(ctypes, "RTLD_GLOBAL", -1)
+        for c in mock_cdll.call_args_list
+    )
+
+
+def test_load_zerotts_candidate_unloads_dependencies_on_failure(tmp_path: Path) -> None:
+    """Test preloaded dependencies are unloaded if candidate library loading fails."""
+    variant_dir = tmp_path / "avx2"
+    variant_dir.mkdir()
+    candidate = variant_dir / ZeroTtsFile.LIBZEROTTS_SO
+    candidate.write_bytes(b"ELF_AVX2")
+    for dependency in _ZEROTTS_RUNTIME_DEPENDENCIES:
+        (variant_dir / dependency).write_bytes(b"ELF_GGML")
+
+    fake_deps = [MagicMock() for _ in _ZEROTTS_RUNTIME_DEPENDENCIES]
+    dep_map = {
+        str((variant_dir / dep).resolve()): fake_dep
+        for dep, fake_dep in zip(_ZEROTTS_RUNTIME_DEPENDENCIES, fake_deps, strict=True)
+    }
+
+    def fake_loader(path_str: str, **kwargs: object) -> MagicMock:
+        if path_str in dep_map:
+            return dep_map[path_str]
+        raise OSError("Failed to load candidate binary")
+
+    with (
+        patch(
+            "wyoming_vietnamese.zerotts_engine.ctypes.CDLL",
+            side_effect=fake_loader,
+        ),
+        patch("wyoming_vietnamese.zerotts_engine._unload_cdll") as mock_unload,
+        pytest.raises(OSError, match="Failed to load candidate binary"),
+    ):
+        _load_zerotts_candidate(candidate)
+
+    assert mock_unload.call_count == len(_ZEROTTS_RUNTIME_DEPENDENCIES)
+    assert mock_unload.call_args_list == [call(dep) for dep in reversed(fake_deps)]
+
+
+def test_unload_cdll_invokes_dlclose() -> None:
+    """Test _unload_cdll closes the underlying handle when handle is an integer."""
+    fake_lib = MagicMock()
+    fake_lib._handle = 123456
+    with patch("_ctypes.dlclose") as mock_dlclose:
+        _unload_cdll(fake_lib)
+        mock_dlclose.assert_called_once_with(123456)
+        assert fake_lib._handle is None
+
+
+def test_unload_cdll_safely_ignores_invalid_handle() -> None:
+    """Test _unload_cdll handles non-integer or missing handles without error."""
+    fake_lib = MagicMock()
+    fake_lib._handle = "not_an_int"
+    with patch("_ctypes.dlclose") as mock_dlclose:
+        _unload_cdll(fake_lib)
+        mock_dlclose.assert_not_called()
+
+    empty_lib = MagicMock(spec=[])
+    _unload_cdll(empty_lib)
+
+
+def test_load_zerotts_candidate_rejects_incomplete_dependencies(tmp_path: Path) -> None:
+    """Test _load_zerotts_candidate raises OSError on partial dependency sets."""
+    variant_dir = tmp_path / "avx2"
+    variant_dir.mkdir()
+    candidate = variant_dir / ZeroTtsFile.LIBZEROTTS_SO
+    candidate.write_bytes(b"ELF_AVX2")
+    (variant_dir / _ZEROTTS_RUNTIME_DEPENDENCIES[0]).write_bytes(b"ELF_GGML")
+    expected_missing = re.escape(", ".join(_ZEROTTS_RUNTIME_DEPENDENCIES[1:]))
+
+    with pytest.raises(
+        OSError,
+        match=rf"Incomplete ZeroTTS runtime dependencies for .*: missing {expected_missing}",
+    ):
+        _load_zerotts_candidate(candidate)
+
+
+def test_resolve_zerotts_ggml_lib_fallback_on_incomplete_dependencies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test resolve_zerotts_ggml_lib falls back when candidate has incomplete dependencies."""
+    monkeypatch.delenv("ZEROTTS_LIB_PATH", raising=False)
+    base_dir = tmp_path / "lib"
+    avx2_dir = base_dir / "avx2"
+    compat_dir = base_dir / "compat"
+    avx2_dir.mkdir(parents=True)
+    compat_dir.mkdir(parents=True)
+
+    avx2_so = avx2_dir / ZeroTtsFile.LIBZEROTTS_SO
+    compat_so = compat_dir / ZeroTtsFile.LIBZEROTTS_SO
+    avx2_so.write_bytes(b"ELF_AVX2")
+    compat_so.write_bytes(b"ELF_COMPAT")
+
+    (avx2_dir / _ZEROTTS_RUNTIME_DEPENDENCIES[0]).write_bytes(b"ELF_AVX2_DEP")
+    for dep in _ZEROTTS_RUNTIME_DEPENDENCIES:
+        (compat_dir / dep).write_bytes(b"ELF_COMPAT_DEP")
+
+    fake_compat_cdll = MagicMock()
+
+    def fake_loader(path_str: str, **kwargs: object) -> MagicMock:
+        if "compat" in path_str and path_str.endswith(ZeroTtsFile.LIBZEROTTS_SO):
+            return fake_compat_cdll
+        mock = MagicMock()
+        mock._path = path_str
+        return mock
+
+    with (
+        patch(
+            "wyoming_vietnamese.zerotts_engine.detect_cpu_variant",
+            return_value=ZeroTtsVariant.AVX2,
+        ),
+        patch(
+            "wyoming_vietnamese.zerotts_engine.get_zerotts_candidate_lib_paths",
+            return_value=[("avx2", avx2_so), ("compat", compat_so)],
+        ),
+        patch(
+            "wyoming_vietnamese.zerotts_engine.ctypes.CDLL",
+            side_effect=fake_loader,
+        ),
+    ):
+        lib = resolve_zerotts_ggml_lib()
+        assert lib is fake_compat_cdll
+
+
+def test_load_zerotts_candidate_resolves_symlink_for_dependencies(tmp_path: Path) -> None:
+    """Test _load_zerotts_candidate resolves symlinks to preload target dependencies."""
+    target_dir = tmp_path / "actual" / "avx2"
+    target_dir.mkdir(parents=True)
+    real_candidate = target_dir / ZeroTtsFile.LIBZEROTTS_SO
+    real_candidate.write_bytes(b"ELF_AVX2")
+
+    for dependency in _ZEROTTS_RUNTIME_DEPENDENCIES:
+        (target_dir / dependency).write_bytes(b"ELF_GGML")
+
+    symlink_dir = tmp_path / "symlinks"
+    symlink_dir.mkdir(parents=True)
+    symlink_candidate = symlink_dir / "custom_zerotts.so"
+    symlink_candidate.symlink_to(real_candidate)
+
+    fake_cdll = MagicMock()
+    with patch(
+        "wyoming_vietnamese.zerotts_engine.ctypes.CDLL", return_value=fake_cdll
+    ) as mock_cdll:
+        assert _load_zerotts_candidate(symlink_candidate) is fake_cdll
+
+    assert [c.args[0] for c in mock_cdll.call_args_list] == [
+        str((target_dir / dependency).resolve()) for dependency in _ZEROTTS_RUNTIME_DEPENDENCIES
+    ] + [str(real_candidate.resolve())]
+
+
+def test_resolve_zerotts_ggml_lib_symlink_candidate_preloads_dependencies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test resolve_zerotts_ggml_lib with symlinked custom/env candidate preloads dependencies."""
+    target_dir = tmp_path / "installed" / "avx2"
+    target_dir.mkdir(parents=True)
+    real_candidate = target_dir / ZeroTtsFile.LIBZEROTTS_SO
+    real_candidate.write_bytes(b"ELF_AVX2")
+
+    for dependency in _ZEROTTS_RUNTIME_DEPENDENCIES:
+        (target_dir / dependency).write_bytes(b"ELF_GGML")
+
+    symlink_path = tmp_path / "env_symlink.so"
+    symlink_path.symlink_to(real_candidate)
+    monkeypatch.setenv("ZEROTTS_LIB_PATH", str(symlink_path))
+
+    fake_cdll = MagicMock()
+    with patch(
+        "wyoming_vietnamese.zerotts_engine.ctypes.CDLL", return_value=fake_cdll
+    ) as mock_cdll:
+        lib = resolve_zerotts_ggml_lib()
+        assert lib is fake_cdll
+
+    assert [c.args[0] for c in mock_cdll.call_args_list] == [
+        str((target_dir / dependency).resolve()) for dependency in _ZEROTTS_RUNTIME_DEPENDENCIES
+    ] + [str(real_candidate.resolve())]
+
+
+def test_resolve_zerotts_ggml_lib_fallback_unloads_failed_variant_dependencies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test candidate dependencies are cleaned up before fallback candidate is loaded."""
+    monkeypatch.delenv("ZEROTTS_LIB_PATH", raising=False)
+    base_dir = tmp_path / "lib"
+    avx2_dir = base_dir / "avx2"
+    compat_dir = base_dir / "compat"
+    avx2_dir.mkdir(parents=True)
+    compat_dir.mkdir(parents=True)
+
+    avx2_so = avx2_dir / ZeroTtsFile.LIBZEROTTS_SO
+    compat_so = compat_dir / ZeroTtsFile.LIBZEROTTS_SO
+    avx2_so.write_bytes(b"ELF_AVX2")
+    compat_so.write_bytes(b"ELF_COMPAT")
+
+    for dep in _ZEROTTS_RUNTIME_DEPENDENCIES:
+        (avx2_dir / dep).write_bytes(b"ELF_AVX2_DEP")
+        (compat_dir / dep).write_bytes(b"ELF_COMPAT_DEP")
+
+    fake_compat_cdll = MagicMock()
+    unloaded: list[str] = []
+
+    def fake_loader(path_str: str, **kwargs: object) -> MagicMock:
+        if "avx2" in path_str and path_str.endswith(ZeroTtsFile.LIBZEROTTS_SO):
+            raise OSError("AVX2 candidate invalid")
+        mock = MagicMock()
+        mock._path = path_str
+        if "compat" in path_str and path_str.endswith(ZeroTtsFile.LIBZEROTTS_SO):
+            return fake_compat_cdll
+        return mock
+
+    def fake_unload(lib: ctypes.CDLL) -> None:
+        unloaded.append(getattr(lib, "_path", str(lib)))
+
+    with (
+        patch(
+            "wyoming_vietnamese.zerotts_engine.detect_cpu_variant",
+            return_value=ZeroTtsVariant.AVX2,
+        ),
+        patch(
+            "wyoming_vietnamese.zerotts_engine.get_zerotts_candidate_lib_paths",
+            return_value=[("avx2", avx2_so), ("compat", compat_so)],
+        ),
+        patch(
+            "wyoming_vietnamese.zerotts_engine.ctypes.CDLL",
+            side_effect=fake_loader,
+        ),
+        patch(
+            "wyoming_vietnamese.zerotts_engine._unload_cdll",
+            side_effect=fake_unload,
+        ),
+    ):
+        lib = resolve_zerotts_ggml_lib()
+        assert lib is fake_compat_cdll
+        assert any("avx2" in path for path in unloaded)
 
 
 def test_resolve_zerotts_ggml_lib_fallback_to_compat_on_load_error(

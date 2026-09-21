@@ -42,6 +42,11 @@ _ARM_VARIANT_FALLBACK_HIERARCHY: Final[tuple[str, ...]] = (
     ZeroTtsVariant.ARM_DOTPROD,
     ZeroTtsVariant.COMPAT,
 )
+_ZEROTTS_RUNTIME_DEPENDENCIES: Final[tuple[str, ...]] = (
+    "libggml-base.so.0",
+    "libggml-cpu.so.0",
+    "libggml.so.0",
+)
 
 
 class _ZeroTtsSampling(ctypes.Structure):
@@ -179,6 +184,74 @@ def _run_zerotts_build_script(
     return candidate
 
 
+def _unload_cdll(lib: ctypes.CDLL) -> None:
+    """Close the underlying dlopen handle of a CDLL instance to prevent library leakage.
+
+    Args:
+        lib: Loaded ctypes shared library instance to close.
+    """
+    handle = getattr(lib, "_handle", None)
+    if isinstance(handle, int):
+        with contextlib.suppress(Exception):
+            import _ctypes
+
+            _ctypes.dlclose(handle)
+        with contextlib.suppress(Exception):
+            lib.__dict__["_handle"] = None
+
+
+def _load_zerotts_candidate(candidate: Path) -> ctypes.CDLL:
+    """Load a ZeroTTS library with GGML dependencies from the same variant directory.
+
+    The container exposes ``/app/lib`` through ``LD_LIBRARY_PATH`` while the
+    optimized libraries are published below ``/app/lib/<variant>``.  Loading
+    only the top-level library lets the dynamic loader satisfy its SONAMEs from
+    a stale root-level GGML copy before it considers the library's ``$ORIGIN``
+    runpath.  Preloading the matching dependencies by absolute path keeps the
+    selected ZeroTTS variant and its GGML kernels together.
+
+    Dependencies are loaded locally without ``RTLD_GLOBAL`` and are cleanly unloaded
+    if candidate loading fails, preventing cross-variant library and symbol reuse
+    before fallback candidates are attempted.
+
+    Args:
+        candidate: Path to candidate libzerotts.so file.
+
+    Returns:
+        Loaded ctypes.CDLL shared library instance.
+
+    Raises:
+        OSError: If loading the candidate or any required dependency fails.
+    """
+    resolved_candidate = candidate.resolve()
+    dependency_paths = [resolved_candidate.parent / name for name in _ZEROTTS_RUNTIME_DEPENDENCIES]
+    existing_deps = [path for path in dependency_paths if path.is_file()]
+    missing_deps = [
+        name
+        for path, name in zip(dependency_paths, _ZEROTTS_RUNTIME_DEPENDENCIES, strict=False)
+        if not path.is_file()
+    ]
+    if (existing_deps or any(resolved_candidate.parent.glob("libggml*.so*"))) and missing_deps:
+        missing_names = ", ".join(missing_deps)
+        raise OSError(
+            f"Incomplete ZeroTTS runtime dependencies for {resolved_candidate}: "
+            f"missing {missing_names}"
+        )
+
+    if existing_deps:
+        loaded_dependencies: list[ctypes.CDLL] = []
+        try:
+            loaded_dependencies.extend(
+                ctypes.CDLL(str(dependency.resolve())) for dependency in dependency_paths
+            )
+            return ctypes.CDLL(str(resolved_candidate))
+        except Exception:
+            for dep in reversed(loaded_dependencies):
+                _unload_cdll(dep)
+            raise
+    return ctypes.CDLL(str(resolved_candidate))
+
+
 def _build_zerotts_ggml_lib(
     target_dir: Path,
     *,
@@ -253,7 +326,7 @@ def resolve_zerotts_ggml_lib(custom_lib_path: Path | None = None) -> ctypes.CDLL
             continue
         last_attempted_path = cand
         try:
-            loaded_lib = ctypes.CDLL(str(cand.resolve()))
+            loaded_lib = _load_zerotts_candidate(cand)
             _LOGGER.info(
                 "Loaded ZeroTTS GGML runtime shared library (%s variant): %s",
                 var_name,
@@ -285,7 +358,7 @@ def resolve_zerotts_ggml_lib(custom_lib_path: Path | None = None) -> ctypes.CDLL
             publish_subdir=True,
         )
         try:
-            loaded_lib = ctypes.CDLL(str(resolved_lib_path.resolve()))
+            loaded_lib = _load_zerotts_candidate(resolved_lib_path)
         except OSError as err:
             raise RuntimeError(
                 f"Failed to load {ZeroTtsFile.LIBZEROTTS_SO} from {resolved_lib_path}: {err}"
