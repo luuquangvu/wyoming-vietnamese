@@ -112,15 +112,15 @@ class TtsSilenceMs(IntEnum):
     MAX = 3_000
 
 
-DEFAULT_TTS_CACHE_IDLE_SECONDS = 86_400.0
+DEFAULT_TTS_CACHE_IDLE_SECONDS = 2_592_000.0
 
 
 class TtsCacheLimit(IntEnum):
     """Default capacity bounds for the TTS audio cache."""
 
-    MAX_ENTRIES = 128
-    MAX_MB = 64
-    MAX_ITEM_MB = 4
+    MAX_ENTRIES = 2_048
+    MAX_MB = 512
+    MAX_ITEM_MB = 8
 
 
 # Inference is serialized by the STT and TTS locks, so a small pool is enough: one STT

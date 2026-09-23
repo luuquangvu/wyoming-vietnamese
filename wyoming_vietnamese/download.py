@@ -12,6 +12,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, suppress
 from hashlib import file_digest, sha256
 from pathlib import Path
+from typing import Final
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
@@ -37,6 +38,8 @@ from .tts_model import (
 AnyVoiceSpec = NghiTtsVoiceSpec | ZeroTtsVoiceSpec
 
 _LOGGER = logging.getLogger(__name__)
+
+_DOWNLOAD_TIMEOUT_SECONDS: Final[float] = 60.0
 
 
 def setup_hf_environment(cache_dir: Path, offline: bool = False) -> None:
@@ -216,7 +219,10 @@ def _download_verified_file(
     digest = sha256()
     try:
         request = Request(url, headers={"User-Agent": "wyoming-vietnamese/0.1"})
-        with urlopen(request, timeout=60) as response, temporary_path.open("wb") as output_file:
+        with (
+            urlopen(request, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as response,
+            temporary_path.open("wb") as output_file,
+        ):
             while chunk := response.read(1024 * 1024):
                 digest.update(chunk)
                 output_file.write(chunk)

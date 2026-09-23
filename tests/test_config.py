@@ -9,7 +9,6 @@ from wyoming_vietnamese.config import (
     ServerConfig,
     _get_float,
     get_env_bool,
-    resolve_cpu_threads,
 )
 from wyoming_vietnamese.const import (
     DEFAULT_PORT,
@@ -66,37 +65,6 @@ def test_get_env_bool_default_and_invalid() -> None:
         get_env_bool("FLAG", False, {"FLAG": "sometimes"})
 
 
-@pytest.mark.parametrize(
-    ("configured_threads", "expected_threads"),
-    [(0, 4), (2, 2), (8, 4)],
-)
-def test_resolve_cpu_threads_caps_to_available_cpus(
-    configured_threads: int,
-    expected_threads: int,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Test auto resolution and explicit thread capping."""
-    monkeypatch.setattr("wyoming_vietnamese.config.os.process_cpu_count", lambda: 4)
-    assert resolve_cpu_threads(configured_threads) == expected_threads
-
-
-def test_resolve_cpu_threads_rejects_negative_values() -> None:
-    """Test direct callers cannot bypass non-negative thread validation."""
-    with pytest.raises(ValueError, match="must not be negative"):
-        resolve_cpu_threads(-1)
-
-
-def test_resolve_cpu_threads_uses_cpu_count_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Test CPU detection remains positive when affinity data is unavailable."""
-    monkeypatch.setattr("wyoming_vietnamese.config.os.process_cpu_count", lambda: None)
-    monkeypatch.setattr("wyoming_vietnamese.config.os.cpu_count", lambda: 2)
-    assert resolve_cpu_threads(0) == 2
-    monkeypatch.setattr("wyoming_vietnamese.config.os.cpu_count", lambda: None)
-    assert resolve_cpu_threads(0) == 1
-
-
 def test_server_config_defaults() -> None:
     """Test server config defaults."""
     config = ServerConfig.from_env({})
@@ -109,10 +77,10 @@ def test_server_config_defaults() -> None:
     assert config.write_timeout == 5
     assert config.max_active_connections == 64
     assert config.max_stt_buffer_bytes == 256 * 1024 * 1024
-    assert config.tts_cache_idle_seconds == 86400
-    assert config.tts_cache_max_entries == 128
-    assert config.tts_cache_max_bytes == 64 * 1024 * 1024
-    assert config.tts_cache_max_item_bytes == 4 * 1024 * 1024
+    assert config.tts_cache_idle_seconds == 2_592_000.0
+    assert config.tts_cache_max_entries == 2_048
+    assert config.tts_cache_max_bytes == 512 * 1024 * 1024
+    assert config.tts_cache_max_item_bytes == 8 * 1024 * 1024
     assert config.tts_sentence_silence_ms == TtsSilenceMs.SENTENCE
     assert config.tts_clause_silence_ms == TtsSilenceMs.CLAUSE
     assert config.tts_paragraph_silence_ms == TtsSilenceMs.PARAGRAPH
@@ -217,7 +185,7 @@ def test_server_config_accepts_tts_voice_separators(value: str) -> None:
         ({"TTS_CACHE_IDLE_SECONDS": "0"}, "must be greater"),
         ({"TTS_CACHE_MAX_ENTRIES": "-1"}, "must be at least"),
         ({"TTS_CACHE_MAX_MB": "-1"}, "must be at least"),
-        ({"TTS_CACHE_MAX_ITEM_MB": "65"}, "must not exceed"),
+        ({"TTS_CACHE_MAX_ITEM_MB": "513"}, "must not exceed"),
         ({"TTS_VOICE": "unknown"}, "must be one of"),
         ({"TTS_VOICE": "ngoc-huyen-moi;ngoc-ngan"}, "must be one of"),
         ({"TTS_VOICE": "ngoc-huyen-moi,ngoc-huyen-moi"}, "duplicate"),

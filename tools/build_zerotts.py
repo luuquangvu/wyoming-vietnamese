@@ -10,10 +10,13 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import FrameType
 from typing import Final
 
 try:
@@ -51,6 +54,14 @@ _SAFE_REPO_URL_PATTERN: Final = re.compile(
     r"^https://github\.com/[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+(?:\.git)?$"
 )
 _GGML_LIB_GLOB: Final = "libggml*.so*"
+_GIT_NETWORK_TIMEOUT_SECONDS: Final[float] = 300.0
+_GIT_LOCAL_TIMEOUT_SECONDS: Final[float] = 30.0
+_COMPILER_PROBE_TIMEOUT_SECONDS: Final[float] = 10.0
+_CMAKE_CONFIGURE_TIMEOUT_SECONDS: Final[float] = 120.0
+_CMAKE_BUILD_TIMEOUT_SECONDS: Final[float] = 600.0
+_GXX_LINK_TIMEOUT_SECONDS: Final[float] = 180.0
+_PROCESS_TERMINATION_TIMEOUT_SECONDS: Final[float] = 5.0
+_MAX_CMAKE_TEARDOWN_SECONDS: Final[float] = 10.0
 
 
 def _validate_git_argument(value: str, pattern: re.Pattern[str], param_name: str) -> str:
@@ -83,6 +94,7 @@ def _checkout_repo(clone_dest: Path, repo_url: str, commit: str) -> None:
         ],
         check=True,
         capture_output=True,
+        timeout=_GIT_NETWORK_TIMEOUT_SECONDS,
     )
     subprocess.run(
         [
@@ -96,6 +108,7 @@ def _checkout_repo(clone_dest: Path, repo_url: str, commit: str) -> None:
         ],
         check=True,
         capture_output=True,
+        timeout=_GIT_LOCAL_TIMEOUT_SECONDS,
     )
     subprocess.run(
         [
@@ -109,6 +122,7 @@ def _checkout_repo(clone_dest: Path, repo_url: str, commit: str) -> None:
         ],
         check=True,
         capture_output=True,
+        timeout=_GIT_NETWORK_TIMEOUT_SECONDS,
     )
 
 
@@ -246,10 +260,157 @@ def _is_toolchain_variant_supported(variant: str) -> bool:
             ["g++", *extra_flags, "-E", "-x", "c++", os.devnull, "-o", os.devnull],
             capture_output=True,
             check=False,
+            timeout=_COMPILER_PROBE_TIMEOUT_SECONDS,
         )
         return res.returncode == 0
     except OSError, subprocess.SubprocessError:
         return False
+
+
+_ACTIVE_CMAKE_PROC: subprocess.Popen[bytes] | None = None
+
+
+def _handle_sigterm(signum: int, _frame: object) -> None:
+    """Terminate active CMake process and exit on termination signal."""
+    global _ACTIVE_CMAKE_PROC
+    proc = _ACTIVE_CMAKE_PROC
+    if proc is not None:
+        _terminate_cmake_process_tree(proc)
+    sys.exit(128 + signum)
+
+
+_SignalHandler = Callable[[int, FrameType | None], object] | int | signal.Handlers | None
+
+
+@contextlib.contextmanager
+def _handle_build_signals() -> Iterator[None]:
+    """Register signal handlers to terminate active CMake process on SIGTERM/SIGINT."""
+    prev_signals: dict[int, _SignalHandler] = {}
+    for sig_name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, sig_name, None)
+        if isinstance(sig, int):
+            with contextlib.suppress(ValueError, OSError):
+                prev_signals[sig] = signal.signal(sig, _handle_sigterm)
+    try:
+        yield
+    finally:
+        for sig, prev_handler in prev_signals.items():
+            if prev_handler is not None:
+                with contextlib.suppress(ValueError, OSError):
+                    signal.signal(sig, prev_handler)
+
+
+def _is_cmake_process_group_alive(pgid: int) -> bool:
+    """Return True if any processes remain alive in the process group.
+
+    Args:
+        pgid: Process group ID to check.
+
+    Returns:
+        True if any process in the process group is running, False otherwise.
+    """
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+
+
+def _terminate_cmake_process_tree(
+    proc: subprocess.Popen[bytes] | subprocess.Popen[str],
+) -> None:
+    """Terminate CMake process and all descendant processes in its process group.
+
+    Args:
+        proc: The running CMake subprocess whose process tree should be terminated.
+    """
+    pid = getattr(proc, "pid", None)
+    if not isinstance(pid, int):
+        return
+
+    if platform.system() == "Windows":
+        with contextlib.suppress(Exception):
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                check=False,
+                timeout=_PROCESS_TERMINATION_TIMEOUT_SECONDS,
+            )
+        with contextlib.suppress(Exception):
+            proc.kill()
+            proc.wait(timeout=_PROCESS_TERMINATION_TIMEOUT_SECONDS)
+        return
+
+    has_killpg = hasattr(os, "killpg")
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if has_killpg:
+            with contextlib.suppress(ProcessLookupError, OSError):
+                os.killpg(pid, sig)
+        with contextlib.suppress(ProcessLookupError, OSError, AttributeError):
+            if sig == signal.SIGTERM:
+                proc.terminate()
+            else:
+                proc.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired, AttributeError, Exception):
+            proc.wait(timeout=_PROCESS_TERMINATION_TIMEOUT_SECONDS)
+        if has_killpg and not _is_cmake_process_group_alive(pid):
+            break
+
+
+def _run_cmake_build(cmd: list[str], timeout: float) -> None:
+    """Run CMake build command in a process group with group termination on timeout.
+
+    Args:
+        cmd: Command arguments to execute.
+        timeout: Timeout in seconds for the build process.
+
+    Raises:
+        subprocess.TimeoutExpired: If the build process times out.
+        subprocess.CalledProcessError: If the build process exits with a non-zero code.
+    """
+    global _ACTIVE_CMAKE_PROC
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    _ACTIVE_CMAKE_PROC = proc
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as err:
+        _terminate_cmake_process_tree(proc)
+        try:
+            term_stdout, term_stderr = proc.communicate(
+                timeout=_PROCESS_TERMINATION_TIMEOUT_SECONDS
+            )
+        except subprocess.TimeoutExpired as term_err:
+            term_stdout = term_err.output or err.output
+            term_stderr = term_err.stderr or err.stderr
+        except Exception:
+            term_stdout = err.output
+            term_stderr = err.stderr
+        raise subprocess.TimeoutExpired(
+            cmd=cmd,
+            timeout=timeout,
+            output=term_stdout or b"",
+            stderr=term_stderr or b"",
+        ) from err
+    except BaseException:
+        _terminate_cmake_process_tree(proc)
+        raise
+    finally:
+        _ACTIVE_CMAKE_PROC = None
+
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(
+            returncode=proc.returncode,
+            cmd=cmd,
+            output=stdout,
+            stderr=stderr,
+        )
 
 
 def _compile_libraries(
@@ -289,12 +450,12 @@ def _compile_libraries(
         cmake_cmd,
         check=True,
         capture_output=True,
+        timeout=_CMAKE_CONFIGURE_TIMEOUT_SECONDS,
     )
     jobs = str(min(os.cpu_count() or 4, 8))
-    subprocess.run(
+    _run_cmake_build(
         ["cmake", "--build", str(cmake_build_dir), f"-j{jobs}"],
-        check=True,
-        capture_output=True,
+        timeout=_CMAKE_BUILD_TIMEOUT_SECONDS,
     )
 
     gxx_cmd = [
@@ -317,7 +478,12 @@ def _compile_libraries(
         "-o",
         str(staging_dir / ZeroTtsFile.LIBZEROTTS_SO),
     ]
-    subprocess.run(gxx_cmd, check=True, capture_output=True)
+    subprocess.run(
+        gxx_cmd,
+        check=True,
+        capture_output=True,
+        timeout=_GXX_LINK_TIMEOUT_SECONDS,
+    )
 
     _copy_ggml_libraries(cmake_build_dir / "vendor-ggml" / "src", staging_dir)
 
@@ -512,21 +678,21 @@ def _publish_libraries(staging_dir: Path, target_dir: Path) -> None:
             else:
                 newly_published.append(dst)
             _publish_single_file(entry, target_dir)
-    except Exception:
+    except BaseException:
         _rollback_published(newly_published, backups)
         raise
     else:
         _cleanup_backups(backups)
 
 
-def _format_process_error(err: subprocess.CalledProcessError) -> str:
-    """Format a subprocess.CalledProcessError with captured stdout and stderr.
+def _format_process_error(err: subprocess.CalledProcessError | subprocess.TimeoutExpired) -> str:
+    """Format a process execution or timeout error with captured stdout and stderr.
 
     Args:
-        err: The CalledProcessError raised by subprocess.run.
+        err: The CalledProcessError or TimeoutExpired raised by subprocess.run.
 
     Returns:
-        A human-readable string containing command, exit code, stdout, and stderr.
+        A human-readable string containing command, error details, stdout, and stderr.
     """
     lines = [str(err)]
     if err.stdout:
@@ -585,7 +751,7 @@ def build_zerotts_ggml_lib(
     destination_dir = target_dir / actual_variant if publish_subdir else target_dir
     destination_dir.mkdir(parents=True, exist_ok=True)
 
-    build_dir = Path(tempfile.mkdtemp(prefix="_build_", dir=target_dir))
+    build_dir = Path(tempfile.mkdtemp(prefix=f"_build_{os.getpid()}_", dir=target_dir))
     clone_dest = build_dir / "ZeroTTS"
     staging_dir = build_dir / "stage"
     staging_dir.mkdir(parents=True, exist_ok=True)
@@ -611,7 +777,7 @@ def build_zerotts_ggml_lib(
             )
         _verify_library_loadable(staged_candidate, variant=actual_variant)
         _publish_libraries(staging_dir, destination_dir)
-    except subprocess.CalledProcessError as err:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as err:
         details = _format_process_error(err)
         _LOGGER.error("Subprocess execution failed during ZeroTTS build:\n%s", details)
         raise RuntimeError(f"Failed to build ZeroTTS GGML shared library: {details}") from err
@@ -724,7 +890,7 @@ def build_all_zerotts_variants(
         )
 
     quarantined = _quarantine_stale_variants(target_dir, unsupported_variants)
-    build_dir = Path(tempfile.mkdtemp(prefix="_build_all_", dir=target_dir))
+    build_dir = Path(tempfile.mkdtemp(prefix=f"_build_all_{os.getpid()}_", dir=target_dir))
     clone_dest = build_dir / "ZeroTTS"
     results: dict[str, Path] = {}
 
@@ -760,7 +926,7 @@ def build_all_zerotts_variants(
                 compat_link.unlink()
             compat_link.symlink_to(Path(ZeroTtsVariant.COMPAT) / ZeroTtsFile.LIBZEROTTS_SO)
         _cleanup_quarantined_variants(quarantined)
-    except subprocess.CalledProcessError as err:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as err:
         _restore_quarantined_variants(quarantined)
         details = _format_process_error(err)
         _LOGGER.error("Subprocess execution failed during multi-variant build:\n%s", details)
@@ -771,6 +937,9 @@ def build_all_zerotts_variants(
     except Exception as err:
         _restore_quarantined_variants(quarantined)
         raise RuntimeError(f"Failed to build ZeroTTS GGML shared libraries: {err}") from err
+    except BaseException:
+        _restore_quarantined_variants(quarantined)
+        raise
     finally:
         shutil.rmtree(build_dir, ignore_errors=True)
 
@@ -840,28 +1009,29 @@ def main() -> int:
             )
 
     target_path = Path(args.target_dir).resolve()
-    try:
-        if args.all_variants:
-            results = build_all_zerotts_variants(
-                target_path,
-                repo_url=args.repo_url,
-                commit=args.commit,
-            )
-            print(f"Successfully built ZeroTTS GGML library variants: {list(results.keys())}")
-        else:
-            variant = args.variant or ZeroTtsVariant.COMPAT
-            output_so = build_zerotts_ggml_lib(
-                target_path,
-                repo_url=args.repo_url,
-                commit=args.commit,
-                variant=variant,
-                native=args.native,
-            )
-            print(f"Successfully built ZeroTTS GGML library at: {output_so}")
-        return 0
-    except Exception as exc:
-        print(f"Error building ZeroTTS GGML library: {exc}", file=sys.stderr)
-        return 1
+    with _handle_build_signals():
+        try:
+            if args.all_variants:
+                results = build_all_zerotts_variants(
+                    target_path,
+                    repo_url=args.repo_url,
+                    commit=args.commit,
+                )
+                print(f"Successfully built ZeroTTS GGML library variants: {list(results.keys())}")
+            else:
+                variant = args.variant or ZeroTtsVariant.COMPAT
+                output_so = build_zerotts_ggml_lib(
+                    target_path,
+                    repo_url=args.repo_url,
+                    commit=args.commit,
+                    variant=variant,
+                    native=args.native,
+                )
+                print(f"Successfully built ZeroTTS GGML library at: {output_so}")
+            return 0
+        except Exception as exc:
+            print(f"Error building ZeroTTS GGML library: {exc}", file=sys.stderr)
+            return 1
 
 
 if __name__ == "__main__":

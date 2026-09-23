@@ -57,14 +57,6 @@ def get_env_bool(
     raise ValueError(f"{name} must be one of true/false, 1/0, yes/no, or on/off")
 
 
-def resolve_cpu_threads(configured_threads: int) -> int:
-    """Resolve auto mode and cap inference threads to process-available CPUs."""
-    if configured_threads < 0:
-        raise ValueError("configured threads must not be negative")
-    available_threads = max(os.process_cpu_count() or os.cpu_count() or 1, 1)
-    return min(configured_threads, available_threads) if configured_threads else available_threads
-
-
 def _get_int(
     environ: Mapping[str, str],
     name: str,

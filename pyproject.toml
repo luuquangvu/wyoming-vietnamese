@@ -34,6 +34,13 @@ dev = [
 
 [tool.uv]
 no-build = true
+exclude-dependencies = [
+  { package = { name = "zerotts" }, dependencies = [
+    "scipy",
+    "sounddevice",
+    "soundfile",
+  ] },
+]
 
 [tool.ruff]
 line-length = 100

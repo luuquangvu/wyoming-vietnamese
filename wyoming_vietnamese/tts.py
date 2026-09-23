@@ -33,7 +33,6 @@ from wyoming.tts import (
 )
 
 from .cache import BoundedLruCache
-from .config import resolve_cpu_threads
 from .const import (
     DEFAULT_TTS_ENGINE,
     NGHITTS_REPO_URL,
@@ -50,6 +49,7 @@ from .const import (
     ZeroTtsDirectory,
     ZeroTtsFile,
 )
+from .cpu import resolve_cpu_threads
 from .inference import run_inference
 from .protocol import ProtocolWriteError, SafeAsyncEventHandler, is_vietnamese_language
 from .tts_model import (

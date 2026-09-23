@@ -17,7 +17,6 @@ from wyoming.error import Error as WyomingError
 from wyoming.event import Event
 from wyoming.info import AsrModel, AsrProgram, Attribution, Describe, Info
 
-from .config import resolve_cpu_threads
 from .const import (
     HUGGINGFACE_BASE_URL,
     PROGRAM_NAME,
@@ -30,6 +29,7 @@ from .const import (
     SttConversion,
     Timeout,
 )
+from .cpu import resolve_cpu_threads
 from .inference import run_inference
 from .protocol import ByteBudget, SafeAsyncEventHandler, is_vietnamese_language
 
