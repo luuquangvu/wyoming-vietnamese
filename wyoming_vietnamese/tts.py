@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from time import perf_counter
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 import numpy as np
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
@@ -31,6 +31,7 @@ from wyoming.tts import (
     SynthesizeTextFormat,
     SynthesizeVoice,
 )
+from zerotts.text_norm import normalize_vi_text
 
 from .cache import BoundedLruCache
 from .const import (
@@ -68,6 +69,7 @@ AnyVoiceSpec = NghiTtsVoiceSpec | ZeroTtsVoiceSpec
 _LOGGER = logging.getLogger(__name__)
 
 _ERR_AT_LEAST_ONE_VOICE = "At least one TTS voice must be configured"
+_ERR_TEXT_TOO_LONG = "Synthesis text exceeds the configured limit"
 
 
 class TTSEngine(Protocol):
@@ -94,6 +96,24 @@ class TTSEngine(Protocol):
 
     def close(self) -> None:
         """Release model resources."""
+
+
+@runtime_checkable
+class _NormalizedTTSEngine(Protocol):
+    """Optional engine surface for synthesizing text already normalized by the handler."""
+
+    def infer_stream_normalized(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+    ) -> Iterator[np.ndarray]:
+        """Yield a waveform without applying the configured text normalizer again."""
+        ...
+
+    def normalize(self, text: str, *, voice: str | None = None) -> str:
+        """Return text after this engine's configured normalizer."""
+        ...
 
 
 class _SherpaGeneratedAudio(Protocol):
@@ -215,13 +235,22 @@ class _NghiAudioIterator(Iterator[np.ndarray]):
 class NghiTTSEngine:
     """Adapt a non-autoregressive NghiTTS voice to the service API."""
 
-    def __init__(self, tts: _SherpaOfflineTts, voice: NghiTtsVoiceSpec) -> None:
+    def __init__(
+        self,
+        tts: _SherpaOfflineTts,
+        voice: NghiTtsVoiceSpec,
+        *,
+        normalize_fn: Callable[[str], str] | None = normalize_vi_text,
+        max_text_chars: int | None = None,
+    ) -> None:
         """Validate the native model contract and expose one named preset voice."""
         if tts.sample_rate != NghiTtsAudio.SAMPLE_RATE:
             raise RuntimeError("NghiTTS returned an unexpected sample rate")
         if tts.num_speakers != 1:
             raise RuntimeError("NghiTTS returned an unexpected speaker count")
         self._tts: _SherpaOfflineTts | None = tts
+        self._normalize_fn = normalize_fn
+        self._max_text_chars = max_text_chars
         self.voice = voice
         self.sample_rate = tts.sample_rate
         self.chunks_are_sentences: bool = True
@@ -248,11 +277,30 @@ class NghiTTSEngine:
         voice: str | None = None,
     ) -> Iterator[np.ndarray]:
         """Stream completed native sentence chunks through a bounded iterator."""
+        return self.infer_stream_normalized(self.normalize(text, voice=voice), voice=voice)
+
+    def infer_stream_normalized(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+    ) -> Iterator[np.ndarray]:
+        """Stream text that has already passed through this engine's normalizer."""
+        if self._max_text_chars is not None and len(text) > self._max_text_chars:
+            raise ValueError(
+                f"Normalized synthesis text exceeds the limit of {self._max_text_chars} characters "
+                f"({len(text)} chars)"
+            )
         return _NghiAudioIterator(
             self._native_tts(),
             text,
             self._speaker_id(voice),
         )
+
+    def normalize(self, text: str, *, voice: str | None = None) -> str:
+        """Return text after this engine's configured normalizer."""
+        self._speaker_id(voice)
+        return text if self._normalize_fn is None else self._normalize_fn(text)
 
     def close(self) -> None:
         """Release the native model reference."""
@@ -297,6 +345,19 @@ class MultiVoiceTTSEngine:
     ) -> Iterator[np.ndarray]:
         """Stream a waveform with the selected voice."""
         return self._engine(voice).infer_stream(text)
+
+    def infer_stream_normalized(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+    ) -> Iterator[np.ndarray]:
+        """Stream already-normalized text with the selected voice."""
+        return self._engine(voice).infer_stream_normalized(text, voice=voice)
+
+    def normalize(self, text: str, *, voice: str | None = None) -> str:
+        """Normalize text with the engine selected for the requested voice."""
+        return self._engine(voice).normalize(text, voice=voice)
 
     def close(self) -> None:
         """Release every initialized voice engine."""
@@ -368,6 +429,9 @@ _LINE_BREAK_CHARS = frozenset("\n")
 _NUMERIC_SEPARATOR_CHARS = frozenset(",.:\u2013\u2014-")
 # Subset of the delimiters above that also joins one token: "Wi-Fi", "e-mail", "TP-HCM".
 _TOKEN_JOINING_CHARS = frozenset("\u2013\u2014-")
+# Administrative prefix abbreviations whose periods precede a proper noun or number:
+# "TP. HCM", "Q. 1". Aligned with zerotts.text_norm.vi_normalizer._PREFIX_ABBR.
+_PREFIX_ABBR = frozenset({"TP", "Q", "P", "H", "TX", "TT", "KP"})
 # Closing punctuation may follow a boundary character; rstrip() requires text.
 _TRAILING_WRAPPER_CHARS = "\"')]}\u00bb\u201d\u2019"
 # Shortest clause a punctuation boundary may produce, and shortest standalone final tail.
@@ -404,6 +468,53 @@ def _is_token_joining_dash(text: str, start: int, trailing_space: str) -> bool:
     return not trailing_space and start > 0 and not text[start - 1].isspace()
 
 
+def _is_abbreviation_token(token: str) -> bool:
+    """Return whether a letter token has the shape of an uppercase abbreviation component."""
+    return bool(token) and len(token) <= 4 and token.isupper()
+
+
+def _is_letter_joining_period(text: str, start: int, end: int) -> bool:
+    """Return whether one period sits inside an uppercase dotted abbreviation or waits for one.
+
+    Periods between adjacent letters join dotted abbreviations such as "TP.HCM"
+    or "U.S.A", aligned with zerotts uppercase abbreviation rules. Ordinary
+    adjacent letters, such as between sentences in "Chào.Bạn khỏe.", remain
+    sentence boundaries. A trailing period immediately following an abbreviation
+    token is kept buffered until subsequent chunks clarify whether it joins an
+    abbreviation.
+    """
+    if start == 0 or not text[start - 1].isalnum():
+        return False
+    idx = start - 1
+    while idx >= 0 and text[idx].isalnum():
+        idx -= 1
+    prev_token = text[idx + 1 : start]
+    if end >= len(text):
+        return _is_abbreviation_token(prev_token)
+    if not text[end].isalnum():
+        return False
+    idx2 = end
+    while idx2 < len(text) and text[idx2].isalnum():
+        idx2 += 1
+    next_token = text[end:idx2]
+    return _is_abbreviation_token(prev_token) and _is_abbreviation_token(next_token)
+
+
+def _is_prefix_abbrev_period(text: str, start: int, end: int) -> bool:
+    """Return whether one period follows a prefix abbreviation before a proper noun or number."""
+    if start == 0 or not text[start - 1].isalnum():
+        return False
+    idx = start - 1
+    while idx >= 0 and text[idx].isalnum():
+        idx -= 1
+    if idx >= 0 and text[idx] in (".", "_"):
+        return False
+    if text[idx + 1 : start] not in _PREFIX_ABBR:
+        return False
+    rest = text[end:].lstrip()
+    return not rest or rest[0].isdigit() or rest[0].isupper()
+
+
 def _is_intra_token_separator(text: str, match: re.Match[str]) -> bool:
     """Return whether a delimiter sits inside one token instead of ending a clause."""
     delimiter = match.group(1)
@@ -411,6 +522,10 @@ def _is_intra_token_separator(text: str, match: re.Match[str]) -> bool:
         return False
     start, end = match.start(1), match.end(1)
     if delimiter in _NUMERIC_SEPARATOR_CHARS and _is_numeric_separator(text, start, end):
+        return True
+    if delimiter == "." and (
+        _is_letter_joining_period(text, start, end) or _is_prefix_abbrev_period(text, start, end)
+    ):
         return True
     return delimiter in _TOKEN_JOINING_CHARS and _is_token_joining_dash(text, start, match.group(2))
 
@@ -626,21 +741,28 @@ class TTSEventHandler(SafeAsyncEventHandler):
         text = synthesize.text.strip()
         if not text:
             return await self._fail("Synthesis text must not be empty", "empty-text")
-        if len(text) > self.max_text_chars:
-            return await self._fail("Synthesis text exceeds the configured limit", "text-too-long")
         if not self._is_supported_text_format(synthesize.text_format):
             return await self._fail(
                 "Only plain text synthesis is supported",
                 "unsupported-text-format",
             )
+        if len(text) > self.max_text_chars:
+            return await self._fail(_ERR_TEXT_TOO_LONG, "text-too-long")
+        try:
+            normalized = self._normalize_for_limit(text, voice_name)
+        except Exception:
+            _LOGGER.exception("TTS text normalization failed")
+            return await self._fail("Speech synthesis failed", "inference-failed")
+        if len(normalized) > self.max_text_chars:
+            return await self._fail(_ERR_TEXT_TOO_LONG, "text-too-long")
 
         _LOGGER.info(
             "Starting TTS request: text_chars=%d, voice=%s",
-            len(text),
+            len(normalized),
             voice_name or "default",
         )
         request_started = perf_counter()
-        production = await self._synthesize(text, voice_name)
+        production = await self._synthesize(normalized, voice_name)
         success = production is not None
         audio_seconds = (
             production.total_bytes
@@ -653,7 +775,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
         _LOGGER.info(
             "Completed TTS request: text_chars=%d voice=%s success=%s audio_seconds=%.3f "
             "engine_ms=%.3f handle_ms=%.3f real_time_factor=%.3f",
-            len(text),
+            len(normalized),
             voice_name or "default",
             success,
             audio_seconds,
@@ -715,23 +837,51 @@ class TTSEventHandler(SafeAsyncEventHandler):
             )
 
         self.stream_chunk_count += 1
-        self.stream_text_chars += len(stream_chunk.text)
-        if self.stream_text_chars > self.max_text_chars:
-            return await self._fail_stream(
-                "Synthesis text exceeds the configured limit",
-                "text-too-long",
-            )
+        raw_stream_chars = self.stream_text_chars + len(stream_chunk.text)
+        if raw_stream_chars > self.max_text_chars:
+            self.stream_text_chars = raw_stream_chars
+            return await self._fail_stream(_ERR_TEXT_TOO_LONG, "text-too-long")
+        self.stream_text_chars = raw_stream_chars
 
         detector = self.sentence_boundary
-        for clause, separator in detector.add_chunk_with_separators(stream_chunk.text):
+        clauses = detector.add_chunk_with_separators(stream_chunk.text)
+        if not clauses:
+            return True
+
+        try:
+            normalized_clauses = [
+                (
+                    self._normalize_for_limit(clause, self.stream_voice_name),
+                    (
+                        self._normalize_for_limit(separator, self.stream_voice_name)
+                        if separator
+                        else ""
+                    ),
+                    separator,
+                )
+                for clause, separator in clauses
+            ]
+        except Exception:
+            _LOGGER.exception("TTS stream text normalization failed")
+            return await self._fail_stream("Speech synthesis failed", "inference-failed")
+
+        normalized_clause_chars = sum(
+            len(clause) + len(normalized_separator)
+            for clause, normalized_separator, _ in normalized_clauses
+        )
+        if self.stream_normalized_chars + normalized_clause_chars > self.max_text_chars:
+            return await self._fail_stream(_ERR_TEXT_TOO_LONG, "text-too-long")
+
+        self.stream_normalized_chars += normalized_clause_chars
+        for normalized_clause, _, separator in normalized_clauses:
             self.stream_segment_count += 1
             _LOGGER.debug(
                 "TTS step=sentence-ready segment=%d text_chars=%d",
                 self.stream_segment_count,
-                len(clause),
+                len(normalized_clause),
             )
             if not await self._synthesize(
-                clause,
+                normalized_clause,
                 self.stream_voice_name,
                 send_start=not self.stream_audio_started,
                 send_stop=False,
@@ -763,17 +913,40 @@ class TTSEventHandler(SafeAsyncEventHandler):
         )
         if final_text:
             clause_pairs = StreamClauseDetector.split_clause_text_with_separators(final_text)
-            for idx, (clause, separator) in enumerate(clause_pairs):
+            try:
+                normalized_clauses = [
+                    (
+                        self._normalize_for_limit(clause, self.stream_voice_name),
+                        (
+                            self._normalize_for_limit(separator, self.stream_voice_name)
+                            if separator
+                            else ""
+                        ),
+                        separator,
+                    )
+                    for clause, separator in clause_pairs
+                ]
+            except Exception:
+                _LOGGER.exception("TTS final stream text normalization failed")
+                return await self._fail_stream("Speech synthesis failed", "inference-failed")
+            normalized_clause_chars = sum(
+                len(clause) + len(normalized_separator)
+                for clause, normalized_separator, _ in normalized_clauses
+            )
+            if self.stream_normalized_chars + normalized_clause_chars > self.max_text_chars:
+                return await self._fail_stream(_ERR_TEXT_TOO_LONG, "text-too-long")
+            self.stream_normalized_chars += normalized_clause_chars
+            for idx, (normalized_clause, _, separator) in enumerate(normalized_clauses):
                 self.stream_segment_count += 1
                 is_last_clause = idx == len(clause_pairs) - 1
                 _LOGGER.debug(
                     "TTS step=sentence-ready segment=%d text_chars=%d final=%s",
                     self.stream_segment_count,
-                    len(clause),
+                    len(normalized_clause),
                     is_last_clause,
                 )
                 if not await self._synthesize(
-                    clause,
+                    normalized_clause,
                     self.stream_voice_name,
                     send_start=not self.stream_audio_started,
                     send_stop=is_last_clause,
@@ -831,6 +1004,15 @@ class TTSEventHandler(SafeAsyncEventHandler):
     def _is_supported_text_format(text_format: object) -> bool:
         """Return whether the requested Wyoming text format is supported."""
         return text_format in (None, "text", SynthesizeTextFormat.TEXT)
+
+    def _normalize_for_limit(self, text: str, voice_name: str | None) -> str:
+        """Use the selected engine's normalizer when it exposes one."""
+        if not text or not isinstance(self.tts, _NormalizedTTSEngine):
+            return text
+        normalized = self.tts.normalize(text, voice=voice_name)
+        if not isinstance(normalized, str):
+            raise TypeError("TTS normalizer must return text")
+        return normalized
 
     def _resolve_voice_name(self, voice: SynthesizeVoice | None) -> str | None:
         """Validate Wyoming voice selectors and resolve a preset voice name."""
@@ -1229,12 +1411,18 @@ class TTSEventHandler(SafeAsyncEventHandler):
             production.inference_api = "infer_stream"
             _LOGGER.debug("TTS step=inference-start api=%s", production.inference_api)
             engine_started = perf_counter()
+
+            def infer_normalized() -> Iterator[np.ndarray]:
+                """Dispatch already-normalized text when the engine supports it."""
+                if isinstance(self.tts, _NormalizedTTSEngine):
+                    production.inference_api = "infer_stream_normalized"
+                    return self.tts.infer_stream_normalized(text, voice=voice_name)
+                return self.tts.infer_stream(text, voice=voice_name)
+
             try:
                 iterator = await run_inference(
                     self.inference_executor,
-                    self.tts.infer_stream,
-                    text,
-                    voice=voice_name,
+                    infer_normalized,
                 )
             finally:
                 production.engine_seconds += perf_counter() - engine_started
@@ -1394,6 +1582,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
         self.stream_chunk_count = 0
         self.stream_segment_count = 0
         self.stream_text_chars = 0
+        self.stream_normalized_chars = 0
         self.stream_audio_bytes = 0
         self.stream_queue_seconds = 0.0
         self.stream_engine_seconds = 0.0
@@ -1542,6 +1731,9 @@ def initialize_tts(
     model_dir: Path,
     num_threads: int = 0,
     voice: NghiTtsVoiceSpec = DEFAULT_NGHITTS_VOICE,
+    *,
+    normalize_fn: Callable[[str], str] | None = normalize_vi_text,
+    max_text_chars: int | None = None,
 ) -> TTSEngine:
     """Initialize one shared NghiTTS engine from required local assets."""
     model_path = model_dir / NghiTtsFile.MODEL
@@ -1582,7 +1774,12 @@ def initialize_tts(
             max_num_sentences=1,
         )
     )
-    engine = NghiTTSEngine(native_tts, voice)
+    engine = NghiTTSEngine(
+        native_tts,
+        voice,
+        normalize_fn=normalize_fn,
+        max_text_chars=max_text_chars,
+    )
     _LOGGER.info(
         "Initialized NghiTTS: voice=%s sample_rate=%d duration_ms=%.3f",
         voice.name,
@@ -1596,6 +1793,9 @@ def initialize_tts_voices(
     model_root: Path,
     voices: tuple[NghiTtsVoiceSpec, ...],
     num_threads: int = 0,
+    *,
+    normalize_fn: Callable[[str], str] | None = normalize_vi_text,
+    max_text_chars: int | None = None,
 ) -> TTSEngine:
     """Initialize and combine all configured voices from voice-specific directories."""
     if not voices:
@@ -1603,7 +1803,13 @@ def initialize_tts_voices(
     engines: list[NghiTTSEngine] = []
     try:
         for voice in voices:
-            engine = initialize_tts(model_root / voice.id, num_threads, voice)
+            engine = initialize_tts(
+                model_root / voice.id,
+                num_threads,
+                voice,
+                normalize_fn=normalize_fn,
+                max_text_chars=max_text_chars,
+            )
             if not isinstance(engine, NghiTTSEngine):
                 raise TypeError("initialize_tts returned an incompatible engine")
             engines.append(engine)

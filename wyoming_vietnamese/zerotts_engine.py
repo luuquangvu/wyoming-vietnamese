@@ -920,13 +920,26 @@ class ZeroTtsGgmlEngine:
             ValueError: If the requested voice is unsupported.
             RuntimeError: If the GGML context is closed or native generation fails.
         """
+        yield from self.infer_stream_normalized(
+            self.normalize(text, voice=voice),
+            voice=voice,
+            seed=seed,
+        )
+
+    def infer_stream_normalized(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+        seed: int | None = None,
+    ) -> Iterator[np.ndarray]:
+        """Yield audio for text that has already passed through the configured normalizer."""
         if self._ctx is None:
             raise RuntimeError("ZeroTTS GGML context is closed")
 
         self._rng = np.random.default_rng(self._seed if seed is None else seed)
 
-        norm_text = text if self._normalize_fn is None else self._normalize_fn(text)
-        text_tokens = self._tokenizer(norm_text)
+        text_tokens = self._tokenizer(text)
         text_ids = np.ascontiguousarray(text_tokens, dtype=np.int32)
         if len(text_ids) == 0:
             return
@@ -967,6 +980,11 @@ class ZeroTtsGgmlEngine:
                     yield audio_out
         finally:
             stream.close()
+
+    def normalize(self, text: str, *, voice: str | None = None) -> str:
+        """Return text after the normalizer used by inference."""
+        del voice
+        return text if self._normalize_fn is None else self._normalize_fn(text)
 
     def close(self) -> None:
         """Release native model resources and tensor buffers."""
