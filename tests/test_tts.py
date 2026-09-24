@@ -42,6 +42,7 @@ from wyoming_vietnamese.const import (
     ZeroTtsFile,
 )
 from wyoming_vietnamese.tts import (
+    _PREFIX_ABBR,
     MultiVoiceTTSEngine,
     NghiTTSEngine,
     StreamClauseDetector,
@@ -779,8 +780,8 @@ async def test_tts_enforces_stream_text_limit() -> None:
     """Test tts enforces stream text limit."""
     handler, writer = make_handler(max_text_chars=5)
     assert await handler.handle_event(SynthesizeStart().event()) is True
-    assert await handler.handle_event(SynthesizeChunk(text="123").event()) is True
-    assert await handler.handle_event(SynthesizeChunk(text="456").event()) is False
+    assert await handler.handle_event(SynthesizeChunk(text="xin").event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text=" chào").event()) is False
     assert written_events(writer)[0].data["code"] == "text-too-long"
 
 
@@ -1279,6 +1280,194 @@ def test_nghitts_adapter_streams_callbacks_and_validates_voice() -> None:
         engine.infer_stream("Xin chào.")
 
 
+def test_nghitts_adapter_normalizes_vietnamese_text() -> None:
+    """Test NghiTTS normalizes numbers, dates, times, and abbreviations using ZeroTTS normalizer."""
+    native = FakeSherpaTTS()
+    engine = NghiTTSEngine(native, DEFAULT_NGHITTS_VOICE)
+
+    list(engine.infer_stream("Ngày 23/8 lúc 15h30, TP.HCM tăng 12,5%."))
+    assert len(native.calls) == 1
+    normalized_text, sid, speed = native.calls[0]
+    assert sid == 0
+    assert speed == 1.0
+    assert normalized_text == (
+        "Ngày hai mươi ba tháng tám lúc mười lăm giờ ba mươi phút, "
+        "Thành phố Hồ Chí Minh tăng mười hai phẩy năm phần trăm."
+    )
+
+    # Test with custom normalizer
+    custom_native = FakeSherpaTTS()
+    custom_engine = NghiTTSEngine(
+        custom_native, DEFAULT_NGHITTS_VOICE, normalize_fn=lambda t: f"NORM[{t}]"
+    )
+    list(custom_engine.infer_stream("Xin chào"))
+    assert custom_native.calls[0][0] == "NORM[Xin chào]"
+
+    # Test with normalizer disabled (normalize_fn=None)
+    raw_native = FakeSherpaTTS()
+    raw_engine = NghiTTSEngine(raw_native, DEFAULT_NGHITTS_VOICE, normalize_fn=None)
+    list(raw_engine.infer_stream("Ngày 23/8 lúc 15h30"))
+    assert raw_native.calls[0][0] == "Ngày 23/8 lúc 15h30"
+
+
+def test_nghitts_adapter_enforces_max_text_chars() -> None:
+    """Test NghiTTS rejects text expanding past max_text_chars before creating audio iterator."""
+    native = FakeSherpaTTS()
+    engine = NghiTTSEngine(native, DEFAULT_NGHITTS_VOICE, max_text_chars=30)
+    with pytest.raises(ValueError, match="Normalized synthesis text exceeds the limit"):
+        list(engine.infer_stream("Ngày 23/8 lúc 15h30"))
+    assert native.calls == []
+
+
+async def test_tts_enforces_limit_on_expanded_normalized_text() -> None:
+    """Test synthesis fails when raw text is within limit but expands past max_text_chars."""
+    # "23/8 lúc 15h30" is 14 chars, which is <= 20 chars
+    # Normalized: "hai mươi ba tháng tám lúc mười lăm giờ ba mươi phút" (51 chars > 20)
+    handler, writer = make_handler(
+        NghiTTSEngine(FakeSherpaTTS(), DEFAULT_NGHITTS_VOICE),
+        max_text_chars=20,
+    )
+    assert await handler.handle_event(Synthesize(text="23/8 lúc 15h30").event()) is False
+    events = written_events(writer)
+    assert events[0].type == "error"
+    assert events[0].data["code"] == "text-too-long"
+
+
+async def test_tts_enforces_stream_limit_on_expanded_clause() -> None:
+    """Test stream fails when an individual clause expands past max_text_chars."""
+    handler, writer = make_handler(
+        NghiTTSEngine(FakeSherpaTTS(), DEFAULT_NGHITTS_VOICE),
+        max_text_chars=20,
+    )
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    # "23/8 lúc 15h30, " ends on a clause boundary and expands to 52 chars > 20
+    assert await handler.handle_event(SynthesizeChunk(text="23/8 lúc 15h30, ").event()) is False
+    events = written_events(writer)
+    assert any(e.type == "error" and e.data["code"] == "text-too-long" for e in events)
+
+
+async def test_tts_enforces_stream_limit_on_expanded_final_text() -> None:
+    """Test stream fails at stop when buffered unpunctuated text expands past max_text_chars."""
+    handler, writer = make_handler(
+        NghiTTSEngine(FakeSherpaTTS(), DEFAULT_NGHITTS_VOICE),
+        max_text_chars=20,
+    )
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    # "23/8 lúc 15h30" is 14 chars <= 20, expands to 51 chars > 20
+    assert await handler.handle_event(SynthesizeChunk(text="23/8 lúc 15h30").event()) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is False
+    events = written_events(writer)
+    assert any(e.type == "error" and e.data["code"] == "text-too-long" for e in events)
+
+
+async def test_tts_enforces_stream_limit_including_normalized_separators() -> None:
+    """Test stream accounting counts normalized separators across clause boundaries."""
+
+    def custom_norm(text: str) -> str:
+        """Replace digit 1 with 4 characters for predictable length testing."""
+        return text.replace("1", "abcd")
+
+    engine = NghiTTSEngine(
+        FakeSherpaTTS(),
+        DEFAULT_NGHITTS_VOICE,
+        normalize_fn=custom_norm,
+    )
+    # "1. 1." produces ("1.", " ") at chunk boundary and ("1.", "") at stream stop.
+    # Clause "1." normalizes to "abcd." (5 chars). Separator " " normalizes to " " (1 char).
+    # Total normalized chars = 5 + 1 + 5 + 0 = 11 chars.
+    # With max_text_chars=10, the stream must fail with text-too-long.
+    handler, writer = make_handler(engine, max_text_chars=10)
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="1. 1.").event()) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is False
+    events = written_events(writer)
+    assert any(e.type == "error" and e.data["code"] == "text-too-long" for e in events)
+
+    # With max_text_chars=11, the stream succeeds.
+    handler_ok, _ = make_handler(engine, max_text_chars=11)
+    assert await handler_ok.handle_event(SynthesizeStart().event()) is True
+    assert await handler_ok.handle_event(SynthesizeChunk(text="1. 1.").event()) is True
+    assert await handler_ok.handle_event(SynthesizeStop().event()) is True
+
+
+async def test_tts_stream_chunks_skip_pending_normalization() -> None:
+    """Test streaming chunks do not eagerly normalize the pending buffer on the event loop."""
+    normalize_calls: list[str] = []
+
+    def tracking_normalizer(text: str) -> str:
+        """Record and return incoming text for normalization tracking."""
+        normalize_calls.append(text)
+        return text
+
+    engine = NghiTTSEngine(
+        FakeSherpaTTS(),
+        DEFAULT_NGHITTS_VOICE,
+        normalize_fn=tracking_normalizer,
+    )
+    handler, _writer = make_handler(engine, max_text_chars=100)
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="xin").event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text=" chào").event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text=" các bạn").event()) is True
+    # No clause was emitted, so normalizer must not have been called during chunk buffering
+    assert not normalize_calls
+    # Stopping flushes the remaining buffer, normalizing exactly once
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+    assert normalize_calls == ["xin chào các bạn"]
+
+
+@pytest.mark.parametrize(
+    ("full_text", "chunk1", "chunk2"),
+    [
+        ("TP.HCM", "TP.", "HCM"),
+        ("TP. HCM", "TP.", " HCM"),
+        (
+            "Thành phố Hồ Chí Minh (viết tắt TP. HCM)",
+            "Thành phố Hồ Chí Minh (viết tắt TP.",
+            " HCM)",
+        ),
+        (
+            "Thành phố Hồ Chí Minh (viết tắt TP.HCM)",
+            "Thành phố Hồ Chí Minh (viết tắt TP.",
+            "HCM)",
+        ),
+        (
+            "Tôi sống ở TP.HCM đã nhiều năm.",
+            "Tôi sống ở TP.",
+            "HCM đã nhiều năm.",
+        ),
+        (
+            "Tôi sống ở TP. HCM đã nhiều năm.",
+            "Tôi sống ở TP.",
+            " HCM đã nhiều năm.",
+        ),
+    ],
+)
+async def test_tts_stream_and_oneshot_normalize_dotted_abbreviations_identically(
+    full_text: str,
+    chunk1: str,
+    chunk2: str,
+) -> None:
+    """Test one-shot and stream synthesis normalize dotted abbreviations to identical text."""
+    native_one_shot = FakeSherpaTTS()
+    engine_one_shot = NghiTTSEngine(native_one_shot, DEFAULT_NGHITTS_VOICE)
+    handler_one_shot, _ = make_handler(engine_one_shot, max_text_chars=500)
+    assert await handler_one_shot.handle_event(Synthesize(text=full_text).event()) is False
+
+    native_stream = FakeSherpaTTS()
+    engine_stream = NghiTTSEngine(native_stream, DEFAULT_NGHITTS_VOICE)
+    handler_stream, _ = make_handler(engine_stream, max_text_chars=500)
+    assert await handler_stream.handle_event(SynthesizeStart().event()) is True
+    assert await handler_stream.handle_event(SynthesizeChunk(text=chunk1).event()) is True
+    assert await handler_stream.handle_event(SynthesizeChunk(text=chunk2).event()) is True
+    assert await handler_stream.handle_event(SynthesizeStop().event()) is True
+
+    one_shot_texts = [call[0] for call in native_one_shot.calls]
+    stream_texts = [call[0] for call in native_stream.calls]
+    assert stream_texts == one_shot_texts
+    assert stream_texts != []
+
+
 @pytest.mark.parametrize(
     ("sample_rate", "speakers", "message"),
     [
@@ -1374,6 +1563,37 @@ def test_initialize_tts_voices_uses_voice_directories(
     assert [item.args for item in initialize.call_args_list] == [
         (tmp_path / DEFAULT_NGHITTS_VOICE.id, 2, DEFAULT_NGHITTS_VOICE),
         (tmp_path / second_voice.id, 2, second_voice),
+    ]
+
+
+def test_initialize_tts_voices_forwards_normalization_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test initialize_tts_voices passes normalize_fn and max_text_chars to each voice engine."""
+    second_voice = get_voice("chieu-thanh")
+    engines = (
+        NghiTTSEngine(FakeSherpaTTS(), DEFAULT_NGHITTS_VOICE),
+        NghiTTSEngine(FakeSherpaTTS(), second_voice),
+    )
+    initialize = Mock(side_effect=engines)
+    monkeypatch.setattr("wyoming_vietnamese.tts.initialize_tts", initialize)
+
+    def custom_norm(text: str) -> str:
+        """Echo text for custom normalizer testing."""
+        return text
+
+    combined = initialize_tts_voices(
+        tmp_path,
+        (DEFAULT_NGHITTS_VOICE, second_voice),
+        num_threads=2,
+        normalize_fn=custom_norm,
+        max_text_chars=500,
+    )
+
+    assert isinstance(combined, MultiVoiceTTSEngine)
+    assert [item.kwargs for item in initialize.call_args_list] == [
+        {"normalize_fn": custom_norm, "max_text_chars": 500},
+        {"normalize_fn": custom_norm, "max_text_chars": 500},
     ]
 
 
@@ -1531,6 +1751,92 @@ def test_stream_clause_detector_waits_for_a_token_split_across_chunks() -> None:
     assert not list(detector.add_chunk("Bạn hãy kết nối Wi-"))
     assert list(detector.add_chunk("Fi trước đã. Rồi tiếp")) == ["Bạn hãy kết nối Wi-Fi trước đã."]
     assert detector.finish() == "Rồi tiếp"
+
+
+def test_stream_clause_detector_keeps_dotted_abbreviations_intact() -> None:
+    """Test dotted and prefix abbreviations are not prematurely split into separate clauses."""
+    wikipedia_text = "Thành phố Hồ Chí Minh (viết tắt TP. HCM)"
+    assert StreamClauseDetector.split_clause_text(wikipedia_text) == [wikipedia_text]
+    assert StreamClauseDetector.split_clause_text("Thành phố Hồ Chí Minh (viết tắt TP.HCM)") == [
+        "Thành phố Hồ Chí Minh (viết tắt TP.HCM)"
+    ]
+    assert StreamClauseDetector.split_clause_text("TP.HCM") == ["TP.HCM"]
+    assert StreamClauseDetector.split_clause_text("TP. HCM") == ["TP. HCM"]
+    assert StreamClauseDetector.split_clause_text("Tôi sống ở TP.HCM đã nhiều năm") == [
+        "Tôi sống ở TP.HCM đã nhiều năm"
+    ]
+    assert StreamClauseDetector.split_clause_text("Tôi sống ở TP. HCM đã nhiều năm") == [
+        "Tôi sống ở TP. HCM đã nhiều năm"
+    ]
+    assert StreamClauseDetector.split_clause_text("Địa chỉ ở Q. 1 và P. 5 rất gần") == [
+        "Địa chỉ ở Q. 1 và P. 5 rất gần"
+    ]
+    assert StreamClauseDetector.split_clause_text("Bác sĩ BS.CK1 và GS.TS đã đến") == [
+        "Bác sĩ BS.CK1 và GS.TS đã đến"
+    ]
+
+    detector = StreamClauseDetector()
+    assert not list(detector.add_chunk("Thành phố Hồ Chí Minh (viết tắt TP."))
+    assert not list(detector.add_chunk(" HCM)"))
+    assert detector.finish() == wikipedia_text
+
+    detector2 = StreamClauseDetector()
+    assert not list(detector2.add_chunk("Tôi ở TP."))
+    assert list(detector2.add_chunk("HCM hôm nay. Rồi tiếp")) == ["Tôi ở TP.HCM hôm nay."]
+    assert detector2.finish() == "Rồi tiếp"
+
+    detector3 = StreamClauseDetector()
+    assert not list(detector3.add_chunk("Tôi ở TP."))
+    assert list(detector3.add_chunk(" HCM hôm nay. Rồi tiếp")) == ["Tôi ở TP. HCM hôm nay."]
+    assert detector3.finish() == "Rồi tiếp"
+
+
+def test_stream_clause_detector_splits_adjacent_letters_without_abbreviation() -> None:
+    """Test ordinary unspaced sentences such as 'Chào.Bạn khỏe.' remain sentence boundaries."""
+    assert StreamClauseDetector.split_clause_text("Chào.Bạn khỏe.") == ["Chào.", "Bạn khỏe."]
+    assert StreamClauseDetector.split_clause_text("Tôi đi học.Hôm nay trời đẹp.") == [
+        "Tôi đi học.",
+        "Hôm nay trời đẹp.",
+    ]
+    assert StreamClauseDetector.split_clause_text("Tôi sống ở TP.HCM.Bạn khỏe không?") == [
+        "Tôi sống ở TP.HCM.",
+        "Bạn khỏe không?",
+    ]
+    assert StreamClauseDetector.split_clause_text("Đi TP. sau đó quay lại.") == [
+        "Đi TP.",
+        "sau đó quay lại.",
+    ]
+    assert StreamClauseDetector.split_clause_text("Anh ấy đến TP. ở đó rất đông người.") == [
+        "Anh ấy đến TP.",
+        "ở đó rất đông người.",
+    ]
+
+    detector = StreamClauseDetector()
+    assert list(detector.add_chunk("Chào.")) == ["Chào."]
+    assert list(detector.add_chunk("Bạn khỏe.")) == ["Bạn khỏe."]
+    assert detector.finish() == ""
+
+
+def test_prefix_abbreviations_align_with_zerotts() -> None:
+    """Verify local administrative prefix abbreviations stay aligned with ZeroTTS helper."""
+    from zerotts.text_norm.vi_normalizer import _PREFIX_ABBR as UPSTREAM_PREFIX_ABBR
+
+    assert frozenset(UPSTREAM_PREFIX_ABBR) == _PREFIX_ABBR
+
+
+@pytest.mark.parametrize("prefix", sorted(_PREFIX_ABBR))
+def test_each_prefix_abbreviation_joins_with_proper_noun_and_number(prefix: str) -> None:
+    """Verify configured prefix abbreviations join before uppercase and digits."""
+    assert StreamClauseDetector.split_clause_text(f"Địa điểm tại {prefix}. 1 rất gần.") == [
+        f"Địa điểm tại {prefix}. 1 rất gần."
+    ]
+    assert StreamClauseDetector.split_clause_text(f"Đang ở {prefix}. Hà Nội hôm nay.") == [
+        f"Đang ở {prefix}. Hà Nội hôm nay."
+    ]
+    assert StreamClauseDetector.split_clause_text(f"Đến {prefix}. sau đó quay lại.") == [
+        f"Đến {prefix}.",
+        "sau đó quay lại.",
+    ]
 
 
 def test_split_clause_text_merges_a_short_tail_without_rewriting_it() -> None:
