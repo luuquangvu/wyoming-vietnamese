@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import re
 import shutil
+import signal
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, call, patch
@@ -57,11 +58,21 @@ def test_build_zerotts_ggml_lib_success(tmp_path: Path, native: bool) -> None:
             out_file.write_bytes(b"ELF_FAKE")
         return Mock(returncode=0)
 
+    mock_cmake_proc = Mock()
+    mock_cmake_proc.communicate.return_value = (b"", b"")
+    mock_cmake_proc.returncode = 0
+    mock_cmake_proc.pid = 12345
+
     with (
         patch("tools.build_zerotts.subprocess.run", side_effect=fake_subprocess_run),
+        patch("tools.build_zerotts.subprocess.Popen", return_value=mock_cmake_proc) as mock_popen,
         patch("tools.build_zerotts.ctypes.CDLL") as mock_cdll,
     ):
         result = _build_zerotts_ggml_lib(target_dir, native=native)
+        mock_popen.assert_called_once()
+        popen_args, popen_kwargs = mock_popen.call_args
+        assert popen_args[0][:2] == ["cmake", "--build"]
+        assert popen_kwargs.get("start_new_session") is True
         assert result.is_file()
         assert result.name == ZeroTtsFile.LIBZEROTTS_SO
         assert result.parent == target_dir
@@ -139,8 +150,10 @@ def test_build_zerotts_ggml_lib_loadability_failure(tmp_path: Path) -> None:
             out_file.write_bytes(b"ELF_FAKE")
         return Mock(returncode=0)
 
+    mock_cmake_proc = Mock(communicate=Mock(return_value=(b"", b"")), returncode=0, pid=12345)
     with (
         patch("tools.build_zerotts.subprocess.run", side_effect=fake_subprocess_run),
+        patch("tools.build_zerotts.subprocess.Popen", return_value=mock_cmake_proc),
         patch(
             "tools.build_zerotts.ctypes.CDLL",
             side_effect=OSError("libggml-cpu.so.0: cannot open shared object file"),
@@ -170,8 +183,10 @@ def test_build_zerotts_ggml_lib_preserves_existing_artifacts_on_loadability_fail
             out_file.write_bytes(b"NEW_BROKEN_LIB")
         return Mock(returncode=0)
 
+    mock_cmake_proc = Mock(communicate=Mock(return_value=(b"", b"")), returncode=0, pid=12345)
     with (
         patch("tools.build_zerotts.subprocess.run", side_effect=fake_subprocess_run),
+        patch("tools.build_zerotts.subprocess.Popen", return_value=mock_cmake_proc),
         patch(
             "tools.build_zerotts.ctypes.CDLL",
             side_effect=OSError("symbol not found"),
@@ -219,12 +234,14 @@ def test_resolve_zerotts_ggml_lib_cannot_select_failed_build_output(
             out_file.write_bytes(b"NEW_BROKEN_LIB")
         return Mock(returncode=0)
 
+    mock_cmake_proc = Mock(communicate=Mock(return_value=(b"", b"")), returncode=0, pid=12345)
     with (
         patch(
             "wyoming_vietnamese.zerotts_engine._build_zerotts_ggml_lib",
             side_effect=lambda *_args, **_kwargs: _build_zerotts_ggml_lib(target_dir),
         ),
         patch("tools.build_zerotts.subprocess.run", side_effect=fake_subprocess_run),
+        patch("tools.build_zerotts.subprocess.Popen", return_value=mock_cmake_proc),
         patch(
             "tools.build_zerotts.ctypes.CDLL",
             side_effect=OSError("symbol lookup error"),
@@ -300,6 +317,44 @@ def test_publish_libraries_rollback_on_failure(tmp_path: Path) -> None:
     ):
         _publish_libraries(staging_dir, target_dir)
 
+    assert existing_file.is_file()
+    assert existing_file.read_bytes() == b"OLD_GGML_BYTES"
+    published_zerotts = target_dir / ZeroTtsFile.LIBZEROTTS_SO
+    assert not published_zerotts.exists()
+
+
+def test_publish_libraries_rollback_on_system_exit(tmp_path: Path) -> None:
+    """Test _publish_libraries restores old files and cleans published files on SystemExit."""
+    from tools.build_zerotts import _publish_libraries
+
+    staging_dir = tmp_path / "stage"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    target_dir = tmp_path / "target"
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    existing_file = target_dir / "libggml-cpu.so.0.1.0"
+    existing_file.write_bytes(b"OLD_GGML_BYTES")
+
+    staged_ggml = staging_dir / "libggml-cpu.so.0.1.0"
+    staged_ggml.write_bytes(b"NEW_GGML_BYTES")
+
+    staged_zerotts = staging_dir / ZeroTtsFile.LIBZEROTTS_SO
+    staged_zerotts.write_bytes(b"NEW_ZEROTTS_BYTES")
+
+    from tools.build_zerotts import _publish_single_file as real_publish
+
+    def fake_publish_single_file(src: Path, dst_dir: Path) -> None:
+        if src.name == ZeroTtsFile.LIBZEROTTS_SO:
+            raise SystemExit(143)
+        real_publish(src, dst_dir)
+
+    with (
+        patch("tools.build_zerotts._publish_single_file", side_effect=fake_publish_single_file),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        _publish_libraries(staging_dir, target_dir)
+
+    assert exc_info.value.code == 143
     assert existing_file.is_file()
     assert existing_file.read_bytes() == b"OLD_GGML_BYTES"
     published_zerotts = target_dir / ZeroTtsFile.LIBZEROTTS_SO
@@ -398,8 +453,10 @@ def test_format_process_error_variants() -> None:
 def test_build_zerotts_ggml_lib_missing_output(tmp_path: Path) -> None:
     """Test _build_zerotts_ggml_lib raises FileNotFoundError when binary is missing."""
     target_dir = tmp_path / "lib"
+    mock_cmake_proc = Mock(communicate=Mock(return_value=(b"", b"")), returncode=0, pid=12345)
     with (
         patch("tools.build_zerotts.subprocess.run", return_value=Mock(returncode=0)),
+        patch("tools.build_zerotts.subprocess.Popen", return_value=mock_cmake_proc),
         pytest.raises(FileNotFoundError, match="not found after build"),
     ):
         _build_zerotts_ggml_lib(target_dir)
@@ -930,8 +987,10 @@ def test_build_zerotts_unique_temp_build_dir(tmp_path: Path) -> None:
             out_file.write_bytes(b"ELF_FAKE")
         return Mock(returncode=0)
 
+    mock_cmake_proc = Mock(communicate=Mock(return_value=(b"", b"")), returncode=0, pid=12345)
     with (
         patch("tools.build_zerotts.subprocess.run", side_effect=fake_subprocess_run),
+        patch("tools.build_zerotts.subprocess.Popen", return_value=mock_cmake_proc),
         patch("tools.build_zerotts.ctypes.CDLL"),
     ):
         result = build_zerotts_ggml_lib(target_dir)
@@ -2064,17 +2123,19 @@ def test_is_toolchain_variant_supported() -> None:
     assert _is_toolchain_variant_supported(ZeroTtsVariant.COMPAT) is True
     assert _is_toolchain_variant_supported(ZeroTtsVariant.NATIVE) is True
 
+    tested_variants = (
+        ZeroTtsVariant.SSE4,
+        ZeroTtsVariant.AVX,
+        ZeroTtsVariant.AVX512,
+        ZeroTtsVariant.ARM_DOTPROD,
+    )
     with patch("tools.build_zerotts.subprocess.run", return_value=Mock(returncode=0)):
-        assert _is_toolchain_variant_supported(ZeroTtsVariant.SSE4) is True
-        assert _is_toolchain_variant_supported(ZeroTtsVariant.AVX) is True
-        assert _is_toolchain_variant_supported(ZeroTtsVariant.AVX512) is True
-        assert _is_toolchain_variant_supported(ZeroTtsVariant.ARM_DOTPROD) is True
+        for var in tested_variants:
+            assert _is_toolchain_variant_supported(var) is True
 
     with patch("tools.build_zerotts.subprocess.run", return_value=Mock(returncode=1)):
-        assert _is_toolchain_variant_supported(ZeroTtsVariant.SSE4) is False
-        assert _is_toolchain_variant_supported(ZeroTtsVariant.AVX) is False
-        assert _is_toolchain_variant_supported(ZeroTtsVariant.AVX512) is False
-        assert _is_toolchain_variant_supported(ZeroTtsVariant.ARM_DOTPROD) is False
+        for var in tested_variants:
+            assert _is_toolchain_variant_supported(var) is False
 
     with patch("tools.build_zerotts.subprocess.run", side_effect=OSError("g++ not found")):
         assert _is_toolchain_variant_supported(ZeroTtsVariant.AVX512) is False
@@ -2147,12 +2208,19 @@ def test_run_zerotts_build_script_flags(
 
     recorded_cmd: list[str] = []
 
-    def fake_subprocess_run(cmd: list[str], **kwargs: object) -> Mock:
+    def fake_subprocess_popen(cmd: list[str], **kwargs: object) -> Mock:
         nonlocal recorded_cmd
         recorded_cmd = list(cmd)
-        return Mock(returncode=0, stdout="", stderr="")
+        mock_proc = Mock()
+        mock_proc.pid = 12345
+        mock_proc.communicate.return_value = ("", "")
+        mock_proc.returncode = 0
+        return mock_proc
 
-    with patch("wyoming_vietnamese.zerotts_engine.subprocess.run", side_effect=fake_subprocess_run):
+    with patch(
+        "wyoming_vietnamese.zerotts_engine.subprocess.Popen",
+        side_effect=fake_subprocess_popen,
+    ):
         res = _run_zerotts_build_script(build_script, target_dir, variant=variant, native=native)
         assert res == fake_lib
         assert expected_flag in recorded_cmd
@@ -2173,12 +2241,19 @@ def test_run_zerotts_build_script_publish_subdir(tmp_path: Path) -> None:
 
     recorded_cmd: list[str] = []
 
-    def fake_subprocess_run(cmd: list[str], **kwargs: object) -> Mock:
+    def fake_subprocess_popen(cmd: list[str], **kwargs: object) -> Mock:
         nonlocal recorded_cmd
         recorded_cmd = list(cmd)
-        return Mock(returncode=0, stdout="", stderr="")
+        mock_proc = Mock()
+        mock_proc.pid = 12345
+        mock_proc.communicate.return_value = ("", "")
+        mock_proc.returncode = 0
+        return mock_proc
 
-    with patch("wyoming_vietnamese.zerotts_engine.subprocess.run", side_effect=fake_subprocess_run):
+    with patch(
+        "wyoming_vietnamese.zerotts_engine.subprocess.Popen",
+        side_effect=fake_subprocess_popen,
+    ):
         res = _run_zerotts_build_script(
             build_script,
             target_dir,
@@ -2231,6 +2306,39 @@ def test_build_all_zerotts_variants_stale_variant_handling(
             assert ZeroTtsVariant.AVX512 not in results
             assert not stale_variant_dir.exists()
             assert not stale_lib.exists()
+
+
+def test_build_all_zerotts_variants_restores_quarantine_on_system_exit(
+    tmp_path: Path,
+) -> None:
+    """Test build_all_zerotts_variants restores quarantined dirs on SystemExit."""
+    from tools.build_zerotts import build_all_zerotts_variants
+
+    target_dir = tmp_path / "lib"
+    stale_variant_dir = target_dir / ZeroTtsVariant.AVX512
+    stale_variant_dir.mkdir(parents=True, exist_ok=True)
+    stale_lib = stale_variant_dir / ZeroTtsFile.LIBZEROTTS_SO
+    stale_lib.write_bytes(b"OLD_STALE_AVX512")
+
+    def fake_supported(variant: str) -> bool:
+        return variant != ZeroTtsVariant.AVX512
+
+    def fake_compile(*args: object, **kwargs: object) -> None:
+        raise SystemExit(143)
+
+    with (
+        patch("platform.machine", return_value="x86_64"),
+        patch("tools.build_zerotts._is_toolchain_variant_supported", side_effect=fake_supported),
+        patch("tools.build_zerotts._checkout_repo"),
+        patch("tools.build_zerotts._compile_libraries", side_effect=fake_compile),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        build_all_zerotts_variants(target_dir)
+
+    assert exc_info.value.code == 143
+    assert stale_variant_dir.exists()
+    assert stale_lib.exists()
+    assert stale_lib.read_bytes() == b"OLD_STALE_AVX512"
 
 
 def test_get_variant_build_flags_definitions_and_compiler_options() -> None:
@@ -2295,3 +2403,647 @@ def test_get_variant_build_flags_definitions_and_compiler_options() -> None:
         native_arm_cmake, native_arm_gxx = _get_variant_build_flags(ZeroTtsVariant.NATIVE)
         assert "-DGGML_NATIVE=ON" in native_arm_cmake
         assert "-mcpu=native" in native_arm_gxx
+
+
+def test_get_darwin_cpu_flags_timeout() -> None:
+    """Test get_darwin_cpu_flags suppresses subprocess.TimeoutExpired gracefully."""
+    from wyoming_vietnamese.cpu import get_darwin_cpu_flags
+
+    with (
+        patch("wyoming_vietnamese.cpu.platform.system", return_value="Darwin"),
+        patch("wyoming_vietnamese.cpu.platform.machine", return_value="arm64"),
+        patch(
+            "wyoming_vietnamese.cpu.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["sysctl"], timeout=5.0),
+        ),
+    ):
+        assert get_darwin_cpu_flags() == {"asimd"}
+
+    with (
+        patch("wyoming_vietnamese.cpu.platform.system", return_value="Darwin"),
+        patch("wyoming_vietnamese.cpu.platform.machine", return_value="x86_64"),
+        patch(
+            "wyoming_vietnamese.cpu.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["sysctl"], timeout=5.0),
+        ),
+    ):
+        assert get_darwin_cpu_flags() == set()
+
+
+def test_run_zerotts_build_script_timeout(tmp_path: Path) -> None:
+    """Test _run_zerotts_build_script raises RuntimeError on timeout and cleans workspace."""
+    from wyoming_vietnamese.zerotts_engine import (
+        _ZEROTTS_BUILD_TIMEOUT_SECONDS,
+        _run_zerotts_build_script,
+    )
+
+    build_script = tmp_path / "build_zerotts.py"
+    build_script.write_text("# dummy", encoding="utf-8")
+    target_dir = tmp_path / "lib"
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    stale_build_dir = target_dir / "_build_12345_temp123"
+    stale_build_dir.mkdir(parents=True, exist_ok=True)
+    stale_file = stale_build_dir / "temp.o"
+    stale_file.write_bytes(b"temp")
+
+    unrelated_build_dir = target_dir / "_build_99999_temp"
+    unrelated_build_dir.mkdir(parents=True, exist_ok=True)
+
+    mock_proc = Mock()
+    mock_proc.pid = 12345
+    mock_proc.communicate.side_effect = subprocess.TimeoutExpired(
+        cmd=["python"], timeout=_ZEROTTS_BUILD_TIMEOUT_SECONDS
+    )
+    mock_proc.wait.return_value = 0
+
+    with (
+        patch("wyoming_vietnamese.zerotts_engine.subprocess.Popen", return_value=mock_proc),
+        patch("wyoming_vietnamese.zerotts_engine.os.killpg") as mock_killpg,
+        pytest.raises(
+            RuntimeError,
+            match=f"ZeroTTS GGML build timed out after {_ZEROTTS_BUILD_TIMEOUT_SECONDS:g} seconds",
+        ),
+    ):
+        _run_zerotts_build_script(
+            build_script,
+            target_dir,
+            variant=ZeroTtsVariant.COMPAT,
+            native=False,
+        )
+
+    assert call(12345, signal.SIGTERM) in mock_killpg.call_args_list
+    assert not stale_build_dir.exists()
+    assert unrelated_build_dir.exists()
+
+
+def test_terminate_process_tree_escalates_to_sigkill() -> None:
+    """Test _terminate_process_tree sends SIGTERM first and escalates to SIGKILL on timeout."""
+    from wyoming_vietnamese.zerotts_engine import (
+        _SIGKILL_GRACE_PERIOD_SECONDS,
+        _terminate_process_tree,
+    )
+
+    mock_proc = Mock()
+    mock_proc.pid = 99999
+    mock_proc.wait.side_effect = [
+        subprocess.TimeoutExpired(cmd=["proc"], timeout=_SIGKILL_GRACE_PERIOD_SECONDS),
+        0,
+    ]
+
+    with (
+        patch("wyoming_vietnamese.zerotts_engine.os.killpg") as mock_killpg,
+        patch("wyoming_vietnamese.zerotts_engine._is_process_group_alive", return_value=True),
+    ):
+        _terminate_process_tree(mock_proc)
+        assert mock_killpg.call_args_list == [
+            call(99999, signal.SIGTERM),
+            call(99999, signal.SIGKILL),
+        ]
+
+
+def test_clean_zerotts_build_workspace(tmp_path: Path) -> None:
+    """Test _clean_zerotts_build_workspace removes transient files and restores rollback copies."""
+    from wyoming_vietnamese.zerotts_engine import _clean_zerotts_build_workspace
+
+    # Scratch directories for current build PID (123)
+    build_dir = tmp_path / "_build_123_temp456"
+    build_dir.mkdir(parents=True, exist_ok=True)
+    (build_dir / "obj.o").write_bytes(b"data")
+
+    build_all_dir = tmp_path / "_build_all_123_temp789"
+    build_all_dir.mkdir(parents=True, exist_ok=True)
+
+    # Scratch directory for concurrent build PID (999) - must NOT be touched
+    unrelated_build_dir = tmp_path / "_build_999_temp"
+    unrelated_build_dir.mkdir(parents=True, exist_ok=True)
+
+    # Temporary publish files for PID 123 vs PID 999
+    tmp_file_target = tmp_path / ".libzerotts.so.tmp.123"
+    tmp_file_target.write_bytes(b"tmp_123")
+    tmp_file_other = tmp_path / ".libzerotts.so.tmp.999"
+    tmp_file_other.write_bytes(b"tmp_999")
+
+    # Rollback files for PID 123 where destination is missing (should be restored)
+    bak_file_missing = tmp_path / ".libzerotts.so.bak.123"
+    bak_file_missing.write_bytes(b"PREVIOUS_VALID_LIB")
+
+    # Rollback directory for PID 123 where destination is missing (should be restored)
+    stale_dir_missing = tmp_path / ".avx2.stale.123"
+    stale_dir_missing.mkdir(parents=True, exist_ok=True)
+    (stale_dir_missing / "libzerotts.so").write_bytes(b"AVX2_LIB")
+
+    # Rollback file for PID 999 from another concurrent build (must NOT be touched)
+    bak_file_other = tmp_path / ".libggml.so.bak.999"
+    bak_file_other.write_bytes(b"OTHER_BAK")
+
+    # Regular unmanaged file (must NOT be touched)
+    other_file = tmp_path / "README.txt"
+    other_file.write_text("keep me", encoding="utf-8")
+
+    _clean_zerotts_build_workspace(tmp_path, pid=123)
+
+    # Scratch directories for PID 123 deleted, PID 999 preserved
+    assert not build_dir.exists()
+    assert not build_all_dir.exists()
+    assert unrelated_build_dir.exists()
+
+    # PID 123 tmp deleted, PID 999 tmp preserved
+    assert not tmp_file_target.exists()
+    assert tmp_file_other.exists()
+
+    # PID 123 missing files restored to their original names
+    restored_lib = tmp_path / ZeroTtsFile.LIBZEROTTS_SO
+    assert restored_lib.exists()
+    assert restored_lib.read_bytes() == b"PREVIOUS_VALID_LIB"
+    assert not bak_file_missing.exists()
+
+    restored_dir = tmp_path / ZeroTtsVariant.AVX2
+    assert restored_dir.exists()
+    assert (restored_dir / "libzerotts.so").read_bytes() == b"AVX2_LIB"
+    assert not stale_dir_missing.exists()
+
+    # PID 999 rollback and other files preserved
+    assert bak_file_other.exists()
+    assert other_file.exists()
+
+
+def test_run_zerotts_build_script_failure(tmp_path: Path) -> None:
+    """Test _run_zerotts_build_script raises RuntimeError on non-zero returncode."""
+    from wyoming_vietnamese.zerotts_engine import _run_zerotts_build_script
+
+    build_script = tmp_path / "build_zerotts.py"
+    build_script.write_text("# dummy", encoding="utf-8")
+    target_dir = tmp_path / "lib"
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    mock_proc = Mock()
+    mock_proc.pid = 12345
+    mock_proc.communicate.return_value = ("", "compiler error: syntax error")
+    mock_proc.returncode = 1
+
+    with (
+        patch("wyoming_vietnamese.zerotts_engine.subprocess.Popen", return_value=mock_proc),
+        pytest.raises(
+            RuntimeError,
+            match="Failed to build ZeroTTS GGML shared library: compiler error",
+        ),
+    ):
+        _run_zerotts_build_script(
+            build_script,
+            target_dir,
+            variant=ZeroTtsVariant.COMPAT,
+            native=False,
+        )
+
+
+def test_run_zerotts_build_script_invalid_variant(tmp_path: Path) -> None:
+    """Test _run_zerotts_build_script validates variant before execution."""
+    from wyoming_vietnamese.zerotts_engine import _run_zerotts_build_script
+
+    build_script = tmp_path / "build_zerotts.py"
+    build_script.write_text("# dummy", encoding="utf-8")
+    with pytest.raises(ValueError, match="Invalid ZeroTTS variant"):
+        _run_zerotts_build_script(
+            build_script,
+            tmp_path / "lib",
+            variant="invalid_variant_123",
+            native=False,
+        )
+
+
+def test_checkout_repo_timeout(tmp_path: Path) -> None:
+    """Test _checkout_repo passes network and local timeouts to git commands."""
+    from tools.build_zerotts import (
+        _GIT_LOCAL_TIMEOUT_SECONDS,
+        _GIT_NETWORK_TIMEOUT_SECONDS,
+        _checkout_repo,
+    )
+
+    recorded_timeouts: list[object] = []
+
+    def fake_run(_cmd: list[str], **kwargs: object) -> Mock:
+        recorded_timeouts.append(kwargs.get("timeout"))
+        return Mock(returncode=0)
+
+    with patch("tools.build_zerotts.subprocess.run", side_effect=fake_run):
+        _checkout_repo(
+            tmp_path / "dest",
+            "https://github.com/zeroweight-ai/ZeroTTS.git",
+            "319c3e07c8575c1e38617f07c773ec76a780a1f1",
+        )
+
+    assert recorded_timeouts == [
+        _GIT_NETWORK_TIMEOUT_SECONDS,
+        _GIT_LOCAL_TIMEOUT_SECONDS,
+        _GIT_NETWORK_TIMEOUT_SECONDS,
+    ]
+
+
+def test_is_toolchain_variant_supported_timeout() -> None:
+    """Test _is_toolchain_variant_supported returns False when g++ times out."""
+    from tools.build_zerotts import _is_toolchain_variant_supported
+
+    with patch(
+        "tools.build_zerotts.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(cmd=["g++"], timeout=10.0),
+    ):
+        assert not _is_toolchain_variant_supported("avx2")
+
+
+def test_format_process_error_with_timeout_expired() -> None:
+    """Test _format_process_error formats subprocess.TimeoutExpired properly."""
+    from tools.build_zerotts import _format_process_error
+
+    err = subprocess.TimeoutExpired(
+        cmd=["git", "clone"],
+        timeout=300.0,
+        output=b"cloning stdout\n",
+        stderr=b"cloning stderr\n",
+    )
+    msg = _format_process_error(err)
+    assert "timed out after 300" in msg
+    assert "cloning stdout" in msg
+    assert "cloning stderr" in msg
+
+
+def test_run_zerotts_build_script_timeout_windows(tmp_path: Path) -> None:
+    """Test _run_zerotts_build_script handles timeout on Windows using taskkill."""
+    from wyoming_vietnamese.zerotts_engine import (
+        _ZEROTTS_BUILD_TIMEOUT_SECONDS,
+        _run_zerotts_build_script,
+    )
+
+    build_script = tmp_path / "build_zerotts.py"
+    build_script.write_text("# dummy", encoding="utf-8")
+    target_dir = tmp_path / "lib"
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    stale_build_dir = target_dir / "_build_54321_temp"
+    stale_build_dir.mkdir(parents=True, exist_ok=True)
+    unrelated_build_dir = target_dir / "_build_99999_temp"
+    unrelated_build_dir.mkdir(parents=True, exist_ok=True)
+
+    mock_proc = Mock()
+    mock_proc.pid = 54321
+    mock_proc.communicate.side_effect = subprocess.TimeoutExpired(
+        cmd=["python"], timeout=_ZEROTTS_BUILD_TIMEOUT_SECONDS
+    )
+    mock_proc.wait.return_value = 0
+
+    taskkill_calls: list[list[str]] = []
+
+    def fake_subprocess_run(cmd: list[str], **kwargs: object) -> Mock:
+        taskkill_calls.append(cmd)
+        return Mock(returncode=0)
+
+    with (
+        patch("wyoming_vietnamese.zerotts_engine.platform.system", return_value="Windows"),
+        patch(
+            "wyoming_vietnamese.zerotts_engine.hasattr",
+            side_effect=lambda obj, attr: False if attr == "killpg" else hasattr(obj, attr),
+        ),
+        patch("wyoming_vietnamese.zerotts_engine.subprocess.run", side_effect=fake_subprocess_run),
+        patch("wyoming_vietnamese.zerotts_engine.subprocess.Popen", return_value=mock_proc),
+        pytest.raises(
+            RuntimeError,
+            match=f"ZeroTTS GGML build timed out after {_ZEROTTS_BUILD_TIMEOUT_SECONDS:g} seconds",
+        ),
+    ):
+        _run_zerotts_build_script(
+            build_script,
+            target_dir,
+            variant=ZeroTtsVariant.COMPAT,
+            native=False,
+        )
+
+    assert any("taskkill" in cmd[0] and "54321" in cmd for cmd in taskkill_calls)
+    assert not stale_build_dir.exists()
+    assert unrelated_build_dir.exists()
+
+
+def test_abort_process_termination_error_does_not_skip_cleanup_or_timeout(
+    tmp_path: Path,
+) -> None:
+    """Test process termination errors do not skip workspace cleanup or timeout error."""
+    from wyoming_vietnamese.zerotts_engine import (
+        _ZEROTTS_BUILD_TIMEOUT_SECONDS,
+        _run_zerotts_build_script,
+    )
+
+    build_script = tmp_path / "build_zerotts.py"
+    build_script.write_text("# dummy", encoding="utf-8")
+    target_dir = tmp_path / "lib"
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    stale_build_dir = target_dir / "_build_11111_temp"
+    stale_build_dir.mkdir(parents=True, exist_ok=True)
+
+    mock_proc = Mock()
+    mock_proc.pid = 11111
+    mock_proc.communicate.side_effect = subprocess.TimeoutExpired(
+        cmd=["python"], timeout=_ZEROTTS_BUILD_TIMEOUT_SECONDS
+    )
+
+    with (
+        patch(
+            "wyoming_vietnamese.zerotts_engine._terminate_process_tree",
+            side_effect=RuntimeError("kill failed"),
+        ),
+        patch("wyoming_vietnamese.zerotts_engine.subprocess.Popen", return_value=mock_proc),
+        pytest.raises(
+            RuntimeError,
+            match=f"ZeroTTS GGML build timed out after {_ZEROTTS_BUILD_TIMEOUT_SECONDS:g} seconds",
+        ),
+    ):
+        _run_zerotts_build_script(
+            build_script,
+            target_dir,
+            variant=ZeroTtsVariant.COMPAT,
+            native=False,
+        )
+
+    assert not stale_build_dir.exists()
+
+
+def test_terminate_process_tree_descendants_alive_even_if_child_exited() -> None:
+    """Test _terminate_process_tree sends SIGKILL when descendants remain even if child exited."""
+    from wyoming_vietnamese.zerotts_engine import _terminate_process_tree
+
+    mock_proc = Mock()
+    mock_proc.pid = 88888
+    mock_proc.wait.return_value = 0
+
+    killpg_calls: list[tuple[int, int]] = []
+
+    def fake_killpg(pgid: int, sig: int) -> None:
+        killpg_calls.append((pgid, sig))
+
+    with (
+        patch("wyoming_vietnamese.zerotts_engine.os.killpg", side_effect=fake_killpg),
+        patch("wyoming_vietnamese.zerotts_engine._is_process_group_alive", return_value=True),
+    ):
+        _terminate_process_tree(mock_proc)
+
+    assert (88888, signal.SIGTERM) in killpg_calls
+    assert (88888, signal.SIGKILL) in killpg_calls
+
+
+def test_terminate_process_tree_descendants_dead_no_sigkill() -> None:
+    """Test _terminate_process_tree does not send SIGKILL if no descendants remain."""
+    from wyoming_vietnamese.zerotts_engine import _terminate_process_tree
+
+    mock_proc = Mock()
+    mock_proc.pid = 88888
+    mock_proc.wait.return_value = 0
+
+    killpg_calls: list[tuple[int, int]] = []
+
+    def fake_killpg(pgid: int, sig: int) -> None:
+        killpg_calls.append((pgid, sig))
+
+    with (
+        patch("wyoming_vietnamese.zerotts_engine.os.killpg", side_effect=fake_killpg),
+        patch("wyoming_vietnamese.zerotts_engine._is_process_group_alive", return_value=False),
+    ):
+        _terminate_process_tree(mock_proc)
+
+    assert (88888, signal.SIGTERM) in killpg_calls
+    assert (88888, signal.SIGKILL) not in killpg_calls
+
+
+def test_is_process_group_alive() -> None:
+    """Test _is_process_group_alive returns True when group exists and False when not found."""
+    from wyoming_vietnamese.zerotts_engine import _is_process_group_alive
+
+    with patch("wyoming_vietnamese.zerotts_engine.os.killpg", return_value=None):
+        assert _is_process_group_alive(12345) is True
+
+    with patch("wyoming_vietnamese.zerotts_engine.os.killpg", side_effect=ProcessLookupError):
+        assert _is_process_group_alive(12345) is False
+
+    with patch("wyoming_vietnamese.zerotts_engine.os.killpg", side_effect=PermissionError):
+        assert _is_process_group_alive(12345) is True
+
+
+def test_run_cmake_build_success() -> None:
+    """Test _run_cmake_build starts CMake in new session and waits for completion."""
+    from tools.build_zerotts import _run_cmake_build
+
+    mock_proc = Mock()
+    mock_proc.communicate.return_value = (b"Built target", b"")
+    mock_proc.returncode = 0
+
+    with patch("tools.build_zerotts.subprocess.Popen", return_value=mock_proc) as mock_popen:
+        _run_cmake_build(["cmake", "--build", "/tmp/build"], timeout=60.0)
+        mock_popen.assert_called_once()
+        _, kwargs = mock_popen.call_args
+        assert kwargs.get("start_new_session") is True
+
+
+def test_run_cmake_build_adopts_managed_session() -> None:
+    """Test _run_cmake_build starts new session even when running under managed session."""
+    from tools.build_zerotts import _run_cmake_build
+
+    mock_proc = Mock()
+    mock_proc.communicate.return_value = (b"Built target", b"")
+    mock_proc.returncode = 0
+
+    with (
+        patch("tools.build_zerotts.os.getpgrp", return_value=12345),
+        patch("tools.build_zerotts.os.getpid", return_value=12345),
+        patch("tools.build_zerotts.subprocess.Popen", return_value=mock_proc) as mock_popen,
+    ):
+        _run_cmake_build(["cmake", "--build", "/tmp/build"], timeout=60.0)
+        mock_popen.assert_called_once()
+        _, kwargs = mock_popen.call_args
+        assert kwargs.get("start_new_session") is True
+
+
+def test_run_cmake_build_called_process_error() -> None:
+    """Test _run_cmake_build raises CalledProcessError when returncode is non-zero."""
+    from tools.build_zerotts import _run_cmake_build
+
+    mock_proc = Mock()
+    mock_proc.communicate.return_value = (b"", b"Error: build failed")
+    mock_proc.returncode = 2
+
+    with (
+        patch("tools.build_zerotts.subprocess.Popen", return_value=mock_proc),
+        pytest.raises(subprocess.CalledProcessError) as exc_info,
+    ):
+        _run_cmake_build(["cmake", "--build", "/tmp/build"], timeout=60.0)
+
+    assert exc_info.value.returncode == 2
+    assert exc_info.value.stderr == b"Error: build failed"
+
+
+def test_run_cmake_build_timeout_terminates_group() -> None:
+    """Test _run_cmake_build terminates process group on timeout and raises TimeoutExpired."""
+    from tools.build_zerotts import _run_cmake_build
+
+    mock_proc = Mock()
+    mock_proc.pid = 77777
+    mock_proc.communicate.side_effect = subprocess.TimeoutExpired(
+        cmd=["cmake", "--build"],
+        timeout=10.0,
+        output=b"partial build stdout",
+        stderr=b"partial build stderr",
+    )
+    mock_proc.wait.return_value = 0
+
+    killpg_calls: list[tuple[int, int]] = []
+
+    def fake_killpg(pgid: int, sig: int) -> None:
+        killpg_calls.append((pgid, sig))
+
+    with (
+        patch("tools.build_zerotts.subprocess.Popen", return_value=mock_proc),
+        patch("tools.build_zerotts.os.killpg", side_effect=fake_killpg),
+        patch("tools.build_zerotts._is_cmake_process_group_alive", return_value=True),
+        pytest.raises(subprocess.TimeoutExpired) as exc_info,
+    ):
+        _run_cmake_build(["cmake", "--build", "/tmp/build"], timeout=10.0)
+
+    assert (77777, signal.SIGTERM) in killpg_calls
+    assert (77777, signal.SIGKILL) in killpg_calls
+    assert exc_info.value.output == b"partial build stdout"
+    assert exc_info.value.stderr == b"partial build stderr"
+
+
+def test_run_cmake_build_timeout_bounded_communicate_captures_trailing_output() -> None:
+    """Test _run_cmake_build captures trailing output via bounded communicate on timeout."""
+    from tools.build_zerotts import _run_cmake_build
+
+    mock_proc = Mock()
+    mock_proc.pid = 88888
+    mock_proc.communicate.side_effect = [
+        subprocess.TimeoutExpired(cmd=["cmake", "--build"], timeout=10.0),
+        (b"trailing stdout", b"trailing stderr"),
+    ]
+    mock_proc.wait.return_value = 0
+
+    with (
+        patch("tools.build_zerotts.subprocess.Popen", return_value=mock_proc),
+        patch("tools.build_zerotts.os.killpg"),
+        patch("tools.build_zerotts._is_cmake_process_group_alive", return_value=False),
+        pytest.raises(subprocess.TimeoutExpired) as exc_info,
+    ):
+        _run_cmake_build(["cmake", "--build", "/tmp/build"], timeout=10.0)
+
+    assert exc_info.value.output == b"trailing stdout"
+    assert exc_info.value.stderr == b"trailing stderr"
+
+
+def test_terminate_cmake_process_tree_windows() -> None:
+    """Test _terminate_cmake_process_tree uses taskkill on Windows without calling os.killpg."""
+    from tools.build_zerotts import _terminate_cmake_process_tree
+
+    mock_proc = Mock()
+    mock_proc.pid = 66666
+    mock_proc.wait.return_value = 0
+
+    taskkill_cmds: list[list[str]] = []
+
+    def fake_subprocess_run(cmd: list[str], **kwargs: object) -> Mock:
+        taskkill_cmds.append(cmd)
+        return Mock(returncode=0)
+
+    with (
+        patch("tools.build_zerotts.platform.system", return_value="Windows"),
+        patch(
+            "tools.build_zerotts.hasattr",
+            side_effect=lambda obj, attr: False if attr == "killpg" else hasattr(obj, attr),
+        ),
+        patch("tools.build_zerotts.subprocess.run", side_effect=fake_subprocess_run),
+    ):
+        _terminate_cmake_process_tree(mock_proc)
+
+    assert any("taskkill" in cmd[0] and "66666" in cmd for cmd in taskkill_cmds)
+
+
+def test_is_cmake_process_group_alive() -> None:
+    """Test _is_cmake_process_group_alive returns True when group exists and False when absent."""
+    from tools.build_zerotts import _is_cmake_process_group_alive
+
+    with patch("tools.build_zerotts.os.killpg", return_value=None):
+        assert _is_cmake_process_group_alive(12345) is True
+
+    with patch("tools.build_zerotts.os.killpg", side_effect=ProcessLookupError):
+        assert _is_cmake_process_group_alive(12345) is False
+
+    with patch("tools.build_zerotts.os.killpg", side_effect=PermissionError):
+        assert _is_cmake_process_group_alive(12345) is True
+
+
+def test_private_final_timeouts() -> None:
+    """Test private final timeouts in build and engine modules."""
+    from tools.build_zerotts import (
+        _MAX_CMAKE_TEARDOWN_SECONDS as BUILD_MAX_TEARDOWN,
+    )
+    from tools.build_zerotts import (
+        _PROCESS_TERMINATION_TIMEOUT_SECONDS as BUILD_TERM_TIMEOUT,
+    )
+    from wyoming_vietnamese.zerotts_engine import (
+        _PROCESS_TERMINATION_TIMEOUT_SECONDS as ENGINE_TERM_TIMEOUT,
+    )
+    from wyoming_vietnamese.zerotts_engine import (
+        _SIGKILL_GRACE_PERIOD_SECONDS as ENGINE_SIGKILL_GRACE_PERIOD,
+    )
+    from wyoming_vietnamese.zerotts_engine import (
+        _ZEROTTS_BUILD_TIMEOUT_SECONDS as ENGINE_BUILD_TIMEOUT,
+    )
+
+    assert BUILD_TERM_TIMEOUT == 5.0
+    assert ENGINE_TERM_TIMEOUT == 5.0
+    assert ENGINE_BUILD_TIMEOUT == 1800.0
+    assert BUILD_MAX_TEARDOWN == 10.0
+    assert ENGINE_SIGKILL_GRACE_PERIOD == 15.0
+    assert ENGINE_SIGKILL_GRACE_PERIOD > BUILD_MAX_TEARDOWN
+
+
+def test_build_zerotts_sigterm_handler() -> None:
+    """Test _handle_sigterm tears down active CMake process and exits."""
+    import tools.build_zerotts as bz
+
+    mock_proc = Mock()
+    mock_proc.pid = 98765
+    mock_proc.wait.return_value = 0
+
+    with (
+        patch.object(bz, "_ACTIVE_CMAKE_PROC", mock_proc),
+        patch("tools.build_zerotts._terminate_cmake_process_tree") as mock_term,
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        bz._handle_sigterm(signal.SIGTERM, None)
+
+    mock_term.assert_called_once_with(mock_proc)
+    assert exc_info.value.code == 128 + signal.SIGTERM
+
+
+def test_build_zerotts_sigterm_handler_no_active_proc() -> None:
+    """Test _handle_sigterm exits cleanly when no CMake process is active."""
+    import tools.build_zerotts as bz
+
+    with (
+        patch.object(bz, "_ACTIVE_CMAKE_PROC", None),
+        patch("tools.build_zerotts._terminate_cmake_process_tree") as mock_term,
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        bz._handle_sigterm(signal.SIGTERM, None)
+
+    mock_term.assert_not_called()
+    assert exc_info.value.code == 128 + signal.SIGTERM
+
+
+def test_build_zerotts_handle_build_signals_context_manager() -> None:
+    """Test _handle_build_signals registers and restores signal handlers."""
+    from tools.build_zerotts import _handle_build_signals, _handle_sigterm
+
+    original_handler = signal.getsignal(signal.SIGTERM)
+    with _handle_build_signals():
+        current_handler = signal.getsignal(signal.SIGTERM)
+        assert current_handler is _handle_sigterm
+
+    restored_handler = signal.getsignal(signal.SIGTERM)
+    assert restored_handler == original_handler

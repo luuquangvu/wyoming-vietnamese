@@ -16,8 +16,9 @@ from tests.helpers import make_reader, memory_writer, stream_writer
 from wyoming_vietnamese import healthcheck
 from wyoming_vietnamese.__main__ import _drain_inference, main, run_server
 from wyoming_vietnamese.combined import CombinedEventHandler, combine_service_info
-from wyoming_vietnamese.config import ServerConfig, resolve_cpu_threads
+from wyoming_vietnamese.config import ServerConfig
 from wyoming_vietnamese.const import PROGRAM_NAME, TtsEngine
+from wyoming_vietnamese.cpu import resolve_cpu_threads
 from wyoming_vietnamese.protocol import ConnectionLimiter
 from wyoming_vietnamese.stt import get_stt_info
 from wyoming_vietnamese.tts import get_tts_info

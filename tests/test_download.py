@@ -179,12 +179,37 @@ def test_download_verified_file_checks_digest(
     )
     assert destination.read_bytes() == content
 
+    bad_sha = sha256(b"different").hexdigest()
     with pytest.raises(ValueError, match="SHA-256"):
         _download_verified_file(
             "https://models.example/model.onnx",
             destination,
-            expected_sha256=sha256(b"different").hexdigest(),
+            expected_sha256=bad_sha,
         )
+
+
+def test_download_verified_file_uses_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test _download_verified_file uses _DOWNLOAD_TIMEOUT_SECONDS."""
+    from wyoming_vietnamese.download import _DOWNLOAD_TIMEOUT_SECONDS
+
+    content = b"verified model"
+    recorded_kwargs: dict[str, object] = {}
+
+    def fake_urlopen(_request: object, **kwargs: object) -> BytesIO:
+        recorded_kwargs.update(kwargs)
+        return BytesIO(content)
+
+    monkeypatch.setattr("wyoming_vietnamese.download.urlopen", fake_urlopen)
+    destination = tmp_path / NghiTtsFile.MODEL
+    _download_verified_file(
+        "https://models.example/model.onnx",
+        destination,
+        expected_sha256=sha256(content).hexdigest(),
+    )
+    assert recorded_kwargs.get("timeout") == _DOWNLOAD_TIMEOUT_SECONDS
+    assert _DOWNLOAD_TIMEOUT_SECONDS == 60.0
 
 
 @pytest.mark.parametrize("offline", [True, False])

@@ -487,6 +487,8 @@ def test_initialize_stt_auto_threads(tmp_path: Path, monkeypatch: pytest.MonkeyP
     from_transducer = Mock(return_value=object())
     module = SimpleNamespace(OfflineRecognizer=SimpleNamespace(from_transducer=from_transducer))
     monkeypatch.setitem(sys.modules, "sherpa_onnx", module)
-    monkeypatch.setattr("wyoming_vietnamese.config.os.process_cpu_count", lambda: 16)
+    resolve_threads = Mock(return_value=16)
+    monkeypatch.setattr("wyoming_vietnamese.stt.resolve_cpu_threads", resolve_threads)
     initialize_stt(tmp_path)
+    resolve_threads.assert_called_once_with(0)
     assert from_transducer.call_args.kwargs["num_threads"] == 16

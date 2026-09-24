@@ -8,6 +8,9 @@ import itertools
 import json
 import logging
 import os
+import platform
+import shutil
+import signal
 import subprocess
 import sys
 from collections.abc import Iterator, Mapping, Sequence
@@ -47,6 +50,9 @@ _ZEROTTS_RUNTIME_DEPENDENCIES: Final[tuple[str, ...]] = (
     "libggml-cpu.so.0",
     "libggml.so.0",
 )
+_ZEROTTS_BUILD_TIMEOUT_SECONDS: Final[float] = 1800.0
+_PROCESS_TERMINATION_TIMEOUT_SECONDS: Final[float] = 5.0
+_SIGKILL_GRACE_PERIOD_SECONDS: Final[float] = 15.0
 
 
 class _ZeroTtsSampling(ctypes.Structure):
@@ -100,12 +106,15 @@ def _get_variant_fallback_order(optimal_variant: str) -> list[str]:
 
 def get_zerotts_candidate_lib_paths(
     custom_lib_path: Path | None = None,
+    base_dir: Path | None = None,
 ) -> list[tuple[str, Path]]:
     """Enumerate candidate ZeroTTS GGML library paths in preference order.
 
     Args:
         custom_lib_path: First candidate path; a missing file falls back to configured
             and default locations.
+        base_dir: Optional directory containing variant subdirectories. When provided,
+            only this directory is searched after the custom path.
 
     Returns:
         List of tuples containing (variant_description, path_candidate).
@@ -121,11 +130,15 @@ def get_zerotts_candidate_lib_paths(
     variant_order = _get_variant_fallback_order(optimal_variant)
 
     repo_root = Path(__file__).resolve().parent.parent
-    base_dirs = [
-        Path("/app/lib"),
-        repo_root / "lib",
-        Path(__file__).resolve().parent / "lib",
-    ]
+    base_dirs = (
+        [base_dir]
+        if base_dir is not None
+        else [
+            Path("/app/lib"),
+            repo_root / "lib",
+            Path(__file__).resolve().parent / "lib",
+        ]
+    )
 
     candidates.extend(
         (var, base_dir / var / ZeroTtsFile.LIBZEROTTS_SO)
@@ -143,6 +156,196 @@ def get_zerotts_candidate_lib_paths(
     return candidates
 
 
+def _restore_or_remove_rollback(item: Path, orig_path: Path) -> None:
+    """Restore rollback item to orig_path if missing, otherwise remove it.
+
+    Args:
+        item: Rollback file or directory to restore or delete.
+        orig_path: Destination path where the file or directory originally lived.
+    """
+    with contextlib.suppress(OSError):
+        if not orig_path.exists() and not orig_path.is_symlink():
+            item.replace(orig_path)
+        elif item.is_dir() and not item.is_symlink():
+            shutil.rmtree(item, ignore_errors=True)
+        else:
+            item.unlink()
+
+
+def _extract_rollback_original_name(name: str, tag: str, pid: int | None) -> str | None:
+    """Extract original filename from rollback pattern (e.g. .<orig><tag><pid>).
+
+    Args:
+        name: Name of the filesystem entry to inspect.
+        tag: Rollback marker tag (e.g. '.bak.' or '.stale.').
+        pid: Optional process ID filter.
+
+    Returns:
+        The extracted original name if pattern matches, None otherwise.
+    """
+    if pid is not None:
+        suffix = f"{tag}{pid}"
+        return name[1 : -len(suffix)] if name.endswith(suffix) else None
+    if tag in name:
+        orig, _, trailing = name[1:].rpartition(tag)
+        if orig and trailing.isdigit():
+            return orig
+    return None
+
+
+def _is_tmp_publish_file(name: str, pid: int | None) -> bool:
+    """Return whether filename matches temporary publish file pattern.
+
+    Args:
+        name: Name of the filesystem entry to inspect.
+        pid: Optional process ID filter.
+
+    Returns:
+        True if the name matches a temporary publish file, False otherwise.
+    """
+    if pid is not None:
+        return name.endswith(f".tmp.{pid}")
+    return name[1:].rpartition(".tmp.")[2].isdigit() if ".tmp." in name else False
+
+
+def _handle_workspace_entry(item: Path, directory: Path, pid: int | None) -> None:
+    """Clean transient build artifacts or restore rollback copies for a single entry.
+
+    Args:
+        item: Filesystem item path to evaluate.
+        directory: Directory containing the item.
+        pid: Optional process ID filter.
+    """
+    name = item.name
+    if pid is not None:
+        is_build_dir = name.startswith((f"_build_{pid}_", f"_build_all_{pid}_"))
+    else:
+        is_build_dir = name.startswith(("_build_", "_build_all_"))
+
+    if is_build_dir:
+        if item.is_dir() and not item.is_symlink():
+            shutil.rmtree(item, ignore_errors=True)
+        else:
+            with contextlib.suppress(OSError):
+                item.unlink()
+        return
+
+    if not name.startswith("."):
+        return
+
+    for tag in (".bak.", ".stale."):
+        orig_name = _extract_rollback_original_name(name, tag, pid)
+        if orig_name is not None:
+            _restore_or_remove_rollback(item, directory / orig_name)
+            return
+
+    if _is_tmp_publish_file(name, pid):
+        with contextlib.suppress(OSError):
+            item.unlink()
+
+
+def _clean_zerotts_build_workspace(directory: Path, pid: int | None = None) -> None:
+    """Remove transient build directories and restore rollback copies in workspace.
+
+    Args:
+        directory: Directory containing potential transient build artifacts to clean.
+        pid: Optional process ID of the build process to filter process-specific artifacts.
+    """
+    if not directory.exists() or not directory.is_dir():
+        return
+    for item in directory.iterdir():
+        _handle_workspace_entry(item, directory, pid)
+
+
+def _is_process_group_alive(pgid: int) -> bool:
+    """Return True if any processes remain alive in the process group.
+
+    Args:
+        pgid: Process group ID to check.
+
+    Returns:
+        True if any process in the process group is running, False otherwise.
+    """
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+
+
+def _signal_process_group(pid: int, sig: signal.Signals) -> None:
+    """Send termination signal to process group or taskkill tree on Windows.
+
+    Args:
+        pid: Process ID or process group ID to signal.
+        sig: Signal to send (SIGTERM or SIGKILL).
+    """
+    if hasattr(os, "killpg"):
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.killpg(pid, sig)
+    elif platform.system() == "Windows":
+        with contextlib.suppress(Exception):
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                check=False,
+                timeout=_PROCESS_TERMINATION_TIMEOUT_SECONDS,
+            )
+
+
+def _terminate_process_tree(proc: subprocess.Popen[str]) -> None:
+    """Terminate child process and all descendant processes in its process group.
+
+    Args:
+        proc: The running subprocess whose process tree should be terminated.
+    """
+    pid = proc.pid if isinstance(getattr(proc, "pid", None), int) else None
+    if pid is not None:
+        _signal_process_group(pid, signal.SIGTERM)
+
+    with contextlib.suppress(ProcessLookupError, OSError, AttributeError):
+        proc.terminate()
+
+    with contextlib.suppress(subprocess.TimeoutExpired, AttributeError):
+        proc.wait(timeout=_SIGKILL_GRACE_PERIOD_SECONDS)
+
+    # Check whether any members of the build process group remain before workspace cleanup,
+    # and escalate to SIGKILL when descendants are still running, even if the direct child exited.
+    if pid is not None and _is_process_group_alive(pid):
+        _signal_process_group(pid, signal.SIGKILL)
+
+    with contextlib.suppress(ProcessLookupError, OSError, AttributeError):
+        proc.kill()
+    with contextlib.suppress(Exception):
+        proc.wait(timeout=_PROCESS_TERMINATION_TIMEOUT_SECONDS)
+
+
+def _abort_process_and_clean_workspace(
+    proc: subprocess.Popen[str],
+    dest_dir: Path,
+    target_dir: Path,
+) -> None:
+    """Terminate child process tree and clean transient build artifacts from workspace.
+
+    Args:
+        proc: The running subprocess to terminate.
+        dest_dir: Target variant directory to clean.
+        target_dir: Base destination directory to clean.
+    """
+    pid = getattr(proc, "pid", None)
+    pid_val = pid if isinstance(pid, int) else None
+
+    # Ensure termination errors do not skip workspace cleanup or prevent caller from raising timeout
+    with contextlib.suppress(Exception):
+        _terminate_process_tree(proc)
+
+    _clean_zerotts_build_workspace(dest_dir, pid=pid_val)
+    if dest_dir != target_dir:
+        _clean_zerotts_build_workspace(target_dir, pid=pid_val)
+
+
 def _run_zerotts_build_script(
     build_script: Path,
     target_dir: Path,
@@ -151,8 +354,25 @@ def _run_zerotts_build_script(
     native: bool,
     publish_subdir: bool = False,
 ) -> Path:
-    """Execute tools/build_zerotts.py via subprocess to compile libzerotts.so."""
+    """Execute tools/build_zerotts.py via subprocess to compile libzerotts.so.
+
+    Args:
+        build_script: Path to tools/build_zerotts.py.
+        target_dir: Destination base directory for compiled library.
+        variant: CPU architecture optimization variant.
+        native: Whether to optimize for the host CPU.
+        publish_subdir: Whether to publish into a variant-named subdirectory.
+
+    Returns:
+        Path to the compiled libzerotts.so file.
+
+    Raises:
+        RuntimeError: If the build times out or fails.
+        FileNotFoundError: If the compiled library file is missing after build.
+    """
     actual_variant = ZeroTtsVariant.NATIVE if native else variant
+    if actual_variant not in ZeroTtsVariant:
+        raise ValueError(f"Invalid ZeroTTS variant: {actual_variant}")
     dest_dir = target_dir / actual_variant if publish_subdir else target_dir
     cmd = [
         sys.executable,
@@ -167,14 +387,26 @@ def _run_zerotts_build_script(
         cmd.append("--native")
     else:
         cmd.extend(["--variant", variant])
-    res = subprocess.run(
+    proc = subprocess.Popen(
         cmd,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
+        start_new_session=True,
     )
-    if res.returncode != 0:
+    try:
+        stdout, stderr = proc.communicate(timeout=_ZEROTTS_BUILD_TIMEOUT_SECONDS)
+    except BaseException as err:
+        _abort_process_and_clean_workspace(proc, dest_dir, target_dir)
+        if isinstance(err, subprocess.TimeoutExpired):
+            raise RuntimeError(
+                f"ZeroTTS GGML build timed out after {_ZEROTTS_BUILD_TIMEOUT_SECONDS:g} seconds"
+            ) from err
+        raise
+
+    if proc.returncode != 0:
         raise RuntimeError(
-            f"Failed to build ZeroTTS GGML shared library: {res.stderr or res.stdout}"
+            f"Failed to build ZeroTTS GGML shared library: {stderr or stdout}"
         ) from None
     candidate = dest_dir / ZeroTtsFile.LIBZEROTTS_SO
     if not candidate.is_file():
@@ -300,12 +532,18 @@ def _build_zerotts_ggml_lib(
         raise RuntimeError("ZeroTTS build script tools/build_zerotts.py not found") from import_err
 
 
-def resolve_zerotts_ggml_lib(custom_lib_path: Path | None = None) -> ctypes.CDLL:
+def resolve_zerotts_ggml_lib(
+    custom_lib_path: Path | None = None,
+    *,
+    build_dir: Path | None = None,
+) -> ctypes.CDLL:
     """Load the ZeroTTS GGML library, building it locally if no candidate exists.
 
     Args:
         custom_lib_path: First candidate path; a missing file falls back to configured
             and default locations.
+        build_dir: Optional directory to search and build the GGML library in. The
+            production default remains ``<repository>/lib``.
 
     Returns:
         Loaded ctypes.CDLL instance with configured argument and return types.
@@ -315,7 +553,7 @@ def resolve_zerotts_ggml_lib(custom_lib_path: Path | None = None) -> ctypes.CDLL
         RuntimeError: If loading the shared library fails.
     """
     repo_root = Path(__file__).resolve().parent.parent
-    candidates = get_zerotts_candidate_lib_paths(custom_lib_path)
+    candidates = get_zerotts_candidate_lib_paths(custom_lib_path, build_dir)
 
     loaded_lib: ctypes.CDLL | None = None
     last_error: OSError | None = None
@@ -350,7 +588,7 @@ def resolve_zerotts_ggml_lib(custom_lib_path: Path | None = None) -> ctypes.CDLL
                 last_error,
             )
 
-        target_dir = repo_root / "lib"
+        target_dir = build_dir or (repo_root / "lib")
         optimal_variant = detect_cpu_variant()
         resolved_lib_path = _build_zerotts_ggml_lib(
             target_dir,

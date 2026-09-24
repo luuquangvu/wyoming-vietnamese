@@ -1388,8 +1388,10 @@ def test_initialize_tts_auto_threads(tmp_path: Path, monkeypatch: pytest.MonkeyP
         OfflineTts=Mock(return_value=native),
     )
     monkeypatch.setitem(sys.modules, "sherpa_onnx", cast(Any, fake_sherpa))
-    monkeypatch.setattr("wyoming_vietnamese.config.os.process_cpu_count", lambda: 3)
+    resolve_threads = Mock(return_value=3)
+    monkeypatch.setattr("wyoming_vietnamese.tts.resolve_cpu_threads", resolve_threads)
     initialize_tts(tmp_path)
+    resolve_threads.assert_called_once_with(0)
     fake_sherpa.OfflineTtsModelConfig.assert_called_once_with(
         vits="vits",
         num_threads=3,

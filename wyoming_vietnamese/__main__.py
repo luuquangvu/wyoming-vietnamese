@@ -18,13 +18,14 @@ from wyoming.server import AsyncServer, HandlerFactory
 
 from .cache import BoundedLruCache
 from .combined import CombinedEventHandler, combine_service_info
-from .config import ServerConfig, resolve_cpu_threads
+from .config import ServerConfig
 from .const import (
     PROGRAM_NAME,
     Timeout,
     TtsEngine,
     TtsProvider,
 )
+from .cpu import resolve_cpu_threads
 from .download import download_models
 from .inference import create_inference_executor
 from .protocol import ByteBudget, ConnectionLimiter
