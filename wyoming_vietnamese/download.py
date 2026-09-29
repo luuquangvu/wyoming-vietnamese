@@ -20,6 +20,8 @@ from .config import get_env_bool
 from .const import (
     DEFAULT_TTS_ENGINE,
     NGHITTS_MODEL_BASE_URL,
+    STT_DIR,
+    TTS_DIR,
     NghiTtsAudio,
     NghiTtsFile,
     TtsEngine,
@@ -98,8 +100,8 @@ def download_models(
         allow_patterns=STT_MODEL.allow_patterns,
     )
 
-    stt_dest = download_dir / "stt"
-    tts_dest = download_dir / "tts"
+    stt_dest = download_dir / STT_DIR
+    tts_dest = download_dir / TTS_DIR
 
     if tts_engine == TtsEngine.ZEROTTS:
         _LOGGER.info(
@@ -134,7 +136,7 @@ def download_models(
         raise ValueError(f"Unknown TTS engine: {tts_engine}")
 
     _LOGGER.info("Model verification and structure synchronization completed")
-    return {"stt": stt_dest, "tts": tts_dest}
+    return {STT_DIR: stt_dest, TTS_DIR: tts_dest}
 
 
 def _sync_repo(

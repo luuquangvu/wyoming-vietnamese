@@ -14,6 +14,8 @@ import pytest
 
 from wyoming_vietnamese import download as download_module
 from wyoming_vietnamese.const import (
+    STT_DIR,
+    TTS_DIR,
     VIETNAMESE_LANGUAGE,
     ZEROTTS_REPO_ID,
     NghiTtsFile,
@@ -601,12 +603,12 @@ def test_download_models_structures_selected_nghitts_voice(
         (DEFAULT_NGHITTS_VOICE, second_voice),
     )
 
-    assert (paths["stt"] / "encoder.onnx").is_file()
-    assert paths["tts"] == tmp_path / "models" / "tts"
-    assert (paths["tts"] / DEFAULT_NGHITTS_VOICE.id / NghiTtsFile.MODEL).is_file()
-    assert (paths["tts"] / DEFAULT_NGHITTS_VOICE.id / NghiTtsFile.TOKENS).is_file()
-    assert (paths["tts"] / second_voice.id / NghiTtsFile.MODEL).is_file()
-    assert set(paths) == {"stt", "tts"}
+    assert (paths[STT_DIR] / "encoder.onnx").is_file()
+    assert paths[TTS_DIR] == tmp_path / "models" / TTS_DIR
+    assert (paths[TTS_DIR] / DEFAULT_NGHITTS_VOICE.id / NghiTtsFile.MODEL).is_file()
+    assert (paths[TTS_DIR] / DEFAULT_NGHITTS_VOICE.id / NghiTtsFile.TOKENS).is_file()
+    assert (paths[TTS_DIR] / second_voice.id / NghiTtsFile.MODEL).is_file()
+    assert set(paths) == {STT_DIR, TTS_DIR}
     assert sync.call_args.args == (spec.repo, False)
     assert sync.call_args.kwargs["revision"] == spec.revision
     assert sync.call_args.kwargs["allow_patterns"] == spec.allow_patterns
@@ -698,7 +700,7 @@ def test_structure_zerotts_files_missing_gguf(
     if gguf_file.is_file():
         gguf_file.unlink()
     monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec)
-    target_dir = tmp_path / "tts"
+    target_dir = tmp_path / TTS_DIR
 
     with pytest.raises(FileNotFoundError, match="Missing ZeroTTS GGUF model weights"):
         _structure_zerotts_files(snapshot_dir, target_dir)
@@ -708,7 +710,7 @@ def test_structure_zerotts_files_missing_artifact(tmp_path: Path) -> None:
     """Test _structure_zerotts_files raises FileNotFoundError when artifact is missing."""
     snapshot_dir = tmp_path / "snapshot"
     snapshot_dir.mkdir(parents=True, exist_ok=True)
-    target_dir = tmp_path / "tts"
+    target_dir = tmp_path / TTS_DIR
 
     with pytest.raises(FileNotFoundError, match="Pinned ZeroTTS artifact is missing"):
         _structure_zerotts_files(snapshot_dir, target_dir)
@@ -723,7 +725,7 @@ def test_structure_zerotts_files_corrupted_digest(
     (snapshot_dir / "config.json").write_bytes(b"CORRUPTED_CONFIG")
     monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec)
 
-    target_dir = tmp_path / "tts"
+    target_dir = tmp_path / TTS_DIR
     with pytest.raises(RuntimeError, match="does not match its recorded SHA-256 digest"):
         _structure_zerotts_files(snapshot_dir, target_dir)
 
@@ -752,14 +754,14 @@ def test_download_models_structures_zerotts_quality_mode(
         tts_engine=TtsEngine.ZEROTTS,
     )
 
-    assert paths["tts"] == tmp_path / "models" / "tts"
-    assert (paths["tts"] / ZeroTtsDirectory.GGUF / ZeroTtsFile.DEFAULT_GGUF_MODEL).is_file()
-    assert (paths["tts"] / "config.json").is_file()
-    assert (paths["tts"] / "tokenizer.json").is_file()
-    assert (paths["tts"] / "null_voice_emb.npy").is_file()
-    assert (paths["tts"] / "onnx" / "codec" / "codec_browser_onnx_meta.json").is_file()
-    assert (paths["tts"] / "onnx" / "codec" / "moss_audio_tokenizer_decode_full.onnx").is_file()
-    assert (paths["tts"] / "voices" / test_voice.id / "voice.npz").is_file()
+    assert paths[TTS_DIR] == tmp_path / "models" / TTS_DIR
+    assert (paths[TTS_DIR] / ZeroTtsDirectory.GGUF / ZeroTtsFile.DEFAULT_GGUF_MODEL).is_file()
+    assert (paths[TTS_DIR] / "config.json").is_file()
+    assert (paths[TTS_DIR] / "tokenizer.json").is_file()
+    assert (paths[TTS_DIR] / "null_voice_emb.npy").is_file()
+    assert (paths[TTS_DIR] / "onnx" / "codec" / "codec_browser_onnx_meta.json").is_file()
+    assert (paths[TTS_DIR] / "onnx" / "codec" / "moss_audio_tokenizer_decode_full.onnx").is_file()
+    assert (paths[TTS_DIR] / "voices" / test_voice.id / "voice.npz").is_file()
 
     assert sync.call_count == 2
     assert sync.call_args_list[1].args[0] == ZEROTTS_REPO_ID
@@ -776,7 +778,7 @@ def test_structure_zerotts_files_corrupted_destination_voice(
     monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec)
     monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_VOICES", (test_voice,))
 
-    target_dir = tmp_path / "tts"
+    target_dir = tmp_path / TTS_DIR
     corrupted_dst = target_dir / "voices" / test_voice.id / "voice.npz"
     corrupted_dst.parent.mkdir(parents=True, exist_ok=True)
     corrupted_dst.write_bytes(b"CORRUPTED_VOICE_DATA")
@@ -801,7 +803,7 @@ def test_structure_zerotts_files_missing_configured_voice(
     monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec)
     monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_VOICES", ())
 
-    target_dir = tmp_path / "tts"
+    target_dir = tmp_path / TTS_DIR
     with pytest.raises(FileNotFoundError, match="is missing from"):
         _structure_zerotts_files(snapshot_dir, target_dir, voices=(test_voice,))
 
@@ -815,7 +817,7 @@ def test_structure_zerotts_files_corrupted_destination_artifact(
     monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec)
     monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_VOICES", (test_voice,))
 
-    target_dir = tmp_path / "tts"
+    target_dir = tmp_path / TTS_DIR
     _structure_zerotts_files(snapshot_dir, target_dir, voices=(test_voice,))
 
     corrupted_artifact = target_dir / tts_spec.artifacts[0].local_name

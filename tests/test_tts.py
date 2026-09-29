@@ -31,6 +31,7 @@ from tests.helpers import MemoryWriter, make_reader, stream_writer, written_even
 from wyoming_vietnamese.cache import BoundedLruCache
 from wyoming_vietnamese.const import (
     PROGRAM_NAME,
+    TTS_DIR,
     VIETNAMESE_LANGUAGE,
     NghiTtsAudio,
     NghiTtsFile,
@@ -55,6 +56,7 @@ from wyoming_vietnamese.tts import (
     _silence_pcm,
     get_tts_info,
     get_tts_sample_rate,
+    initialize_lazy_tts_voices,
     initialize_tts,
     initialize_tts_engine,
     initialize_tts_voices,
@@ -1186,6 +1188,245 @@ def test_multi_voice_engine_routes_by_name_and_defaults_to_first() -> None:
     engine.close()
 
 
+def test_lazy_engine_advertises_all_voices_and_loads_on_demand() -> None:
+    """Advertise every configured voice but only load models when requested."""
+    first_voice = DEFAULT_NGHITTS_VOICE
+    second_voice = get_voice("chieu-thanh")
+    third_voice = get_voice("ban-mai")
+    all_voices = (first_voice, second_voice, third_voice)
+
+    first_native = FakeSherpaTTS()
+    first_engine = NghiTTSEngine(first_native, first_voice)
+
+    from wyoming_vietnamese.tts import LazyMultiVoiceTTSEngine
+
+    lazy = LazyMultiVoiceTTSEngine(
+        [first_engine],
+        all_voices,
+        model_root=Path("/unused"),
+        num_threads=1,
+        max_loaded=1,
+    )
+    assert set(lazy._preset_voices) == {v.name for v in all_voices}
+    assert len(lazy._engines) == 1
+    assert first_voice.name in lazy._engines
+    lazy.close()
+
+
+def test_lazy_engine_evicts_lru_voice_when_loading_new_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Evict the least-recently-used voice model when loading a new one at capacity."""
+    first_voice = DEFAULT_NGHITTS_VOICE
+    second_voice = get_voice("chieu-thanh")
+    all_voices = (first_voice, second_voice)
+
+    first_native = FakeSherpaTTS()
+    first_engine = NghiTTSEngine(first_native, first_voice)
+    second_native = FakeSherpaTTS()
+    NghiTTSEngine(second_native, second_voice)
+
+    from wyoming_vietnamese.tts import LazyMultiVoiceTTSEngine
+
+    monkeypatch.setattr(
+        "wyoming_vietnamese.tts.initialize_tts",
+        lambda _dir, _threads, voice, **kw: NghiTTSEngine(FakeSherpaTTS(), voice),
+    )
+
+    lazy = LazyMultiVoiceTTSEngine(
+        [first_engine],
+        all_voices,
+        model_root=Path("/models"),
+        num_threads=1,
+        max_loaded=1,
+    )
+    assert list(lazy._engines) == [first_voice.name]
+
+    # Request second voice triggers load + eviction of first
+    list(lazy.infer_stream("Xin chào", voice=second_voice.name))
+    assert list(lazy._engines) == [second_voice.name]
+    assert first_engine._tts is None  # evicted and closed
+    lazy.close()
+
+
+def test_lazy_engine_normalize_works_without_loading() -> None:
+    """Normalize text for a non-loaded voice without triggering model initialization."""
+    first_voice = DEFAULT_NGHITTS_VOICE
+    second_voice = get_voice("ban-mai")
+    all_voices = (first_voice, second_voice)
+
+    first_engine = NghiTTSEngine(FakeSherpaTTS(), first_voice)
+
+    from wyoming_vietnamese.tts import LazyMultiVoiceTTSEngine
+
+    lazy = LazyMultiVoiceTTSEngine(
+        [first_engine],
+        all_voices,
+        model_root=Path("/unused"),
+        num_threads=1,
+        max_loaded=1,
+    )
+    # Normalize for non-loaded voice should not change engine count
+    result = lazy.normalize("Xin chào", voice=second_voice.name)
+    assert isinstance(result, str)
+    assert len(lazy._engines) == 1
+    lazy.close()
+
+
+def test_lazy_engine_rejects_unknown_voice() -> None:
+    """Reject a voice name that is not in the configured voice list."""
+    first_voice = DEFAULT_NGHITTS_VOICE
+    all_voices = (first_voice,)
+    first_engine = NghiTTSEngine(FakeSherpaTTS(), first_voice)
+
+    from wyoming_vietnamese.tts import LazyMultiVoiceTTSEngine
+
+    lazy = LazyMultiVoiceTTSEngine(
+        [first_engine],
+        all_voices,
+        model_root=Path("/unused"),
+        num_threads=1,
+        max_loaded=1,
+    )
+    with pytest.raises(ValueError, match="Unsupported"):
+        list(lazy.infer_stream("Lỗi", voice="nonexistent"))
+    with pytest.raises(ValueError, match="Unsupported"):
+        lazy.normalize("Lỗi", voice="nonexistent")
+    lazy.close()
+
+
+def test_lazy_engine_close_releases_all_loaded_engines() -> None:
+    """Close releases every loaded engine and clears the engine map."""
+    first_voice = DEFAULT_NGHITTS_VOICE
+    second_voice = get_voice("ban-mai")
+    all_voices = (first_voice, second_voice)
+    e1 = NghiTTSEngine(FakeSherpaTTS(), first_voice)
+    e2 = NghiTTSEngine(FakeSherpaTTS(), second_voice)
+
+    from wyoming_vietnamese.tts import LazyMultiVoiceTTSEngine
+
+    lazy = LazyMultiVoiceTTSEngine(
+        [e1, e2],
+        all_voices,
+        model_root=Path("/unused"),
+        num_threads=1,
+        max_loaded=2,
+    )
+    lazy.close()
+    assert e1._tts is None
+    assert e2._tts is None
+    assert len(lazy._engines) == 0
+
+
+def test_lazy_engine_moves_accessed_voice_to_mru() -> None:
+    """Accessing a loaded voice moves it to most-recently-used position."""
+    first_voice = DEFAULT_NGHITTS_VOICE
+    second_voice = get_voice("ban-mai")
+    all_voices = (first_voice, second_voice)
+    e1 = NghiTTSEngine(FakeSherpaTTS(), first_voice)
+    e2 = NghiTTSEngine(FakeSherpaTTS(), second_voice)
+
+    from wyoming_vietnamese.tts import LazyMultiVoiceTTSEngine
+
+    lazy = LazyMultiVoiceTTSEngine(
+        [e1, e2],
+        all_voices,
+        model_root=Path("/unused"),
+        num_threads=1,
+        max_loaded=2,
+    )
+    # Initially: [first, second] -> first is LRU
+    assert list(lazy._engines) == [first_voice.name, second_voice.name]
+    # Access first -> moves to MRU end
+    list(lazy.infer_stream("Xin chào", voice=first_voice.name))
+    assert list(lazy._engines) == [second_voice.name, first_voice.name]
+    lazy.close()
+
+
+def test_lazy_engine_replacement_rate_limit_exceeded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rapid alternating voice requests exceeding replacement interval raise RuntimeError."""
+    first_voice = DEFAULT_NGHITTS_VOICE
+    second_voice = get_voice("chieu-thanh")
+    all_voices = (first_voice, second_voice)
+
+    first_native = FakeSherpaTTS()
+    first_engine = NghiTTSEngine(first_native, first_voice)
+
+    from wyoming_vietnamese.tts import LazyMultiVoiceTTSEngine
+
+    monkeypatch.setattr(
+        "wyoming_vietnamese.tts.initialize_tts",
+        lambda _dir, _threads, voice, **kw: NghiTTSEngine(FakeSherpaTTS(), voice),
+    )
+
+    lazy = LazyMultiVoiceTTSEngine(
+        [first_engine],
+        all_voices,
+        model_root=Path("/models"),
+        num_threads=1,
+        max_loaded=1,
+        min_replacement_interval=10.0,
+    )
+
+    # First replacement: loads second_voice and evicts first_voice
+    list(lazy.infer_stream("Xin chào", voice=second_voice.name))
+    assert list(lazy._engines) == [second_voice.name]
+
+    # Rapid second replacement within interval must be rejected
+    with pytest.raises(RuntimeError, match="rate limit exceeded"):
+        list(lazy.infer_stream("Xin chào", voice=first_voice.name))
+
+    # Engine map must still contain second_voice
+    assert list(lazy._engines) == [second_voice.name]
+    lazy.close()
+
+
+def test_lazy_engine_initialization_failure_preserves_resident_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed initialization of a new voice preserves existing resident models."""
+    first_voice = DEFAULT_NGHITTS_VOICE
+    second_voice = get_voice("chieu-thanh")
+    all_voices = (first_voice, second_voice)
+
+    first_native = FakeSherpaTTS()
+    first_engine = NghiTTSEngine(first_native, first_voice)
+
+    from wyoming_vietnamese.tts import LazyMultiVoiceTTSEngine
+
+    def fail_init(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("model file corrupted")
+
+    monkeypatch.setattr("wyoming_vietnamese.tts.initialize_tts", fail_init)
+
+    lazy = LazyMultiVoiceTTSEngine(
+        [first_engine],
+        all_voices,
+        model_root=Path("/models"),
+        num_threads=1,
+        max_loaded=1,
+    )
+
+    with pytest.raises(RuntimeError, match="model file corrupted"):
+        list(lazy.infer_stream("Xin chào", voice=second_voice.name))
+
+    # First engine was NOT evicted or closed
+    assert list(lazy._engines) == [first_voice.name]
+    assert first_engine._tts is not None
+    lazy.close()
+
+
+def test_initialize_lazy_tts_voices_rejects_empty_voices() -> None:
+    """Reject initialization when voice lists are empty."""
+    first_voice = DEFAULT_NGHITTS_VOICE
+    with pytest.raises(ValueError, match="voice"):
+        initialize_lazy_tts_voices(Path("/unused"), (), (first_voice,), num_threads=1, max_loaded=1)
+    with pytest.raises(ValueError, match="voice"):
+        initialize_lazy_tts_voices(Path("/unused"), (first_voice,), (), num_threads=1, max_loaded=1)
+
+
 def test_warm_up_tts_uses_streaming_default_voice() -> None:
     """Test warm-up exhausts the incremental API using the active default."""
     engine = FakeTTS([np.array([0.1], dtype=np.float32)])
@@ -1492,7 +1733,7 @@ def test_resolve_nghitts_espeak_data_prefers_model_and_validates_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Test portable model-local eSpeak data and strict explicit overrides."""
-    model_dir = tmp_path / "tts"
+    model_dir = tmp_path / TTS_DIR
     espeak_data = _make_nghitts_model(model_dir)
     monkeypatch.delenv("NGHITTS_ESPEAK_DATA_DIR", raising=False)
     assert _resolve_nghitts_espeak_data(model_dir) == espeak_data.resolve()
@@ -1506,7 +1747,7 @@ def test_initialize_tts_uses_sherpa_cpu_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Test initialization passes verified local paths and effective threads."""
-    model_dir = tmp_path / "tts"
+    model_dir = tmp_path / TTS_DIR
     espeak_data = _make_nghitts_model(model_dir)
     native = FakeSherpaTTS()
     vits_config = Mock(return_value="vits")

@@ -8,6 +8,7 @@ license = { text = "MIT" }
 dependencies = [
   "huggingface-hub",
   "numpy",
+  "psutil",
   "sherpa-onnx",
   "sherpa-onnx-core",
   "wyoming",
