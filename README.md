@@ -39,7 +39,7 @@ Toàn bộ quá trình xử lý âm thanh và suy luận AI (inference) đều d
 
 - **Phần cứng**:
   - Thiết bị chạy Docker: Raspberry Pi 4/5 (khuyên dùng với engine `nghitts`), x86 Mini PC (Intel N100, Core i3/i5/i7, AMD Ryzen...), NAS (Synology, QNAP, TrueNAS...) hoặc bất kỳ máy chủ Linux nào.
-  - Bộ nhớ RAM: Khuyến nghị tối thiểu 1 GB RAM trống (với engine `nghitts`) hoặc 2 GB RAM trống (với engine `zerotts`).
+  - Bộ nhớ RAM: Mức sử dụng tùy engine và số giọng được nạp. Dịch vụ sẽ cảnh báo trong log khi RAM khả dụng thấp.
   - Dung lượng ổ cứng: Trống khoảng 2 - 3 GB để lưu trữ mô hình nhận diện giọng nói và các giọng đọc TTS.
 - **Môi trường & Mạng**:
   - Thiết bị đã cài đặt sẵn **Docker** và **Docker Compose**.
@@ -224,8 +224,10 @@ Khi cần tối ưu hiệu năng hoặc kiểm soát chi tiết hơn, bạn có 
 | `MAX_STT_AUDIO_SECONDS`    | `120.0`  | Thời lượng âm thanh tối đa cho một lượt nhận diện giọng nói STT (giây).                                                                                                                            |
 | `MAX_TTS_TEXT_CHARS`       |  `2000`  | Giới hạn độ dài tối đa của văn bản gửi đến TTS trong một yêu cầu (ký tự).                                                                                                                          |
 
+Khi khởi động, dịch vụ kiểm tra CPU và RAM, tự điều chỉnh số giọng NghiTTS được nạp trước cùng giới hạn bộ nhớ đệm theo RAM. Nếu bộ nhớ khả dụng thấp, dịch vụ ghi cảnh báo trong log và vẫn tiếp tục. Các nội dung TTS sinh ra được lưu trữ tạm thời trong bộ nhớ đệm. Bộ nhớ đệm trong RAM sẽ mất khi dịch vụ khởi động lại; bộ nhớ đệm trong ổ đĩa (`cache` volume) sẽ được giữ nguyên. Các nội dung TTS đã lưu trong bộ nhớ đệm ổ đĩa sẽ tự động xóa sau 30 ngày không được sử dụng.
+
 > [!IMPORTANT]
-> Hai Docker volume `cache` và `models` đóng vai trò lưu trữ toàn bộ các mô hình AI và dữ liệu giọng đọc đã tải về. Bạn **không nên xóa** hai volume này để container có thể khởi động lại tức thì và hoạt động hoàn toàn ngoại tuyến (offline).
+> Các Docker volume `cache` và `models` đóng vai trò lưu trữ toàn bộ các mô hình AI và các nội dung TTS được sinh ra. Bạn **không nên xóa** hai volume này để container có thể khởi động lại tức thì và hoạt động hoàn toàn ngoại tuyến (offline).
 
 ---
 

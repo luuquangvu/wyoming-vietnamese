@@ -17,6 +17,18 @@ DEFAULT_CACHE_DIR = "/app/.cache"
 DEFAULT_DOWNLOAD_DIR = "/app/models"
 VIETNAMESE_LANGUAGE = "vi"
 
+STT_DIR = "stt"
+TTS_DIR = "tts"
+TTS_CACHE_DIR = "tts-audio"
+
+
+class TtsCacheFile(StrEnum):
+    """File naming conventions for persistent TTS audio cache entries."""
+
+    PCM_SUFFIX = ".pcm"
+    PCM_GLOB = "*.pcm"
+    TEMP_PREFIX = ".tts-"
+
 
 class TtsEngine(StrEnum):
     """Supported text-to-speech synthesis engines."""
@@ -110,17 +122,6 @@ class TtsSilenceMs(IntEnum):
     SENTENCE = 400
     CLAUSE = 200
     MAX = 3_000
-
-
-DEFAULT_TTS_CACHE_IDLE_SECONDS = 2_592_000.0
-
-
-class TtsCacheLimit(IntEnum):
-    """Default capacity bounds for the TTS audio cache."""
-
-    MAX_ENTRIES = 2_048
-    MAX_MB = 512
-    MAX_ITEM_MB = 8
 
 
 # Inference is serialized by the STT and TTS locks, so a small pool is enough: one STT

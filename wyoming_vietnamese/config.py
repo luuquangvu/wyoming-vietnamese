@@ -17,11 +17,9 @@ from .const import (
     DEFAULT_MAX_STT_BUFFER_MB,
     DEFAULT_MAX_TTS_TEXT_CHARS,
     DEFAULT_PORT,
-    DEFAULT_TTS_CACHE_IDLE_SECONDS,
     DEFAULT_TTS_ENGINE,
     ConnectionLimit,
     Timeout,
-    TtsCacheLimit,
     TtsEngine,
     TtsSilenceMs,
 )
@@ -36,6 +34,16 @@ from .tts_model import (
 AnyVoiceSpec = NghiTtsVoiceSpec | ZeroTtsVoiceSpec
 
 _LOGGER = logging.getLogger(__name__)
+
+DEPRECATED_SETTINGS = frozenset(
+    {
+        "TTS_CACHE_IDLE_SECONDS",
+        "TTS_CACHE_MAX_ENTRIES",
+        "TTS_CACHE_MAX_MB",
+        "TTS_CACHE_MAX_ITEM_MB",
+        "TTS_SILENCE_JITTER_PERCENT",
+    }
+)
 
 
 def get_env_bool(
@@ -186,10 +194,7 @@ class ServerConfig:
     write_timeout: float
     max_active_connections: int
     max_stt_buffer_bytes: int
-    tts_cache_idle_seconds: float
-    tts_cache_max_entries: int
-    tts_cache_max_bytes: int
-    tts_cache_max_item_bytes: int
+    tts_cache_enabled: bool = True
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> ServerConfig:
@@ -200,28 +205,15 @@ class ServerConfig:
         """
         env = os.environ if environ is None else environ
 
-        if "TTS_SILENCE_JITTER_PERCENT" in env:
+        if deprecated_settings := sorted(DEPRECATED_SETTINGS.intersection(env)):
+            settings = ", ".join(deprecated_settings)
             _LOGGER.warning(
-                "TTS_SILENCE_JITTER_PERCENT is deprecated and has been removed; silence jitter "
-                "is no longer used. Please consult the up-to-date README and use default settings."
+                "Deprecated environment settings are ignored and should be removed: %s. "
+                "These features are now managed automatically.",
+                settings,
             )
 
         tts_engine = _get_tts_engine(env)
-        tts_cache_max_mb = _get_int(
-            env,
-            "TTS_CACHE_MAX_MB",
-            TtsCacheLimit.MAX_MB,
-            minimum=0,
-        )
-        tts_cache_max_item_mb = _get_int(
-            env,
-            "TTS_CACHE_MAX_ITEM_MB",
-            TtsCacheLimit.MAX_ITEM_MB,
-            minimum=0,
-        )
-        if tts_cache_max_mb and tts_cache_max_item_mb > tts_cache_max_mb:
-            raise ValueError("TTS_CACHE_MAX_ITEM_MB must not exceed TTS_CACHE_MAX_MB")
-
         return cls(
             port=_get_int(env, "WYOMING_PORT", DEFAULT_PORT, minimum=1, maximum=65535),
             tts_engine=tts_engine,
@@ -300,18 +292,5 @@ class ServerConfig:
                 * 1024
                 * 1024
             ),
-            tts_cache_idle_seconds=_get_float(
-                env,
-                "TTS_CACHE_IDLE_SECONDS",
-                DEFAULT_TTS_CACHE_IDLE_SECONDS,
-                minimum_exclusive=0,
-            ),
-            tts_cache_max_entries=_get_int(
-                env,
-                "TTS_CACHE_MAX_ENTRIES",
-                TtsCacheLimit.MAX_ENTRIES,
-                minimum=0,
-            ),
-            tts_cache_max_bytes=tts_cache_max_mb * 1024 * 1024,
-            tts_cache_max_item_bytes=tts_cache_max_item_mb * 1024 * 1024,
+            tts_cache_enabled=get_env_bool("TTS_CACHE_ENABLED", True, env),
         )

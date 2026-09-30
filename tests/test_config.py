@@ -1,6 +1,5 @@
 """Configuration parsing tests."""
 
-import logging
 from pathlib import Path
 
 import pytest
@@ -77,10 +76,6 @@ def test_server_config_defaults() -> None:
     assert config.write_timeout == 5
     assert config.max_active_connections == 64
     assert config.max_stt_buffer_bytes == 256 * 1024 * 1024
-    assert config.tts_cache_idle_seconds == 2_592_000.0
-    assert config.tts_cache_max_entries == 2_048
-    assert config.tts_cache_max_bytes == 512 * 1024 * 1024
-    assert config.tts_cache_max_item_bytes == 8 * 1024 * 1024
     assert config.tts_sentence_silence_ms == TtsSilenceMs.SENTENCE
     assert config.tts_clause_silence_ms == TtsSilenceMs.CLAUSE
     assert config.tts_paragraph_silence_ms == TtsSilenceMs.PARAGRAPH
@@ -107,10 +102,6 @@ def test_server_config_custom_values() -> None:
             "WYOMING_WRITE_TIMEOUT": "0.75",
             "MAX_ACTIVE_CONNECTIONS": "12",
             "MAX_STT_BUFFER_MB": "34",
-            "TTS_CACHE_IDLE_SECONDS": "90",
-            "TTS_CACHE_MAX_ENTRIES": "8",
-            "TTS_CACHE_MAX_MB": "12",
-            "TTS_CACHE_MAX_ITEM_MB": "3",
         }
     )
     assert config.port == 12000
@@ -137,10 +128,6 @@ def test_server_config_custom_values() -> None:
     assert config.write_timeout == 0.75
     assert config.max_active_connections == 12
     assert config.max_stt_buffer_bytes == 34 * 1024 * 1024
-    assert config.tts_cache_idle_seconds == 90
-    assert config.tts_cache_max_entries == 8
-    assert config.tts_cache_max_bytes == 12 * 1024 * 1024
-    assert config.tts_cache_max_item_bytes == 3 * 1024 * 1024
 
 
 @pytest.mark.parametrize(
@@ -182,10 +169,6 @@ def test_server_config_accepts_tts_voice_separators(value: str) -> None:
         ({"WYOMING_WRITE_TIMEOUT": "-1"}, "must be greater"),
         ({"MAX_ACTIVE_CONNECTIONS": "0"}, "must be at least"),
         ({"MAX_STT_BUFFER_MB": "0"}, "must be at least"),
-        ({"TTS_CACHE_IDLE_SECONDS": "0"}, "must be greater"),
-        ({"TTS_CACHE_MAX_ENTRIES": "-1"}, "must be at least"),
-        ({"TTS_CACHE_MAX_MB": "-1"}, "must be at least"),
-        ({"TTS_CACHE_MAX_ITEM_MB": "513"}, "must not exceed"),
         ({"TTS_VOICE": "unknown"}, "must be one of"),
         ({"TTS_VOICE": "ngoc-huyen-moi;ngoc-ngan"}, "must be one of"),
         ({"TTS_VOICE": "ngoc-huyen-moi,ngoc-huyen-moi"}, "duplicate"),
@@ -201,6 +184,28 @@ def test_server_config_rejects_invalid_values(environment: dict[str, str], messa
     """Test server config rejects invalid values."""
     with pytest.raises(ValueError, match=message):
         ServerConfig.from_env(environment)
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [
+        "TTS_SILENCE_JITTER_PERCENT",
+        "TTS_CACHE_IDLE_SECONDS",
+        "TTS_CACHE_MAX_ENTRIES",
+        "TTS_CACHE_MAX_MB",
+        "TTS_CACHE_MAX_ITEM_MB",
+    ],
+)
+def test_server_config_warns_on_deprecated_settings(
+    setting: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Warn on deprecated settings and continue with default configuration."""
+    with caplog.at_level("WARNING"):
+        config = ServerConfig.from_env({setting: "1"})
+    assert "Deprecated environment settings are ignored" in caplog.text
+    assert setting in caplog.text
+    assert config == ServerConfig.from_env({})
 
 
 def test_server_config_tts_engine_nghitts() -> None:
@@ -227,14 +232,17 @@ def test_server_config_tts_engine_zerotts() -> None:
     assert [voice.name for voice in config_custom.tts_voices] == ["Bảo Trang", "Gia Huy"]
 
 
-@pytest.mark.parametrize("value", ["20", "not-an-integer", "-1", ""])
-def test_server_config_logs_warning_on_deprecated_jitter_setting(
-    value: str,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Test setting TTS_SILENCE_JITTER_PERCENT logs a warning regardless of value."""
-    with caplog.at_level(logging.WARNING):
-        ServerConfig.from_env({"TTS_SILENCE_JITTER_PERCENT": value})
-    assert "TTS_SILENCE_JITTER_PERCENT is deprecated and has been removed" in caplog.text
-    assert "consult the up-to-date README and use default settings" in caplog.text
-    assert ServerConfig.from_env({"TTS_SILENCE_JITTER_PERCENT": value}) == ServerConfig.from_env({})
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("true", True), ("1", True), ("false", False), ("0", False)],
+)
+def test_server_config_tts_cache_enabled(value: str, expected: bool) -> None:
+    """Test server config parses TTS_CACHE_ENABLED flag."""
+    config = ServerConfig.from_env({"TTS_CACHE_ENABLED": value})
+    assert config.tts_cache_enabled is expected
+
+
+def test_server_config_tts_cache_enabled_default() -> None:
+    """Test server config enables TTS cache by default."""
+    config = ServerConfig.from_env({})
+    assert config.tts_cache_enabled is True

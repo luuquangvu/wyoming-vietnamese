@@ -8,13 +8,14 @@ import os
 import queue
 import re
 import threading
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Executor
 from contextlib import suppress
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from time import perf_counter
+from time import monotonic, perf_counter
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 import numpy as np
@@ -33,7 +34,7 @@ from wyoming.tts import (
 )
 from zerotts.text_norm import normalize_vi_text
 
-from .cache import BoundedLruCache
+from .cache import ResultCache
 from .const import (
     DEFAULT_TTS_ENGINE,
     NGHITTS_REPO_URL,
@@ -60,6 +61,7 @@ from .tts_model import (
     NghiTtsVoiceSpec,
     ZeroTtsVoiceSpec,
 )
+from .voice_usage import RecentVoiceStore
 
 if TYPE_CHECKING:
     from .zerotts_engine import ZeroTtsGgmlEngine
@@ -365,6 +367,124 @@ class MultiVoiceTTSEngine:
             engine.close()
 
 
+class LazyMultiVoiceTTSEngine:
+    """Advertise all voices and swap NghiTTS models on demand within a memory budget."""
+
+    def __init__(
+        self,
+        initial_engines: Iterable[NghiTTSEngine],
+        all_voices: tuple[NghiTtsVoiceSpec, ...],
+        model_root: Path,
+        num_threads: int,
+        max_loaded: int,
+        *,
+        normalize_fn: Callable[[str], str] | None = normalize_vi_text,
+        max_text_chars: int | None = None,
+        min_replacement_interval: float = 1.0,
+    ) -> None:
+        """Retain pre-loaded engines and lazily load others up to the capacity limit."""
+        engine_list = list(initial_engines)
+        if not all_voices:
+            raise ValueError(_ERR_AT_LEAST_ONE_VOICE)
+        if max_loaded < 1:
+            raise ValueError("max_loaded must be at least one")
+        sample_rates = {engine.sample_rate for engine in engine_list}
+        if len(sample_rates) > 1:
+            raise ValueError("Configured TTS voices must use the same sample rate")
+        self._all_voices: dict[str, NghiTtsVoiceSpec] = {v.name: v for v in all_voices}
+        self._model_root = model_root
+        self._num_threads = num_threads
+        self._max_loaded = max_loaded
+        self._normalize_fn = normalize_fn
+        self._max_text_chars = max_text_chars
+        self._min_replacement_interval = min_replacement_interval
+        self._last_replacement_monotonic: float = 0.0
+        # Most recently used voice is at the end.
+        self._engines: OrderedDict[str, NghiTTSEngine] = OrderedDict()
+        for engine in engine_list:
+            self._engines[engine.voice.name] = engine
+        self._default_voice_name = all_voices[0].name
+        self.sample_rate: int = (
+            engine_list[0].sample_rate if engine_list else NghiTtsAudio.SAMPLE_RATE
+        )
+        self.chunks_are_sentences: bool = True
+        self._preset_voices: Mapping[str, object] = {
+            voice.name: {"description": "NghiTTS voice"} for voice in all_voices
+        }
+
+    def _engine(self, voice: str | None) -> NghiTTSEngine:
+        """Return a loaded engine, loading on demand and evicting LRU if at capacity."""
+        name = voice if voice is not None else self._default_voice_name
+        if name in self._engines:
+            self._engines.move_to_end(name)
+            return self._engines[name]
+        voice_spec = self._all_voices.get(name)
+        if voice_spec is None:
+            raise ValueError(f"Unsupported NghiTTS voice: {name!r}")
+
+        now = monotonic()
+        if (
+            len(self._engines) >= self._max_loaded
+            and self._last_replacement_monotonic > 0
+            and (now - self._last_replacement_monotonic) < self._min_replacement_interval
+        ):
+            raise RuntimeError(
+                f"TTS voice replacement rate limit exceeded for {name!r}; please retry later"
+            )
+
+        _LOGGER.info("Loading NghiTTS voice on demand: %s", name)
+        engine = initialize_tts(
+            self._model_root / voice_spec.id,
+            self._num_threads,
+            voice_spec,
+            normalize_fn=self._normalize_fn,
+            max_text_chars=self._max_text_chars,
+        )
+        if not isinstance(engine, NghiTTSEngine):
+            raise TypeError("initialize_tts returned an incompatible engine")
+
+        while len(self._engines) >= self._max_loaded:
+            evicted_name, evicted_engine = self._engines.popitem(last=False)
+            _LOGGER.info("Unloading NghiTTS voice to free memory: %s", evicted_name)
+            evicted_engine.close()
+
+        self._last_replacement_monotonic = monotonic()
+        self.sample_rate = engine.sample_rate
+        self._engines[name] = engine
+        return engine
+
+    def infer_stream(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+    ) -> Iterator[np.ndarray]:
+        """Stream a waveform, loading the requested voice if needed."""
+        return self._engine(voice).infer_stream(text)
+
+    def infer_stream_normalized(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+    ) -> Iterator[np.ndarray]:
+        """Stream already-normalized text, loading the requested voice if needed."""
+        return self._engine(voice).infer_stream_normalized(text, voice=voice)
+
+    def normalize(self, text: str, *, voice: str | None = None) -> str:
+        """Normalize text without loading a voice model."""
+        name = voice if voice is not None else self._default_voice_name
+        if name not in self._all_voices:
+            raise ValueError(f"Unsupported NghiTTS voice: {name!r}")
+        return text if self._normalize_fn is None else self._normalize_fn(text)
+
+    def close(self) -> None:
+        """Release every loaded voice engine."""
+        for engine in self._engines.values():
+            engine.close()
+        self._engines.clear()
+
+
 def get_tts_sample_rate(tts: TTSEngine) -> int:
     """Return a positive engine sample rate, defaulting to the NghiTTS rate when absent."""
     sample_rate = getattr(tts, "sample_rate", NghiTtsAudio.SAMPLE_RATE)
@@ -663,7 +783,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
         tts: TTSEngine,
         wyoming_info_event: Event,
         inference_lock: asyncio.Lock,
-        result_cache: BoundedLruCache[bytes, bytes],
+        result_cache: ResultCache,
         max_text_chars: int,
         queue_timeout: float,
         reader: asyncio.StreamReader,
@@ -675,6 +795,8 @@ class TTSEventHandler(SafeAsyncEventHandler):
         clause_silence_ms: int = TtsSilenceMs.CLAUSE,
         paragraph_silence_ms: int = TtsSilenceMs.PARAGRAPH,
         inference_executor: Executor | None = None,
+        voice_usage_store: RecentVoiceStore | None = None,
+        cache_namespace: bytes = b"",
     ) -> None:
         """Initialize per-connection state around the shared TTS engine."""
         super().__init__(
@@ -688,6 +810,8 @@ class TTSEventHandler(SafeAsyncEventHandler):
         self.wyoming_info_event = wyoming_info_event
         self.inference_lock = inference_lock
         self.result_cache = result_cache
+        self.voice_usage_store = voice_usage_store
+        self.cache_namespace = cache_namespace
         self.max_text_chars = max_text_chars
         self.queue_timeout = queue_timeout
         self.sample_rate = get_tts_sample_rate(tts)
@@ -764,6 +888,8 @@ class TTSEventHandler(SafeAsyncEventHandler):
         request_started = perf_counter()
         production = await self._synthesize(normalized, voice_name)
         success = production is not None
+        if success:
+            await self._record_voice_usage(voice_name)
         audio_seconds = (
             production.total_bytes
             / (self.sample_rate * TtsAudio.SAMPLE_WIDTH * TtsAudio.SAMPLE_CHANNELS)
@@ -811,12 +937,21 @@ class TTSEventHandler(SafeAsyncEventHandler):
         self.is_streaming = True
         self.stream_started_at = perf_counter()
         self.stream_voice_name = voice_name
+        await self._record_voice_usage(voice_name)
         _LOGGER.debug(
             "TTS step=text-stream-start voice=%s max_text_chars=%d",
             voice_name or "default",
             self.max_text_chars,
         )
         return True
+
+    async def _record_voice_usage(self, voice_name: str | None) -> None:
+        """Persist the requested voice or current engine default off the event loop."""
+        if self.voice_usage_store is None:
+            return
+        selected_voice = voice_name or next(iter(self.preset_voices), None)
+        if selected_voice is not None:
+            await asyncio.to_thread(self.voice_usage_store.record, selected_voice)
 
     async def _handle_stream_chunk(self, event: Event) -> bool:
         """Buffer arbitrary text fragments and synthesize complete text segments."""
@@ -1081,6 +1216,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
         digest = sha256()
         digest.update(len(voice_bytes).to_bytes(4, "big"))
         digest.update(voice_bytes)
+        digest.update(self.cache_namespace)
         digest.update(text.encode("utf-8"))
         return digest.digest()
 
@@ -1120,7 +1256,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
         cached_audio: bytes | None = None
         if cache_key is not None:
             cache_lookup_started = perf_counter()
-            cached_audio = self.result_cache.get(cache_key)
+            cached_audio = await asyncio.to_thread(self.result_cache.get, cache_key)
             cache_lookup_seconds += perf_counter() - cache_lookup_started
             cache_status = "hit" if cached_audio is not None else "miss"
 
@@ -1172,7 +1308,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
                     return None
                 if cache_key is not None:
                     cache_lookup_started = perf_counter()
-                    cached_audio = self.result_cache.get(cache_key)
+                    cached_audio = await asyncio.to_thread(self.result_cache.get, cache_key)
                     cache_lookup_seconds += perf_counter() - cache_lookup_started
                     if cached_audio is not None:
                         cache_status = "hit-after-wait"
@@ -1274,7 +1410,8 @@ class TTSEventHandler(SafeAsyncEventHandler):
                     cache_status = "miss-too-large"
                 else:
                     cached_result = b"".join(production.cache_parts)
-                    stored = self.result_cache.put(
+                    stored = await asyncio.to_thread(
+                        self.result_cache.put,
                         cache_key,
                         cached_result,
                         size_bytes=len(cache_key) + len(cached_result),
@@ -1814,6 +1951,51 @@ def initialize_tts_voices(
                 raise TypeError("initialize_tts returned an incompatible engine")
             engines.append(engine)
         return MultiVoiceTTSEngine(engines)
+    except Exception:
+        for engine in engines:
+            engine.close()
+        raise
+
+
+def initialize_lazy_tts_voices(
+    model_root: Path,
+    initial_voices: tuple[NghiTtsVoiceSpec, ...],
+    all_voices: tuple[NghiTtsVoiceSpec, ...],
+    num_threads: int = 0,
+    max_loaded: int = 1,
+    *,
+    normalize_fn: Callable[[str], str] | None = normalize_vi_text,
+    max_text_chars: int | None = None,
+    min_replacement_interval: float = 1.0,
+) -> TTSEngine:
+    """Initialize startup voices eagerly and load remaining voices on demand."""
+    if not all_voices:
+        raise ValueError(_ERR_AT_LEAST_ONE_VOICE)
+    if not initial_voices:
+        raise ValueError(_ERR_AT_LEAST_ONE_VOICE)
+    engines: list[NghiTTSEngine] = []
+    try:
+        for voice in initial_voices:
+            engine = initialize_tts(
+                model_root / voice.id,
+                num_threads,
+                voice,
+                normalize_fn=normalize_fn,
+                max_text_chars=max_text_chars,
+            )
+            if not isinstance(engine, NghiTTSEngine):
+                raise TypeError("initialize_tts returned an incompatible engine")
+            engines.append(engine)
+        return LazyMultiVoiceTTSEngine(
+            engines,
+            all_voices,
+            model_root,
+            num_threads,
+            max_loaded,
+            normalize_fn=normalize_fn,
+            max_text_chars=max_text_chars,
+            min_replacement_interval=min_replacement_interval,
+        )
     except Exception:
         for engine in engines:
             engine.close()
