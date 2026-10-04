@@ -22,6 +22,7 @@ if __name__ == "__main__" and not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from wyoming_vietnamese.const import (
+    DEFAULT_STT_ENGINE,
     HUGGINGFACE_API_MODELS_URL,
     HUGGINGFACE_BASE_URL,
     ZEROTTS_REPO_ID,
@@ -30,7 +31,11 @@ from wyoming_vietnamese.const import (
 from wyoming_vietnamese.const import (
     NGHITTS_MODEL_BASE_URL as _NGHITTS_MODEL_BASE_URL_SOURCE,
 )
-from wyoming_vietnamese.stt_model import STT_MODEL
+from wyoming_vietnamese.stt_model import (
+    DEFAULT_STT_MODEL,
+    STT_MODELS,
+    SttModelSpec,
+)
 from wyoming_vietnamese.tts_model import (
     NGHITTS_VOICES,
     ZEROTTS_MODEL,
@@ -129,23 +134,73 @@ class TtsComparison:
 
 
 @dataclass(frozen=True, slots=True)
-class SttComparison:
-    """Compare the local STT revision and required files with Hugging Face."""
+class SttModelComparison:
+    """Compare one local STT model pin with Hugging Face."""
 
+    engine: str
+    repo: str
+    local_revision: str
     remote_revision: str
     artifacts: tuple[ArtifactComparison, ...]
 
     @property
     def revision_changed(self) -> bool:
         """Return whether the remote repository head moved past the local pin."""
-        return self.remote_revision != STT_MODEL.revision
+        return self.remote_revision != self.local_revision
 
     @property
     def needs_update(self) -> bool:
-        """Return whether the local STT model definition needs review."""
+        """Return whether this STT model definition needs review."""
         return self.revision_changed or any(
             artifact.status in {"CHANGED", "NEW", "REMOVED"} for artifact in self.artifacts
         )
+
+
+@dataclass(frozen=True, slots=True)
+class SttComparison:
+    """Compare the local STT revisions and required files with Hugging Face."""
+
+    models: tuple[SttModelComparison, ...]
+
+    def _default_model(self) -> SttModelComparison | None:
+        """Return the comparison entry for the default STT engine."""
+        for model in self.models:
+            if model.engine == DEFAULT_STT_ENGINE:
+                return model
+        return self.models[0] if self.models else None
+
+    @property
+    def repo(self) -> str:
+        """Return the default STT model repository."""
+        default = self._default_model()
+        return default.repo if default else DEFAULT_STT_MODEL.repo
+
+    @property
+    def local_revision(self) -> str:
+        """Return the default STT model local revision."""
+        default = self._default_model()
+        return default.local_revision if default else DEFAULT_STT_MODEL.revision
+
+    @property
+    def remote_revision(self) -> str:
+        """Return the default STT model remote revision."""
+        default = self._default_model()
+        return default.remote_revision if default else ""
+
+    @property
+    def artifacts(self) -> tuple[ArtifactComparison, ...]:
+        """Return all artifact comparisons across all STT models."""
+        return tuple(artifact for model in self.models for artifact in model.artifacts)
+
+    @property
+    def revision_changed(self) -> bool:
+        """Return whether any remote repository head moved past the local pin."""
+        return any(model.revision_changed for model in self.models)
+
+    @property
+    def needs_update(self) -> bool:
+        """Return whether any local STT model definition needs review."""
+        return any(model.needs_update for model in self.models)
 
 
 @dataclass(frozen=True, slots=True)
@@ -553,20 +608,22 @@ def _remote_hf_tree_entries(repo: str, revision: str, timeout: int) -> dict[str,
     return entries
 
 
-def _remote_stt_revision(timeout: int) -> str:
+def _remote_stt_revision(timeout: int, spec: SttModelSpec = DEFAULT_STT_MODEL) -> str:
     """Read the current Hugging Face repository revision for STT."""
-    return _remote_hf_revision(STT_MODEL.repo, timeout)
+    return _remote_hf_revision(spec.repo, timeout)
 
 
-def _remote_stt_artifacts(revision: str, timeout: int) -> dict[str, str | None]:
+def _remote_stt_artifacts(
+    revision: str, timeout: int, spec: SttModelSpec = DEFAULT_STT_MODEL
+) -> dict[str, str | None]:
     """Read remote SHA-256 digests for the pinned STT file names."""
-    return _remote_hf_tree_entries(STT_MODEL.repo, revision, timeout)
+    return _remote_hf_tree_entries(spec.repo, revision, timeout)
 
 
-def _compare_stt(timeout: int) -> SttComparison:
-    """Compare the pinned STT files with the current Hugging Face head."""
-    remote_revision = _remote_stt_revision(timeout)
-    remote_artifacts = _remote_stt_artifacts(remote_revision, timeout)
+def _compare_stt_model(spec: SttModelSpec, engine: str, timeout: int) -> SttModelComparison:
+    """Compare one pinned STT model with the current Hugging Face head."""
+    remote_revision = _remote_stt_revision(timeout, spec)
+    remote_artifacts = _remote_stt_artifacts(remote_revision, timeout, spec)
     comparisons = tuple(
         ArtifactComparison(
             artifact.remote_name,
@@ -574,9 +631,21 @@ def _compare_stt(timeout: int) -> SttComparison:
             remote_artifacts.get(artifact.remote_name),
             artifact.remote_name in remote_artifacts,
         )
-        for artifact in STT_MODEL.artifacts
+        for artifact in spec.artifacts
     )
-    return SttComparison(remote_revision, comparisons)
+    return SttModelComparison(
+        engine=engine,
+        repo=spec.repo,
+        local_revision=spec.revision,
+        remote_revision=remote_revision,
+        artifacts=comparisons,
+    )
+
+
+def _compare_stt(timeout: int) -> SttComparison:
+    """Compare the pinned STT files with the current Hugging Face head."""
+    models = tuple(_compare_stt_model(spec, engine, timeout) for engine, spec in STT_MODELS.items())
+    return SttComparison(models)
 
 
 def _parse_zerotts_voice_id(path: str) -> str | None:
@@ -767,14 +836,16 @@ def _print_zerotts_report(zerotts: ZeroTtsComparison) -> None:
 
 def _print_stt_report(stt: SttComparison) -> None:
     """Print the STT comparison results."""
-    revision_status = "CHANGED" if stt.revision_changed else "MATCH"
     print("STT")
-    print(f"  Repository: {STT_MODEL.repo}")
-    print(
-        f"  {revision_status:<7} revision local={STT_MODEL.revision} remote={stt.remote_revision}"
-    )
-    for artifact in stt.artifacts:
-        print(_format_artifact(artifact))
+    for model in stt.models:
+        revision_status = "CHANGED" if model.revision_changed else "MATCH"
+        print(f"  [{model.engine}] Repository: {model.repo}")
+        print(
+            f"  {revision_status:<7} revision local={model.local_revision} "
+            f"remote={model.remote_revision}"
+        )
+        for artifact in model.artifacts:
+            print(_format_artifact(artifact))
 
 
 def _print_report(report: ComparisonReport) -> None:
@@ -840,11 +911,23 @@ def _report_to_dict(report: ComparisonReport) -> dict[str, object]:
             ],
         },
         "stt": {
-            "repo": STT_MODEL.repo,
-            "local_revision": STT_MODEL.revision,
+            "repo": report.stt.repo,
+            "local_revision": report.stt.local_revision,
             "remote_revision": report.stt.remote_revision,
             "revision_changed": report.stt.revision_changed,
             "needs_update": report.stt.needs_update,
+            "models": [
+                {
+                    "engine": model.engine,
+                    "repo": model.repo,
+                    "local_revision": model.local_revision,
+                    "remote_revision": model.remote_revision,
+                    "revision_changed": model.revision_changed,
+                    "needs_update": model.needs_update,
+                    "artifacts": [_artifact_to_dict(artifact) for artifact in model.artifacts],
+                }
+                for model in report.stt.models
+            ],
             "artifacts": [_artifact_to_dict(artifact) for artifact in report.stt.artifacts],
         },
     }

@@ -17,8 +17,10 @@ from .const import (
     DEFAULT_MAX_STT_BUFFER_MB,
     DEFAULT_MAX_TTS_TEXT_CHARS,
     DEFAULT_PORT,
+    DEFAULT_STT_ENGINE,
     DEFAULT_TTS_ENGINE,
     ConnectionLimit,
+    SttEngine,
     Timeout,
     TtsEngine,
     TtsSilenceMs,
@@ -139,6 +141,14 @@ def _get_required_text(environ: Mapping[str, str], name: str, default: str) -> s
     raise ValueError(f"{name} must not be empty")
 
 
+def _get_stt_engine(environ: Mapping[str, str]) -> str:
+    """Read and validate the STT engine (zipformer or gipformer)."""
+    raw_engine = environ.get("STT_ENGINE", DEFAULT_STT_ENGINE).strip().lower()
+    if raw_engine not in (SttEngine.ZIPFORMER, SttEngine.GIPFORMER):
+        raise ValueError(f"STT_ENGINE must be one of: {SttEngine.ZIPFORMER}, {SttEngine.GIPFORMER}")
+    return raw_engine
+
+
 def _get_tts_engine(environ: Mapping[str, str]) -> str:
     """Read and validate the TTS engine (nghitts or zerotts)."""
     raw_engine = environ.get("TTS_ENGINE", DEFAULT_TTS_ENGINE).strip().lower()
@@ -195,6 +205,7 @@ class ServerConfig:
     max_active_connections: int
     max_stt_buffer_bytes: int
     tts_cache_enabled: bool = True
+    stt_engine: str = DEFAULT_STT_ENGINE
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> ServerConfig:
@@ -214,8 +225,10 @@ class ServerConfig:
             )
 
         tts_engine = _get_tts_engine(env)
+        stt_engine = _get_stt_engine(env)
         return cls(
             port=_get_int(env, "WYOMING_PORT", DEFAULT_PORT, minimum=1, maximum=65535),
+            stt_engine=stt_engine,
             tts_engine=tts_engine,
             tts_voices=_get_tts_voices(env, tts_engine),
             cache_dir=Path(_get_required_text(env, "CACHE_DIR", DEFAULT_CACHE_DIR)).expanduser(),

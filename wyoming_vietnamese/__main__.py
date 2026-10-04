@@ -36,7 +36,7 @@ from .inference import create_inference_executor
 from .protocol import ByteBudget, ConnectionLimiter
 from .resources import DeviceResources, detect_device_resources, warn_if_low_startup_memory
 from .stt import SherpaSTTEventHandler, get_stt_info, initialize_stt, warm_up_stt
-from .stt_model import STT_MODEL
+from .stt_model import SttModelSpec, get_stt_model
 from .tts import (
     TTSEngine,
     TTSEventHandler,
@@ -81,14 +81,20 @@ async def _drain_inference(
     lock.release()
 
 
-def _log_startup_configuration(server_config: ServerConfig, cpu_threads: int) -> None:
+def _log_startup_configuration(
+    server_config: ServerConfig,
+    cpu_threads: int,
+    stt_model: SttModelSpec | None = None,
+) -> None:
     """Log configured server parameters, directory targets, and model sources."""
+    model = stt_model or get_stt_model(server_config.stt_engine)
     _LOGGER.info(
-        "Configuration: port=%d threads=%d offline=%s tts_engine=%s tts_voices=%s "
-        "tts_cache_enabled=%s",
+        "Configuration: port=%d threads=%d offline=%s stt_engine=%s tts_engine=%s "
+        "tts_voices=%s tts_cache_enabled=%s",
         server_config.port,
         cpu_threads,
         server_config.offline,
+        server_config.stt_engine,
         server_config.tts_engine,
         ",".join(voice.id for voice in server_config.tts_voices),
         server_config.tts_cache_enabled,
@@ -105,8 +111,8 @@ def _log_startup_configuration(server_config: ServerConfig, cpu_threads: int) ->
     )
     _LOGGER.info(
         "Model sources: stt=%s@%s %s_voices=%s",
-        STT_MODEL.repo,
-        STT_MODEL.revision,
+        model.repo,
+        model.revision,
         tts_provider_name.lower(),
         ", ".join(voice.name for voice in server_config.tts_voices),
     )
@@ -321,6 +327,7 @@ async def run_server(
 ) -> None:
     """Initialize models, bind both services, and shut down gracefully."""
     server_config = config or ServerConfig.from_env()
+    stt_model = get_stt_model(server_config.stt_engine)
     cpu_threads = resolve_cpu_threads(server_config.cpu_threads)
     _configure_logging(server_config.log_level)
     resources = detect_device_resources()
@@ -345,7 +352,7 @@ async def run_server(
 
     server_config.cache_dir.mkdir(parents=True, exist_ok=True)
     server_config.download_dir.mkdir(parents=True, exist_ok=True)
-    _log_startup_configuration(server_config, cpu_threads)
+    _log_startup_configuration(server_config, cpu_threads, stt_model)
 
     validate_tts_voices_for_engine(server_config.tts_voices, server_config.tts_engine)
     paths = download_models(
@@ -354,15 +361,16 @@ async def run_server(
         tts_voices=server_config.tts_voices,
         offline=server_config.offline,
         tts_engine=server_config.tts_engine,
+        stt_engine=server_config.stt_engine,
     )
 
-    _LOGGER.info("Initializing Speech-to-Text engine")
+    _LOGGER.info("Initializing Speech-to-Text engine (%s)", server_config.stt_engine)
     stt_recognizer = initialize_stt(
         paths[STT_DIR],
         cpu_threads,
     )
     await asyncio.to_thread(warm_up_stt, stt_recognizer)
-    stt_info = get_stt_info(STT_MODEL.repo, STT_MODEL.revision)
+    stt_info = get_stt_info(stt_model.repo, stt_model.revision, description=stt_model.description)
 
     _LOGGER.info("Initializing Text-to-Speech engine (%s)", server_config.tts_engine)
     tts_engine = _initialize_configured_tts(
@@ -396,7 +404,7 @@ async def run_server(
         stt_recognizer,
         stt_info_event,
         stt_lock,
-        STT_MODEL.repo,
+        stt_model.repo,
         server_config.max_stt_audio_seconds,
         server_config.inference_queue_timeout,
         buffer_budget=stt_buffer_budget,

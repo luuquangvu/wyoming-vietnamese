@@ -14,11 +14,13 @@ import pytest
 
 from wyoming_vietnamese import download as download_module
 from wyoming_vietnamese.const import (
+    DEFAULT_STT_ENGINE,
     STT_DIR,
     TTS_DIR,
     VIETNAMESE_LANGUAGE,
     ZEROTTS_REPO_ID,
     NghiTtsFile,
+    SttEngine,
     TtsEngine,
     ZeroTtsDirectory,
     ZeroTtsFile,
@@ -41,7 +43,13 @@ from wyoming_vietnamese.download import (
     download_models,
     setup_hf_environment,
 )
-from wyoming_vietnamese.stt_model import SttArtifact, SttModelSpec
+from wyoming_vietnamese.stt_model import (
+    GIPFORMER_MODEL,
+    ZIPFORMER_MODEL,
+    SttArtifact,
+    SttModelSpec,
+    get_stt_model,
+)
 from wyoming_vietnamese.tts_model import (
     DEFAULT_NGHITTS_VOICE,
     DEFAULT_ZEROTTS_VOICE,
@@ -101,7 +109,13 @@ def _make_stt_snapshot(directory: Path) -> SttModelSpec:
 
 def _pin_stt_model(monkeypatch: pytest.MonkeyPatch, spec: SttModelSpec) -> None:
     """Point the downloader at a test model spec instead of the shipped one."""
-    monkeypatch.setattr("wyoming_vietnamese.download.STT_MODEL", spec)
+    monkeypatch.setattr("wyoming_vietnamese.download.DEFAULT_STT_MODEL", spec)
+    monkeypatch.setattr(
+        "wyoming_vietnamese.download.get_stt_model",
+        lambda engine=DEFAULT_STT_ENGINE: (
+            spec if engine in (SttEngine.ZIPFORMER, DEFAULT_STT_ENGINE) else get_stt_model(engine)
+        ),
+    )
 
 
 def _make_nghitts_snapshot(directory: Path) -> None:
@@ -603,8 +617,9 @@ def test_download_models_structures_selected_nghitts_voice(
         (DEFAULT_NGHITTS_VOICE, second_voice),
     )
 
+    assert paths[STT_DIR] == tmp_path / "models" / STT_DIR / SttEngine.ZIPFORMER
     assert (paths[STT_DIR] / "encoder.onnx").is_file()
-    assert paths[TTS_DIR] == tmp_path / "models" / TTS_DIR
+    assert paths[TTS_DIR] == tmp_path / "models" / TTS_DIR / TtsEngine.NGHITTS
     assert (paths[TTS_DIR] / DEFAULT_NGHITTS_VOICE.id / NghiTtsFile.MODEL).is_file()
     assert (paths[TTS_DIR] / DEFAULT_NGHITTS_VOICE.id / NghiTtsFile.TOKENS).is_file()
     assert (paths[TTS_DIR] / second_voice.id / NghiTtsFile.MODEL).is_file()
@@ -754,7 +769,7 @@ def test_download_models_structures_zerotts_quality_mode(
         tts_engine=TtsEngine.ZEROTTS,
     )
 
-    assert paths[TTS_DIR] == tmp_path / "models" / TTS_DIR
+    assert paths[TTS_DIR] == tmp_path / "models" / TTS_DIR / TtsEngine.ZEROTTS
     assert (paths[TTS_DIR] / ZeroTtsDirectory.GGUF / ZeroTtsFile.DEFAULT_GGUF_MODEL).is_file()
     assert (paths[TTS_DIR] / "config.json").is_file()
     assert (paths[TTS_DIR] / "tokenizer.json").is_file()
@@ -859,3 +874,204 @@ def test_download_models_rejects_mismatched_voice_spec(tmp_path: Path) -> None:
         )
     assert not (tmp_path / "cache").exists()
     assert not (tmp_path / "models").exists()
+
+
+def test_download_models_structures_gipformer_stt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test download structures STT using Gipformer engine."""
+    stt = tmp_path / "stt-snapshot"
+    tts = tmp_path / "tts-snapshot"
+    stt.mkdir(parents=True, exist_ok=True)
+    for part in ("encoder", "decoder", "joiner"):
+        remote_name = f"{part}.int8.onnx"
+        (stt / remote_name).write_bytes(part.encode())
+    bpe = _sentencepiece_model("<unk>", "xin")
+    (stt / "bpe.model").write_bytes(bpe)
+    spec = SttModelSpec(
+        repo=GIPFORMER_MODEL.repo,
+        revision=GIPFORMER_MODEL.revision,
+        graphs=(
+            SttArtifact("encoder.int8.onnx", "encoder.onnx", sha256(b"encoder").hexdigest()),
+            SttArtifact("decoder.int8.onnx", "decoder.onnx", sha256(b"decoder").hexdigest()),
+            SttArtifact("joiner.int8.onnx", "joiner.onnx", sha256(b"joiner").hexdigest()),
+        ),
+        tokenizer=SttArtifact("bpe.model", "bpe.model", sha256(bpe).hexdigest()),
+        description=GIPFORMER_MODEL.description,
+    )
+    monkeypatch.setattr(
+        "wyoming_vietnamese.download.get_stt_model",
+        lambda engine=DEFAULT_STT_ENGINE: (
+            spec if engine == SttEngine.GIPFORMER else get_stt_model(engine)
+        ),
+    )
+    _make_nghitts_snapshot(tts)
+    sync = Mock(return_value=stt)
+    sync_tts = Mock(return_value=tts)
+    monkeypatch.setattr("wyoming_vietnamese.download._sync_repo", sync)
+    monkeypatch.setattr("wyoming_vietnamese.download._sync_nghitts_model", sync_tts)
+    monkeypatch.setattr("wyoming_vietnamese.download.setup_hf_environment", Mock())
+
+    paths = download_models(
+        tmp_path / "cache",
+        tmp_path / "models",
+        (DEFAULT_NGHITTS_VOICE,),
+        stt_engine=SttEngine.GIPFORMER,
+    )
+
+    assert paths[STT_DIR] == tmp_path / "models" / STT_DIR / SttEngine.GIPFORMER
+    assert paths[TTS_DIR] == tmp_path / "models" / TTS_DIR / TtsEngine.NGHITTS
+    assert (paths[STT_DIR] / "encoder.onnx").is_file()
+    assert sync.call_args.args == (spec.repo, False)
+    assert sync.call_args.kwargs["revision"] == spec.revision
+    assert sync.call_args.kwargs["allow_patterns"] == spec.allow_patterns
+
+
+def test_download_models_rejects_unknown_stt_engine(tmp_path: Path) -> None:
+    """Test download_models rejects unknown STT engine before any synchronization."""
+    with pytest.raises(ValueError, match="STT_ENGINE must be one of"):
+        download_models(
+            tmp_path / "cache",
+            tmp_path / "models",
+            (DEFAULT_NGHITTS_VOICE,),
+            stt_engine="unknown_stt",
+        )
+    assert not (tmp_path / "cache").exists()
+    assert not (tmp_path / "models").exists()
+
+
+def test_structure_stt_files_with_explicit_model_spec(tmp_path: Path) -> None:
+    """Test _structure_stt_files with an explicitly provided SttModelSpec."""
+    snapshot = tmp_path / "snapshot"
+    destination = tmp_path / "model"
+    spec = _make_stt_snapshot(snapshot)
+    destination.mkdir()
+
+    paths = _structure_stt_files(snapshot, destination, stt_model=spec)
+
+    assert (destination / "encoder.onnx").read_bytes() == b"encoder"
+    assert (destination / "decoder.onnx").read_bytes() == b"decoder"
+    assert (destination / "joiner.onnx").read_bytes() == b"joiner"
+    assert (destination / "tokens.txt").read_text(encoding="utf-8").startswith("<unk> 0")
+    assert len(paths) == 4
+
+
+def test_download_models_structures_different_stt_engines_in_separate_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test that two different STT engines structure into separate directories."""
+    stt_zipformer = tmp_path / "zipformer-snapshot"
+    stt_gipformer = tmp_path / "gipformer-snapshot"
+    tts = tmp_path / "tts-snapshot"
+    stt_zipformer.mkdir(parents=True, exist_ok=True)
+    stt_gipformer.mkdir(parents=True, exist_ok=True)
+
+    for part in ("encoder", "decoder", "joiner"):
+        (stt_zipformer / f"{part}.onnx").write_bytes(f"zipformer-{part}".encode())
+        (stt_gipformer / f"{part}.int8.onnx").write_bytes(f"gipformer-{part}".encode())
+    bpe_zip = _sentencepiece_model("<unk>", "zip")
+    bpe_gip = _sentencepiece_model("<unk>", "gip")
+    (stt_zipformer / "bpe.model").write_bytes(bpe_zip)
+    (stt_gipformer / "bpe.model").write_bytes(bpe_gip)
+
+    zip_spec = SttModelSpec(
+        repo=ZIPFORMER_MODEL.repo,
+        revision=ZIPFORMER_MODEL.revision,
+        graphs=(
+            SttArtifact("encoder.onnx", "encoder.onnx", sha256(b"zipformer-encoder").hexdigest()),
+            SttArtifact("decoder.onnx", "decoder.onnx", sha256(b"zipformer-decoder").hexdigest()),
+            SttArtifact("joiner.onnx", "joiner.onnx", sha256(b"zipformer-joiner").hexdigest()),
+        ),
+        tokenizer=SttArtifact("bpe.model", "bpe.model", sha256(bpe_zip).hexdigest()),
+        description=ZIPFORMER_MODEL.description,
+    )
+    gip_spec = SttModelSpec(
+        repo=GIPFORMER_MODEL.repo,
+        revision=GIPFORMER_MODEL.revision,
+        graphs=(
+            SttArtifact(
+                "encoder.int8.onnx", "encoder.onnx", sha256(b"gipformer-encoder").hexdigest()
+            ),
+            SttArtifact(
+                "decoder.int8.onnx", "decoder.onnx", sha256(b"gipformer-decoder").hexdigest()
+            ),
+            SttArtifact("joiner.int8.onnx", "joiner.onnx", sha256(b"gipformer-joiner").hexdigest()),
+        ),
+        tokenizer=SttArtifact("bpe.model", "bpe.model", sha256(bpe_gip).hexdigest()),
+        description=GIPFORMER_MODEL.description,
+    )
+
+    def mock_get_stt_model(engine: str = DEFAULT_STT_ENGINE) -> SttModelSpec:
+        return gip_spec if engine == SttEngine.GIPFORMER else zip_spec
+
+    def mock_sync_repo(repo: str, offline: bool, **kwargs: object) -> Path:
+        return stt_gipformer if repo == GIPFORMER_MODEL.repo else stt_zipformer
+
+    _make_nghitts_snapshot(tts)
+    sync_tts = Mock(return_value=tts)
+    monkeypatch.setattr("wyoming_vietnamese.download.get_stt_model", mock_get_stt_model)
+    monkeypatch.setattr("wyoming_vietnamese.download._sync_repo", mock_sync_repo)
+    monkeypatch.setattr("wyoming_vietnamese.download._sync_nghitts_model", sync_tts)
+    monkeypatch.setattr("wyoming_vietnamese.download.setup_hf_environment", Mock())
+
+    models_dir = tmp_path / "models"
+    zip_paths = download_models(
+        tmp_path / "cache",
+        models_dir,
+        (DEFAULT_NGHITTS_VOICE,),
+        stt_engine=SttEngine.ZIPFORMER,
+    )
+    gip_paths = download_models(
+        tmp_path / "cache",
+        models_dir,
+        (DEFAULT_NGHITTS_VOICE,),
+        stt_engine=SttEngine.GIPFORMER,
+    )
+
+    assert zip_paths[STT_DIR] == models_dir / STT_DIR / SttEngine.ZIPFORMER
+    assert gip_paths[STT_DIR] == models_dir / STT_DIR / SttEngine.GIPFORMER
+    assert (zip_paths[STT_DIR] / "encoder.onnx").read_bytes() == b"zipformer-encoder"
+    assert (gip_paths[STT_DIR] / "encoder.onnx").read_bytes() == b"gipformer-encoder"
+
+
+def test_download_models_structures_different_tts_engines_in_separate_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test that two different TTS engines structure into separate directories."""
+    stt = tmp_path / "stt-snapshot"
+    stt_spec = _make_stt_snapshot(stt)
+    _pin_stt_model(monkeypatch, stt_spec)
+
+    nghitts_snapshot = tmp_path / "nghitts-snapshot"
+    _make_nghitts_snapshot(nghitts_snapshot)
+    zerotts_snapshot = tmp_path / "zerotts-snapshot"
+    tts_spec, test_voice = _make_zerotts_snapshot(zerotts_snapshot)
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec)
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_VOICES", (test_voice,))
+
+    def mock_sync_repo(repo: str, offline: bool, **kwargs: object) -> Path:
+        return zerotts_snapshot if repo == ZEROTTS_REPO_ID else stt
+
+    sync_nghitts = Mock(return_value=nghitts_snapshot)
+    monkeypatch.setattr("wyoming_vietnamese.download._sync_repo", mock_sync_repo)
+    monkeypatch.setattr("wyoming_vietnamese.download._sync_nghitts_model", sync_nghitts)
+    monkeypatch.setattr("wyoming_vietnamese.download.setup_hf_environment", Mock())
+
+    models_dir = tmp_path / "models"
+    nghitts_paths = download_models(
+        tmp_path / "cache",
+        models_dir,
+        (DEFAULT_NGHITTS_VOICE,),
+        tts_engine=TtsEngine.NGHITTS,
+    )
+    zerotts_paths = download_models(
+        tmp_path / "cache",
+        models_dir,
+        (test_voice,),
+        tts_engine=TtsEngine.ZEROTTS,
+    )
+
+    assert nghitts_paths[TTS_DIR] == models_dir / TTS_DIR / TtsEngine.NGHITTS
+    assert zerotts_paths[TTS_DIR] == models_dir / TTS_DIR / TtsEngine.ZEROTTS
+    assert (nghitts_paths[TTS_DIR] / DEFAULT_NGHITTS_VOICE.id / NghiTtsFile.MODEL).is_file()
+    assert (zerotts_paths[TTS_DIR] / "config.json").is_file()

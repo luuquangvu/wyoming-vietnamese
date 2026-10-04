@@ -18,6 +18,7 @@ from urllib.request import Request, urlopen
 
 from .config import get_env_bool
 from .const import (
+    DEFAULT_STT_ENGINE,
     DEFAULT_TTS_ENGINE,
     NGHITTS_MODEL_BASE_URL,
     STT_DIR,
@@ -27,7 +28,7 @@ from .const import (
     TtsEngine,
     ZeroTtsDirectory,
 )
-from .stt_model import STT_MODEL, SttArtifact
+from .stt_model import DEFAULT_STT_MODEL, SttArtifact, SttModelSpec, get_stt_model
 from .tts import validate_tts_voices_for_engine
 from .tts_model import (
     ZEROTTS_MODEL,
@@ -59,6 +60,7 @@ def download_models(
     tts_voices: tuple[AnyVoiceSpec, ...],
     offline: bool = False,
     tts_engine: str = DEFAULT_TTS_ENGINE,
+    stt_engine: str = DEFAULT_STT_ENGINE,
 ) -> dict[str, Path]:
     """Synchronize and verify the selected engine's assets under stable local paths.
 
@@ -68,42 +70,49 @@ def download_models(
         tts_voices: Voices whose assets are required for startup.
         offline: Require every model artifact to be available from local caches.
         tts_engine: Select the NghiTTS or ZeroTTS model source and layout.
+        stt_engine: Select the Zipformer or Gipformer speech-to-text model.
 
     Returns:
         Stable ``stt`` and ``tts`` model directory paths.
 
     Raises:
-        ValueError: If no TTS voice is configured or TTS engine is unknown.
+        ValueError: If no TTS voice is configured, or an engine is unknown.
         TypeError: If configured voices do not match the selected TTS engine.
     """
-    validate_tts_voices_for_engine(tts_voices, tts_engine)
+    tts_engine_name = tts_engine.strip().lower()
+    validate_tts_voices_for_engine(tts_voices, tts_engine_name)
+    stt_engine_name = stt_engine.strip().lower()
+    stt_model = get_stt_model(stt_engine_name)
+
     cache_dir.mkdir(parents=True, exist_ok=True)
     download_dir.mkdir(parents=True, exist_ok=True)
     setup_hf_environment(cache_dir, offline)
 
     _LOGGER.info(
-        "Synchronizing model assets: cache_dir=%s, download_dir=%s, tts_engine=%s",
+        "Synchronizing model assets: cache_dir=%s, download_dir=%s, stt_engine=%s, tts_engine=%s",
         cache_dir,
         download_dir,
-        tts_engine,
+        stt_engine_name,
+        tts_engine_name,
     )
     _LOGGER.info(
-        "STT model: repo=%s revision=%s files=%d",
-        STT_MODEL.repo,
-        STT_MODEL.revision,
-        len(STT_MODEL.artifacts),
+        "STT model: engine=%s repo=%s revision=%s files=%d",
+        stt_engine_name,
+        stt_model.repo,
+        stt_model.revision,
+        len(stt_model.artifacts),
     )
     stt_snapshot = _sync_repo(
-        STT_MODEL.repo,
+        stt_model.repo,
         offline,
-        revision=STT_MODEL.revision,
-        allow_patterns=STT_MODEL.allow_patterns,
+        revision=stt_model.revision,
+        allow_patterns=stt_model.allow_patterns,
     )
 
-    stt_dest = download_dir / STT_DIR
-    tts_dest = download_dir / TTS_DIR
+    stt_dest = download_dir / STT_DIR / stt_engine_name
+    tts_dest = download_dir / TTS_DIR / tts_engine_name
 
-    if tts_engine == TtsEngine.ZEROTTS:
+    if tts_engine_name == TtsEngine.ZEROTTS:
         _LOGGER.info(
             "ZeroTTS model: repo=%s revision=%s files=%d",
             ZEROTTS_MODEL.repo,
@@ -118,16 +127,16 @@ def download_models(
         )
         with _model_structure_lock(download_dir):
             stt_dest.mkdir(parents=True, exist_ok=True)
-            _structure_stt_files(stt_snapshot, stt_dest)
+            _structure_stt_files(stt_snapshot, stt_dest, stt_model)
             _structure_zerotts_files(zerotts_snapshot, tts_dest, tts_voices)
-    elif tts_engine == TtsEngine.NGHITTS:
+    elif tts_engine_name == TtsEngine.NGHITTS:
         nghitts_voices = tuple(voice for voice in tts_voices if isinstance(voice, NghiTtsVoiceSpec))
         tts_snapshots = {
             voice.id: _sync_nghitts_model(cache_dir, offline, voice) for voice in nghitts_voices
         }
         with _model_structure_lock(download_dir):
             stt_dest.mkdir(parents=True, exist_ok=True)
-            _structure_stt_files(stt_snapshot, stt_dest)
+            _structure_stt_files(stt_snapshot, stt_dest, stt_model)
             for voice in nghitts_voices:
                 voice_dest = tts_dest / voice.id
                 voice_dest.mkdir(parents=True, exist_ok=True)
@@ -607,21 +616,26 @@ def _verified_stt_source(snapshot_path: Path, artifact: SttArtifact) -> Path:
     return source
 
 
-def _structure_stt_files(snapshot_path: Path, dest_dir: Path) -> list[Path]:
+def _structure_stt_files(
+    snapshot_path: Path,
+    dest_dir: Path,
+    stt_model: SttModelSpec | None = None,
+) -> list[Path]:
     """Verify every pinned STT artifact and expose stable local filenames."""
+    model = DEFAULT_STT_MODEL if stt_model is None else stt_model
     sources = {
         artifact.remote_name: _verified_stt_source(snapshot_path, artifact)
-        for artifact in STT_MODEL.artifacts
+        for artifact in model.artifacts
     }
 
     copied_paths: list[Path] = []
-    for artifact in STT_MODEL.graphs:
+    for artifact in model.graphs:
         destination = dest_dir / artifact.local_name
         _copy_or_link(sources[artifact.remote_name], destination)
         copied_paths.append(destination)
 
     generated_tokens = dest_dir / "tokens.txt"
-    _generate_tokens_from_bpe(sources[STT_MODEL.tokenizer.remote_name], generated_tokens)
+    _generate_tokens_from_bpe(sources[model.tokenizer.remote_name], generated_tokens)
     copied_paths.append(generated_tokens)
     return copied_paths
 

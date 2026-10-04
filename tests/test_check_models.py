@@ -15,7 +15,7 @@ import pytest
 
 from tools import check_models
 from wyoming_vietnamese.const import ZEROTTS_REPO_ID
-from wyoming_vietnamese.stt_model import STT_MODEL
+from wyoming_vietnamese.stt_model import GIPFORMER_MODEL, ZIPFORMER_MODEL
 from wyoming_vietnamese.tts_model import NGHITTS_VOICES, ZEROTTS_MODEL, ZEROTTS_VOICES
 
 
@@ -84,15 +84,18 @@ def _fake_urlopen(request: Request, **_kwargs: object) -> AbstractContextManager
         return _response(model_files + voice_files)
     if url.endswith(f"/api/models/{ZEROTTS_REPO_ID}"):
         return _response({"sha": ZEROTTS_MODEL.revision})
-    if f"/api/models/{STT_MODEL.repo}/tree/" in url or ("/tree/" in url and STT_MODEL.repo in url):
-        return _response(
-            [
-                {"type": "file", "path": artifact.remote_name, "lfs": {"oid": artifact.sha256}}
-                for artifact in STT_MODEL.artifacts
-            ]
-        )
-    if url.endswith(f"/api/models/{STT_MODEL.repo}"):
-        return _response({"sha": STT_MODEL.revision})
+    for stt_spec in (ZIPFORMER_MODEL, GIPFORMER_MODEL):
+        if f"/api/models/{stt_spec.repo}/tree/" in url or (
+            "/tree/" in url and stt_spec.repo in url
+        ):
+            return _response(
+                [
+                    {"type": "file", "path": artifact.remote_name, "lfs": {"oid": artifact.sha256}}
+                    for artifact in stt_spec.artifacts
+                ]
+            )
+        if url.endswith(f"/api/models/{stt_spec.repo}"):
+            return _response({"sha": stt_spec.revision})
 
     artifact_name = unquote(url.rsplit("/", 1)[-1])
     if artifact_name == "test-voice.onnx":
@@ -232,13 +235,14 @@ def test_remote_stt_artifacts_normalizes_sha256_prefix(monkeypatch) -> None:
     """Test Hugging Face LFS digests may include the sha256 prefix."""
     payload = [
         {"type": "file", "path": artifact.remote_name, "lfs": {"oid": f"sha256:{artifact.sha256}"}}
-        for artifact in STT_MODEL.artifacts
+        for artifact in ZIPFORMER_MODEL.artifacts
     ]
     monkeypatch.setattr(check_models, "_request_json", lambda _url, _timeout: payload)
 
-    artifacts = check_models._remote_stt_artifacts("revision", timeout=1)
+    artifacts = check_models._remote_stt_artifacts("revision", timeout=1, spec=ZIPFORMER_MODEL)
 
-    assert artifacts == {artifact.remote_name: artifact.sha256 for artifact in STT_MODEL.artifacts}
+    expected = {artifact.remote_name: artifact.sha256 for artifact in ZIPFORMER_MODEL.artifacts}
+    assert artifacts == expected
 
 
 def test_extract_zerotts_voice_ids_handles_nested_and_flat_layouts() -> None:
@@ -388,6 +392,34 @@ def test_report_to_dict_includes_zerotts_metadata(monkeypatch: pytest.MonkeyPatc
     artifacts_data = zerotts_data["artifacts"]
     assert isinstance(artifacts_data, list)
     assert len(artifacts_data) == len(check_models._ZEROTTS_CORE_FILES)
+
+    assert "stt" in data
+    stt_data = data["stt"]
+    assert isinstance(stt_data, dict)
+    assert stt_data["repo"] == ZIPFORMER_MODEL.repo
+    assert stt_data["local_revision"] == ZIPFORMER_MODEL.revision
+    assert "models" in stt_data
+    models_list = stt_data["models"]
+    assert isinstance(models_list, list)
+    assert len(models_list) == 2
+
+    for entry, (expected_engine, expected_spec) in zip(
+        models_list,
+        [("zipformer", ZIPFORMER_MODEL), ("gipformer", GIPFORMER_MODEL)],
+        strict=True,
+    ):
+        assert entry["engine"] == expected_engine
+        assert entry["repo"] == expected_spec.repo
+        assert entry["local_revision"] == expected_spec.revision
+        assert entry["remote_revision"] == expected_spec.revision
+        assert entry["needs_update"] is False
+        assert len(entry["artifacts"]) == len(expected_spec.artifacts)
+        for art_dict, art_spec in zip(entry["artifacts"], expected_spec.artifacts, strict=True):
+            assert art_dict["remote_name"] == art_spec.remote_name
+            assert art_dict["local_sha256"] == art_spec.sha256
+            assert art_dict["remote_sha256"] == art_spec.sha256
+            assert art_dict["remote_present"] is True
+            assert art_dict["status"] == "MATCH"
 
 
 def test_print_zerotts_report_formats_sections(capsys: pytest.CaptureFixture[str]) -> None:
@@ -591,3 +623,99 @@ def test_remote_hf_tree_entries_skips_directory_entries_with_npz_path(
     assert voice_ids == ("valid_voice",)
     assert "fake_voice" not in voice_ids
     assert "another_voice" not in voice_ids
+
+
+def test_print_stt_report_formats_all_models(capsys: pytest.CaptureFixture[str]) -> None:
+    """Test console printing formats all STT models."""
+    comparison = check_models.SttComparison(
+        models=(
+            check_models.SttModelComparison(
+                engine="zipformer",
+                repo="hynt/Zipformer",
+                local_revision="rev1",
+                remote_revision="rev1",
+                artifacts=(check_models.ArtifactComparison("encoder.onnx", "sha1", "sha1", True),),
+            ),
+            check_models.SttModelComparison(
+                engine="gipformer",
+                repo="g-group-ai-lab/gipformer",
+                local_revision="rev2",
+                remote_revision="rev3",
+                artifacts=(check_models.ArtifactComparison("decoder.onnx", "sha2", "sha3", True),),
+            ),
+        )
+    )
+    check_models._print_stt_report(comparison)
+    captured = capsys.readouterr().out
+    assert "STT" in captured
+    assert "[zipformer] Repository: hynt/Zipformer" in captured
+    assert "[gipformer] Repository: g-group-ai-lab/gipformer" in captured
+    assert "CHANGED revision local=rev2 remote=rev3" in captured
+
+
+def test_stt_comparison_properties() -> None:
+    """Test SttComparison properties compute aggregate statuses correctly."""
+    m1 = check_models.SttModelComparison(
+        engine="zipformer",
+        repo="repo1",
+        local_revision="rev1",
+        remote_revision="rev1",
+        artifacts=(check_models.ArtifactComparison("a1", "s1", "s1", True),),
+    )
+    m2 = check_models.SttModelComparison(
+        engine="gipformer",
+        repo="repo2",
+        local_revision="rev2",
+        remote_revision="rev2",
+        artifacts=(check_models.ArtifactComparison("a2", "s2", "s2", True),),
+    )
+    comp = check_models.SttComparison((m1, m2))
+    assert comp.repo == "repo1"
+    assert comp.local_revision == "rev1"
+    assert comp.remote_revision == "rev1"
+    assert comp.revision_changed is False
+    assert comp.needs_update is False
+    assert len(comp.artifacts) == 2
+
+    comp_reordered = check_models.SttComparison((m2, m1))
+    assert comp_reordered.repo == "repo1"
+    assert comp_reordered.local_revision == "rev1"
+    assert comp_reordered.remote_revision == "rev1"
+
+    m2_changed = check_models.SttModelComparison(
+        engine="gipformer",
+        repo="repo2",
+        local_revision="rev2",
+        remote_revision="rev_changed",
+        artifacts=(check_models.ArtifactComparison("a2", "s2", "s2", True),),
+    )
+    comp_changed = check_models.SttComparison((m1, m2_changed))
+    assert comp_changed.revision_changed is True
+    assert comp_changed.needs_update is True
+
+    for art in (
+        check_models.ArtifactComparison("a2", "s2", "s_other", True),  # CHANGED
+        check_models.ArtifactComparison("a2", None, "s_remote", True),  # NEW
+        check_models.ArtifactComparison("a2", "s2", None, False),  # REMOVED
+    ):
+        m2_variant = check_models.SttModelComparison(
+            engine="gipformer",
+            repo="repo2",
+            local_revision="rev2",
+            remote_revision="rev2",
+            artifacts=(art,),
+        )
+        comp_variant = check_models.SttComparison((m1, m2_variant))
+        assert comp_variant.revision_changed is False
+        assert comp_variant.needs_update is True
+
+    m2_unknown = check_models.SttModelComparison(
+        engine="gipformer",
+        repo="repo2",
+        local_revision="rev2",
+        remote_revision="rev2",
+        artifacts=(check_models.ArtifactComparison("a2", "s2", None, True),),  # UNKNOWN
+    )
+    comp_unknown = check_models.SttComparison((m1, m2_unknown))
+    assert comp_unknown.revision_changed is False
+    assert comp_unknown.needs_update is False
