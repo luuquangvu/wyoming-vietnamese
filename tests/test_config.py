@@ -11,7 +11,9 @@ from wyoming_vietnamese.config import (
 )
 from wyoming_vietnamese.const import (
     DEFAULT_PORT,
+    DEFAULT_STT_ENGINE,
     DEFAULT_TTS_ENGINE,
+    SttEngine,
     TtsEngine,
     TtsSilenceMs,
 )
@@ -70,6 +72,7 @@ def test_server_config_defaults() -> None:
     assert config.port == DEFAULT_PORT
     assert config.cpu_threads == 0
     assert config.offline is False
+    assert config.stt_engine == DEFAULT_STT_ENGINE
     assert config.tts_engine == DEFAULT_TTS_ENGINE
     assert [voice.id for voice in config.tts_voices] == [DEFAULT_NGHITTS_VOICE_ID]
     assert config.event_timeout == 60
@@ -174,6 +177,7 @@ def test_server_config_accepts_tts_voice_separators(value: str) -> None:
         ({"TTS_VOICE": "ngoc-huyen-moi,ngoc-huyen-moi"}, "duplicate"),
         ({"LOG_LEVEL": "verbose"}, "LOG_LEVEL is invalid"),
         ({"TTS_ENGINE": "invalid"}, "TTS_ENGINE must be one of"),
+        ({"STT_ENGINE": "invalid"}, "STT_ENGINE must be one of"),
         (
             {"TTS_ENGINE": TtsEngine.ZEROTTS, "TTS_VOICE": "ngoc-huyen-moi"},
             "TTS_VOICE must be one of",
@@ -246,3 +250,15 @@ def test_server_config_tts_cache_enabled_default() -> None:
     """Test server config enables TTS cache by default."""
     config = ServerConfig.from_env({})
     assert config.tts_cache_enabled is True
+
+
+def test_server_config_stt_engine_zipformer() -> None:
+    """Test server config parses Zipformer STT engine explicitly."""
+    config = ServerConfig.from_env({"STT_ENGINE": SttEngine.ZIPFORMER})
+    assert config.stt_engine == SttEngine.ZIPFORMER
+
+
+def test_server_config_stt_engine_gipformer() -> None:
+    """Test server config parses Gipformer STT engine explicitly."""
+    config = ServerConfig.from_env({"STT_ENGINE": SttEngine.GIPFORMER})
+    assert config.stt_engine == SttEngine.GIPFORMER

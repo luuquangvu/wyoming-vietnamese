@@ -32,6 +32,7 @@ from .const import (
 from .cpu import resolve_cpu_threads
 from .inference import run_inference
 from .protocol import ByteBudget, SafeAsyncEventHandler, is_vietnamese_language
+from .stt_model import DEFAULT_STT_MODEL, STT_MODELS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -509,8 +510,28 @@ class SherpaSTTEventHandler(SafeAsyncEventHandler):
         self.converter = None
 
 
-def get_stt_info(model_name: str, model_version: str | None = None) -> Info:
+def _resolve_stt_description(model_name: str, description: str | None = None) -> str:
+    """Resolve the STT model description from explicit value or matched SttModelSpec."""
+    if description is not None:
+        return description
+    normalized = model_name.strip().lower()
+    return next(
+        (
+            spec.description
+            for engine, spec in STT_MODELS.items()
+            if spec.repo.lower() == normalized or engine == normalized
+        ),
+        DEFAULT_STT_MODEL.description,
+    )
+
+
+def get_stt_info(
+    model_name: str,
+    model_version: str | None = None,
+    description: str | None = None,
+) -> Info:
     """Build Wyoming discovery information for the STT service."""
+    model_desc = _resolve_stt_description(model_name, description)
     return Info(
         asr=[
             AsrProgram(
@@ -522,7 +543,7 @@ def get_stt_info(model_name: str, model_version: str | None = None) -> Info:
                 models=[
                     AsrModel(
                         name=model_name,
-                        description="Zipformer RNNT STT model",
+                        description=model_desc,
                         attribution=Attribution(
                             name=model_name.split("/", maxsplit=1)[0],
                             url=f"{HUGGINGFACE_BASE_URL}/{model_name}",

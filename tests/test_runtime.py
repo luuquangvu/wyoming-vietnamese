@@ -30,11 +30,19 @@ from wyoming_vietnamese.cache import BoundedLruCache as RealBoundedLruCache
 from wyoming_vietnamese.cache import PersistentAudioCache as RealPersistentAudioCache
 from wyoming_vietnamese.combined import CombinedEventHandler, combine_service_info
 from wyoming_vietnamese.config import ServerConfig
-from wyoming_vietnamese.const import PROGRAM_NAME, STT_DIR, TTS_CACHE_DIR, TTS_DIR, TtsEngine
+from wyoming_vietnamese.const import (
+    PROGRAM_NAME,
+    STT_DIR,
+    TTS_CACHE_DIR,
+    TTS_DIR,
+    SttEngine,
+    TtsEngine,
+)
 from wyoming_vietnamese.cpu import resolve_cpu_threads
 from wyoming_vietnamese.protocol import ConnectionLimiter
 from wyoming_vietnamese.resources import DeviceResources, DeviceTier
 from wyoming_vietnamese.stt import get_stt_info
+from wyoming_vietnamese.stt_model import GIPFORMER_MODEL
 from wyoming_vietnamese.tts import get_tts_info
 from wyoming_vietnamese.tts_model import (
     DEFAULT_NGHITTS_VOICE,
@@ -501,6 +509,7 @@ async def test_run_server_applies_resource_limits_to_selected_recent_voice(
         tts_voices=config.tts_voices,
         offline=False,
         tts_engine=TtsEngine.NGHITTS,
+        stt_engine=SttEngine.ZIPFORMER,
     )
     init_tts.assert_not_called()
     init_lazy.assert_called_once_with(
@@ -587,6 +596,7 @@ async def test_run_server_starts_zerotts_engine(
         tts_voices=(DEFAULT_ZEROTTS_VOICE,),
         offline=False,
         tts_engine=TtsEngine.ZEROTTS,
+        stt_engine=SttEngine.ZIPFORMER,
     )
     init_zerotts.assert_called_once_with(
         tmp_path / TTS_DIR,
@@ -759,3 +769,64 @@ def test_main_handles_terminal_failures(
         with pytest.raises(SystemExit) as exit_error:
             main()
         assert exit_error.value.code == 1
+
+
+async def test_run_server_starts_gipformer_stt_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test run server starts combined service with Gipformer STT engine."""
+    server = FakeServer()
+    tts = ClosableTTS()
+    warm_up_stt_mock = Mock()
+    init_stt_mock = Mock(return_value=object())
+    download = Mock(return_value={STT_DIR: tmp_path / STT_DIR, TTS_DIR: tmp_path / TTS_DIR})
+    get_stt_info_mock = Mock(return_value=Info())
+
+    monkeypatch.setattr("wyoming_vietnamese.__main__.download_models", download)
+    monkeypatch.setattr("wyoming_vietnamese.__main__.initialize_stt", init_stt_mock)
+    monkeypatch.setattr("wyoming_vietnamese.__main__.warm_up_stt", warm_up_stt_mock)
+    monkeypatch.setattr("wyoming_vietnamese.__main__.initialize_tts_voices", Mock(return_value=tts))
+    monkeypatch.setattr("wyoming_vietnamese.__main__.warm_up_tts", Mock())
+    monkeypatch.setattr("wyoming_vietnamese.__main__.get_stt_info", get_stt_info_mock)
+    monkeypatch.setattr("wyoming_vietnamese.__main__.get_tts_info", Mock(return_value=Info()))
+    monkeypatch.setattr(
+        "wyoming_vietnamese.__main__.AsyncServer.from_uri",
+        Mock(side_effect=[server]),
+    )
+
+    executor = Mock()
+    monkeypatch.setattr(
+        "wyoming_vietnamese.__main__.create_inference_executor",
+        Mock(return_value=executor),
+    )
+    stop_event = asyncio.Event()
+    stop_event.set()
+
+    config = ServerConfig.from_env(
+        {
+            "WYOMING_PORT": "10300",
+            "CACHE_DIR": str(tmp_path / "cache"),
+            "DOWNLOAD_DIR": str(tmp_path / "models"),
+            "STT_ENGINE": "gipformer",
+        }
+    )
+    await run_server(config, stop_event)
+
+    download.assert_called_once_with(
+        cache_dir=config.cache_dir,
+        download_dir=config.download_dir,
+        tts_voices=config.tts_voices,
+        offline=False,
+        tts_engine=TtsEngine.NGHITTS,
+        stt_engine=SttEngine.GIPFORMER,
+    )
+    init_stt_mock.assert_called_once_with(
+        tmp_path / STT_DIR,
+        resolve_cpu_threads(0),
+    )
+    warm_up_stt_mock.assert_called_once()
+    get_stt_info_mock.assert_called_once_with(
+        GIPFORMER_MODEL.repo,
+        GIPFORMER_MODEL.revision,
+        description=GIPFORMER_MODEL.description,
+    )

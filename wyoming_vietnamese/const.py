@@ -30,6 +30,23 @@ class TtsCacheFile(StrEnum):
     TEMP_PREFIX = ".tts-"
 
 
+class SttEngine(StrEnum):
+    """Supported speech-to-text recognition engines."""
+
+    ZIPFORMER = "zipformer"
+    GIPFORMER = "gipformer"
+
+
+DEFAULT_STT_ENGINE = SttEngine.ZIPFORMER
+
+
+class SttProvider(StrEnum):
+    """Provider attribution labels for speech-to-text engines."""
+
+    ZIPFORMER = "Zipformer"
+    GIPFORMER = "Gipformer"
+
+
 class TtsEngine(StrEnum):
     """Supported text-to-speech synthesis engines."""
 

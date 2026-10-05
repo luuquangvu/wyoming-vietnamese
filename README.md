@@ -13,12 +13,28 @@ Toàn bộ quá trình xử lý âm thanh và suy luận AI (inference) đều d
 
 - **Tất cả trong một (All-in-One: STT & TTS)**: Tích hợp đồng thời cả nhận diện giọng nói lẫn chuyển văn bản thành giọng đọc tiếng Việt trong duy nhất một container Docker, dùng chung một cổng mạng (`10300`), giúp tiết kiệm tài nguyên và tinh giản cấu hình trên Home Assistant.
 - **Bảo mật và Riêng tư tuyệt đối (100% Local & Privacy)**: Mọi dữ liệu thu âm, câu lệnh điều khiển và phản hồi nhà thông minh của gia đình bạn đều được xử lý nội bộ, không bao giờ bị chuyển ra ngoài Internet.
+- **Linh hoạt lựa chọn 2 engine STT chất lượng cao**:
+  - **Engine Zipformer (`STT_ENGINE: zipformer` - Mặc định)**: Mô hình `hynt/Zipformer-30M-RNNT-6000h` (30M tham số). Siêu nhẹ, tốc độ nhận diện tức thì, tiêu thụ rất ít tài nguyên phần cứng, lý tưởng cho Raspberry Pi 4/5 và NAS.
+  - **Engine Gipformer (`STT_ENGINE: gipformer`)**: Mô hình `g-group-ai-lab/gipformer1.5-68M-rnnt` (68M tham số). Đạt độ chính xác hàng đầu (SOTA), nhận diện vượt trội trong môi trường nhiễu, đàm thoại thực tế và đa dạng phương ngữ Bắc - Trung - Nam.
 - **Linh hoạt lựa chọn 2 engine TTS thế hệ mới**:
   - **Engine NghiTTS (`TTS_ENGINE: nghitts`)**: Xây dựng trên kiến trúc VITS (22.05 kHz) chạy qua runtime C++ `sherpa-onnx` tối ưu cao. Tốc độ phản hồi gần như tức thì, tiêu thụ rất ít tài nguyên phần cứng, rất lý tưởng cho Raspberry Pi 4/5, NAS hoặc các dòng Mini PC tiết kiệm điện.
   - **Engine ZeroTTS (`TTS_ENGINE: zerotts`)**: Sử dụng mô hình AI ngôn ngữ giọng nói ZeroTTS (định dạng GGUF Q8_0) kết hợp MOSS Audio Codec 48 kHz qua runtime C++ GGML. Chất âm chuẩn phòng thu, ngữ điệu truyền cảm và biểu cảm sống động như người thật.
 - **Thư viện 28 giọng đọc phong phú**: Cung cấp sẵn 20 giọng NghiTTS và 8 giọng ZeroTTS với đầy đủ các vùng miền Bắc - Trung - Nam, giọng nam, giọng nữ, đa dạng phong cách từ trợ lý ảo, phát thanh viên, MC cho đến đọc truyện, tâm sự.
 - **Xử lý ngắt nghỉ tự nhiên theo ngữ pháp**: Thuật toán tự động nhận diện cấu trúc câu (dấu chấm, phẩy, hai chấm...) và các đoạn văn để căn chỉnh khoảng lặng hợp lý, giúp câu thoại liền mạch, lưu loát, không bị dồn chữ hay cảm giác "đọc như máy".
 - **Tự động cấu hình & Sẵn sàng chạy offline**: Tự động tải và kiểm tra toàn vẹn (checksum SHA-256) các mô hình ở lần khởi chạy đầu, lưu vào Docker volume và sẵn sàng vận hành lâu dài mà không cần duy trì kết nối Internet.
+
+---
+
+## So sánh nhanh 2 engine STT
+
+| Tiêu chí                | Engine Zipformer (`zipformer` - Mặc định)           | Engine Gipformer (`gipformer`)                                                           |
+| :---------------------- | :-------------------------------------------------- | :--------------------------------------------------------------------------------------- |
+| **Mô hình**             | `hynt/Zipformer-30M-RNNT-6000h`                     | `g-group-ai-lab/gipformer1.5-68M-rnnt`                                                   |
+| **Kiến trúc cốt lõi**   | Zipformer Transducer (INT8 ONNX) qua `sherpa-onnx`  | Zipformer Transducer (INT8 ONNX) qua `sherpa-onnx`                                       |
+| **Số lượng tham số**    | 30 triệu (30M)                                      | 68 triệu (68M)                                                                           |
+| **Tốc độ nhận diện**    | Siêu nhanh, độ trễ tối thiểu                        | Nhanh, mượt mà trên phần cứng hiện đại                                                   |
+| **Đặc trưng nhận diện** | Rất nhẹ, chuẩn từ vựng câu lệnh gia đình thông dụng | Độ chính xác SOTA, kháng nhiễu xuất sắc, nhận diện cực tốt đàm thoại và tiếng địa phương |
+| **Yêu cầu phần cứng**   | Tối ưu cho Raspberry Pi 4/5, Mini PC, NAS           | Phù hợp Raspberry Pi 5, Mini PC x86, máy chủ gia đình                                    |
 
 ---
 
@@ -205,6 +221,7 @@ environment:
 | Biến môi trường |           Mặc định            | Mô tả chi tiết                                                                                                                   |
 | :-------------- | :---------------------------: | :------------------------------------------------------------------------------------------------------------------------------- |
 | `WYOMING_PORT`  |            `10300`            | Cổng TCP dịch vụ lắng nghe cho giao thức Wyoming.                                                                                |
+| `STT_ENGINE`    |          `zipformer`          | Bộ nhận diện giọng nói: `zipformer` (30M, siêu nhẹ) hoặc `gipformer` (Gipformer 1.5 68M SOTA).                                   |
 | `TTS_ENGINE`    |           `nghitts`           | Bộ tạo giọng đọc: `nghitts` (nhẹ, nhanh qua sherpa-onnx) hoặc `zerotts` (AI Neural 48 kHz qua GGML C-FFI).                       |
 | `TTS_VOICE`     | _(giọng mặc định của engine)_ | Danh sách mã giọng kích hoạt, phân cách bằng dấu phẩy hoặc khoảng trắng (giọng đầu tiên là mặc định).                            |
 | `LOG_LEVEL`     |            `info`             | Mức độ chi tiết của nhật ký hệ thống (`debug`, `info`, `warning`, `error`).                                                      |
@@ -317,6 +334,7 @@ Dự án được xây dựng và hoàn thiện dựa trên các công trình m�
 - [nghimestudio/nghitts](https://github.com/nghimestudio/nghitts): Cung cấp các mô hình giọng đọc tiếng Việt (TTS) chất lượng cao cho engine `nghitts`.
 - [zeroweight-ai/ZeroTTS](https://github.com/zeroweight-ai/ZeroTTS): Cung cấp mô hình ngôn ngữ giọng nói ZeroTTS và runtime C++ GGML cho engine `zerotts`.
 - [hynt](https://huggingface.co/hynt): Cung cấp mô hình nhận diện giọng nói tiếng Việt `Zipformer-30M-RNNT-6000h` (STT).
+- [g-group-ai-lab](https://huggingface.co/g-group-ai-lab): Cung cấp mô hình nhận diện giọng nói tiếng Việt `gipformer1.5-68M-rnnt` (STT).
 - [k2-fsa/sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx): Thư viện suy luận offline tối ưu cao cho cả STT và TTS.
 - [Wyoming Protocol](https://github.com/OHF-Voice/wyoming): Chuẩn giao thức mở cho trợ lý giọng nói trong hệ sinh thái Home Assistant.
 

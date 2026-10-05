@@ -24,6 +24,7 @@ from wyoming_vietnamese.protocol import ByteBudget
 from wyoming_vietnamese.stt import (
     SherpaSTTEventHandler,
     STTRecognizer,
+    _resolve_stt_description,
     get_stt_info,
     initialize_stt,
     warm_up_stt,
@@ -441,8 +442,32 @@ def test_stt_info_uses_configured_model() -> None:
     model = info.asr[0].models[0]
     assert model.name == "custom/model"
     assert model.version == "revision"
+    assert model.description == "Zipformer RNNT STT model"
     assert model.attribution.url.endswith("custom/model")
     assert info.asr[0].supports_transcript_streaming is False
+
+
+def test_stt_info_with_gipformer_and_custom_description() -> None:
+    """Test stt info with Gipformer model name and explicit description."""
+    info_gip = get_stt_info("g-group-ai-lab/gipformer1.5-68M-rnnt", "dd9227d")
+    assert info_gip.asr[0].models[0].description == "Gipformer 1.5 68M RNNT STT model"
+    assert info_gip.asr[0].models[0].attribution.name == "g-group-ai-lab"
+
+    info_custom = get_stt_info("custom/model", description="Custom STT description")
+    assert info_custom.asr[0].models[0].description == "Custom STT description"
+
+
+def test_resolve_stt_description_helper() -> None:
+    """Test _resolve_stt_description resolves descriptions from SttModelSpec."""
+    assert _resolve_stt_description("hynt/Zipformer-30M-RNNT-6000h") == "Zipformer RNNT STT model"
+    assert (
+        _resolve_stt_description("g-group-ai-lab/gipformer1.5-68M-rnnt")
+        == "Gipformer 1.5 68M RNNT STT model"
+    )
+    assert _resolve_stt_description("zipformer") == "Zipformer RNNT STT model"
+    assert _resolve_stt_description("gipformer") == "Gipformer 1.5 68M RNNT STT model"
+    assert _resolve_stt_description("unknown", description="Custom") == "Custom"
+    assert _resolve_stt_description("unknown") == "Zipformer RNNT STT model"
 
 
 def test_warm_up_stt_runs_silence_through_recognizer() -> None:

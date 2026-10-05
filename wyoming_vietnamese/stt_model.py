@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .const import DEFAULT_STT_ENGINE, SttEngine
+
 
 @dataclass(frozen=True, slots=True)
 class SttArtifact:
@@ -28,6 +30,7 @@ class SttModelSpec:
     revision: str
     graphs: tuple[SttArtifact, ...]
     tokenizer: SttArtifact
+    description: str = "Zipformer RNNT STT model"
 
     @property
     def artifacts(self) -> tuple[SttArtifact, ...]:
@@ -41,7 +44,7 @@ class SttModelSpec:
 
 
 # Verified against the repository at the pinned commit on 2026-08-11.
-STT_MODEL = SttModelSpec(
+ZIPFORMER_MODEL = SttModelSpec(
     repo="hynt/Zipformer-30M-RNNT-6000h",
     revision="ad6f873b5f5b6ed083821253a88d81afed2505c4",
     graphs=(
@@ -67,4 +70,50 @@ STT_MODEL = SttModelSpec(
         "bpe.model",
         "002894e7a82d80ffa5e25008ec8c5496159db804005e2103de96b01b4c13d445",
     ),
+    description="Zipformer RNNT STT model",
 )
+
+# Verified against the repository at the pinned commit on 2026-09-17.
+GIPFORMER_MODEL = SttModelSpec(
+    repo="g-group-ai-lab/gipformer1.5-68M-rnnt",
+    revision="dd9227dcd8705c13f33bdbe59728d546ab94480f",
+    graphs=(
+        SttArtifact(
+            "encoder.int8.onnx",
+            "encoder.onnx",
+            "b528768939c7711a889be81a718ea7f2ee50d0d2d384d53f399e15b44bd9408c",
+        ),
+        SttArtifact(
+            "decoder.int8.onnx",
+            "decoder.onnx",
+            "e0a156b5454722a524230f9e35d5d928cfcdd3723437b418e5bd5e04f1c3a101",
+        ),
+        SttArtifact(
+            "joiner.int8.onnx",
+            "joiner.onnx",
+            "12636559d135315f002a1e1b477077d415e888477378db0fd450aee5b21ac551",
+        ),
+    ),
+    tokenizer=SttArtifact(
+        "bpe.model",
+        "bpe.model",
+        "289dbb44527c13c419ae3a4d8ce6a349f01a97f8777e69934a77e3692d2f10db",
+    ),
+    description="Gipformer 1.5 68M RNNT STT model",
+)
+
+STT_MODELS: dict[str, SttModelSpec] = {
+    SttEngine.ZIPFORMER: ZIPFORMER_MODEL,
+    SttEngine.GIPFORMER: GIPFORMER_MODEL,
+}
+
+DEFAULT_STT_MODEL = ZIPFORMER_MODEL
+
+
+def get_stt_model(engine: str = DEFAULT_STT_ENGINE) -> SttModelSpec:
+    """Resolve one supported STT model specification or report the available choices."""
+    try:
+        return STT_MODELS[engine.strip().lower()]
+    except KeyError as err:
+        choices = ", ".join(STT_MODELS)
+        raise ValueError(f"STT_ENGINE must be one of: {choices}") from err
