@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import fcntl
 import json
 import logging
 import os
 import shutil
-from collections.abc import Iterator, Sequence
-from contextlib import contextmanager, suppress
+from collections.abc import Generator, Sequence
 from hashlib import file_digest, sha256
 from pathlib import Path
 from typing import Final
@@ -294,8 +294,8 @@ def _sync_nghitts_model(
     return snapshot_path
 
 
-@contextmanager
-def _model_structure_lock(download_dir: Path) -> Iterator[None]:
+@contextlib.contextmanager
+def _model_structure_lock(download_dir: Path) -> Generator[None]:
     """Serialize generated model-directory updates across server processes."""
     lock_path = download_dir / ".structure.lock"
     with lock_path.open("a+b") as lock_file:
@@ -768,7 +768,7 @@ def _copy_or_link(src: Path, dst: Path) -> None:
     source = src.resolve(strict=True)
     source_stat = source.stat()
     if dst.is_file():
-        with suppress(OSError):
+        with contextlib.suppress(OSError):
             if os.path.samefile(source, dst):
                 return
         destination_stat = dst.stat()

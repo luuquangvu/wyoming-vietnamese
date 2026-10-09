@@ -5,7 +5,7 @@ Giải pháp nhận diện giọng nói (**STT** - Speech-to-Text) và phát gi�
 Toàn bộ quá trình xử lý âm thanh và suy luận AI (inference) đều diễn ra ngay trên phần cứng của bạn trong mạng nội bộ (LAN): **không phụ thuộc dịch vụ đám mây (cloud-free), không mất phí API định kỳ và không gửi dữ liệu ra bên ngoài**.
 
 > [!NOTE]
-> Hệ thống hoạt động hoàn toàn ngoại tuyến (**100% offline**) sau khi đã tải các mô hình AI và giọng đọc về bộ nhớ đệm (cache) ở lần khởi động đầu tiên. Nếu bạn thay đổi danh sách giọng đọc (`TTS_VOICE`) hoặc chuyển sang engine khác chưa có sẵn trong volume lưu trữ, container sẽ cần kết nối Internet để nạp thêm các tệp tương ứng.
+> Hệ thống hoạt động hoàn toàn ngoại tuyến (**100% offline**) khi các mô hình AI và giọng đọc đã có sẵn trong volume lưu trữ. Container chỉ cần kết nối Internet khi các tài nguyên được chọn còn thiếu và hệ thống chỉ tự động tải về khi `OFFLINE: false` (mặc định). Nếu bạn đổi engine nhận diện (`STT_ENGINE`), engine giọng đọc (`TTS_ENGINE`) hoặc chọn giọng đọc (`TTS_VOICE`) chưa có sẵn trong volume, container sẽ tự động tải về trừ khi bạn bật chế độ ngoại tuyến (`OFFLINE: true`).
 
 ---
 
@@ -14,11 +14,11 @@ Toàn bộ quá trình xử lý âm thanh và suy luận AI (inference) đều d
 - **Tất cả trong một (All-in-One: STT & TTS)**: Tích hợp đồng thời cả nhận diện giọng nói lẫn chuyển văn bản thành giọng đọc tiếng Việt trong duy nhất một container Docker, dùng chung một cổng mạng (`10300`), giúp tiết kiệm tài nguyên và tinh giản cấu hình trên Home Assistant.
 - **Bảo mật và Riêng tư tuyệt đối (100% Local & Privacy)**: Mọi dữ liệu thu âm, câu lệnh điều khiển và phản hồi nhà thông minh của gia đình bạn đều được xử lý nội bộ, không bao giờ bị chuyển ra ngoài Internet.
 - **Linh hoạt lựa chọn 2 engine STT chất lượng cao**:
-  - **Engine Zipformer (`STT_ENGINE: zipformer` - Mặc định)**: Mô hình `hynt/Zipformer-30M-RNNT-6000h` (30M tham số). Siêu nhẹ, tốc độ nhận diện tức thì, tiêu thụ rất ít tài nguyên phần cứng, lý tưởng cho Raspberry Pi 4/5 và NAS.
-  - **Engine Gipformer (`STT_ENGINE: gipformer`)**: Mô hình `g-group-ai-lab/gipformer1.5-68M-rnnt` (68M tham số). Đạt độ chính xác hàng đầu (SOTA), nhận diện vượt trội trong môi trường nhiễu, đàm thoại thực tế và đa dạng phương ngữ Bắc - Trung - Nam.
+  - **Engine Zipformer (`STT_ENGINE: zipformer` - Mặc định)**: Mô hình `hynt/Zipformer-30M-RNNT-6000h` (30M tham số). Siêu nhẹ, tốc độ nhận diện tức thì, độ trễ tối thiểu, tiêu thụ rất ít tài nguyên phần cứng, đặc biệt phù hợp cho Raspberry Pi 4, NAS hoặc các thiết bị cấu hình khiêm tốn.
+  - **Engine Gipformer (`STT_ENGINE: gipformer`)**: Mô hình `g-group-ai-lab/gipformer1.5-68M-rnnt` (68M tham số). Đạt độ chính xác hàng đầu (SOTA), khả năng kháng ồn môi trường xuất sắc (tiếng TV, quạt gió, tạp âm sinh hoạt), nhận diện đàm thoại tự nhiên và chuẩn xác cả 3 phương ngữ Bắc - Trung - Nam, chạy rất mượt mà trên Raspberry Pi 5 và x86 Mini PC.
 - **Linh hoạt lựa chọn 2 engine TTS thế hệ mới**:
-  - **Engine NghiTTS (`TTS_ENGINE: nghitts`)**: Xây dựng trên kiến trúc VITS (22.05 kHz) chạy qua runtime C++ `sherpa-onnx` tối ưu cao. Tốc độ phản hồi gần như tức thì, tiêu thụ rất ít tài nguyên phần cứng, rất lý tưởng cho Raspberry Pi 4/5, NAS hoặc các dòng Mini PC tiết kiệm điện.
-  - **Engine ZeroTTS (`TTS_ENGINE: zerotts`)**: Sử dụng mô hình AI ngôn ngữ giọng nói ZeroTTS (định dạng GGUF Q8_0) kết hợp MOSS Audio Codec 48 kHz qua runtime C++ GGML. Chất âm chuẩn phòng thu, ngữ điệu truyền cảm và biểu cảm sống động như người thật.
+  - **Engine NghiTTS (`TTS_ENGINE: nghitts` - Mặc định)**: Xây dựng trên kiến trúc VITS (22.05 kHz) chạy qua runtime C++ `sherpa-onnx` tối ưu cao. Tốc độ phản hồi gần như tức thì, tiêu thụ rất ít tài nguyên phần cứng, rất lý tưởng cho Raspberry Pi 4/5, NAS hoặc các dòng Mini PC tiết kiệm điện.
+  - **Engine ZeroTTS (`TTS_ENGINE: zerotts`)**: Sử dụng mô hình AI ngôn ngữ giọng nói ZeroTTS (định dạng GGUF Q8_0) kết hợp MOSS Audio Codec 48 kHz qua runtime C++ GGML. Chất âm chuẩn phòng thu, ngữ điệu truyền cảm và biểu cảm sống động như người thật. Hoạt động mượt mà nhất trên CPU x86 hỗ trợ tập lệnh **AVX-512**, đáp ứng vừa đủ trên **AVX2**, hiệu năng sẽ kém trên các đời CPU cũ hơn.
 - **Thư viện 28 giọng đọc phong phú**: Cung cấp sẵn 20 giọng NghiTTS và 8 giọng ZeroTTS với đầy đủ các vùng miền Bắc - Trung - Nam, giọng nam, giọng nữ, đa dạng phong cách từ trợ lý ảo, phát thanh viên, MC cho đến đọc truyện, tâm sự.
 - **Xử lý ngắt nghỉ tự nhiên theo ngữ pháp**: Thuật toán tự động nhận diện cấu trúc câu (dấu chấm, phẩy, hai chấm...) và các đoạn văn để căn chỉnh khoảng lặng hợp lý, giúp câu thoại liền mạch, lưu loát, không bị dồn chữ hay cảm giác "đọc như máy".
 - **Tự động cấu hình & Sẵn sàng chạy offline**: Tự động tải và kiểm tra toàn vẹn (checksum SHA-256) các mô hình ở lần khởi chạy đầu, lưu vào Docker volume và sẵn sàng vận hành lâu dài mà không cần duy trì kết nối Internet.
@@ -27,36 +27,41 @@ Toàn bộ quá trình xử lý âm thanh và suy luận AI (inference) đều d
 
 ## So sánh nhanh 2 engine STT
 
-| Tiêu chí                | Engine Zipformer (`zipformer` - Mặc định)           | Engine Gipformer (`gipformer`)                                                           |
-| :---------------------- | :-------------------------------------------------- | :--------------------------------------------------------------------------------------- |
-| **Mô hình**             | `hynt/Zipformer-30M-RNNT-6000h`                     | `g-group-ai-lab/gipformer1.5-68M-rnnt`                                                   |
-| **Kiến trúc cốt lõi**   | Zipformer Transducer (INT8 ONNX) qua `sherpa-onnx`  | Zipformer Transducer (INT8 ONNX) qua `sherpa-onnx`                                       |
-| **Số lượng tham số**    | 30 triệu (30M)                                      | 68 triệu (68M)                                                                           |
-| **Tốc độ nhận diện**    | Siêu nhanh, độ trễ tối thiểu                        | Nhanh, mượt mà trên phần cứng hiện đại                                                   |
-| **Đặc trưng nhận diện** | Rất nhẹ, chuẩn từ vựng câu lệnh gia đình thông dụng | Độ chính xác SOTA, kháng nhiễu xuất sắc, nhận diện cực tốt đàm thoại và tiếng địa phương |
-| **Yêu cầu phần cứng**   | Tối ưu cho Raspberry Pi 4/5, Mini PC, NAS           | Phù hợp Raspberry Pi 5, Mini PC x86, máy chủ gia đình                                    |
+| Tiêu chí                          | Engine Zipformer (`zipformer` - Mặc định)           | Engine Gipformer (`gipformer`)                                                                             |
+| :-------------------------------- | :-------------------------------------------------- | :--------------------------------------------------------------------------------------------------------- |
+| **Mô hình**                       | `hynt/Zipformer-30M-RNNT-6000h`                     | `g-group-ai-lab/gipformer1.5-68M-rnnt`                                                                     |
+| **Kiến trúc cốt lõi**             | Zipformer Transducer (INT8 ONNX) qua `sherpa-onnx`  | Zipformer Transducer (INT8 ONNX) qua `sherpa-onnx`                                                         |
+| **Số lượng tham số**              | 30 triệu (30M)                                      | 68 triệu (68M)                                                                                             |
+| **Tốc độ phản hồi (Latency)**     | Siêu nhanh (< 0.2 giây), độ trễ tối thiểu           | Rất nhanh (< 0.5 giây trên x86 / Pi 5), mượt mà                                                            |
+| **Kháng ồn & Môi trường thực tế** | Tốt trong không gian yên tĩnh, cự ly gần            | Xuất sắc, lọc tạp âm môi trường vượt trội (tiếng TV, quạt gió, tiếng trò chuyện xung quanh)                |
+| **Đặc trưng nhận diện**           | Rất nhẹ, chuẩn từ vựng câu lệnh gia đình thông dụng | Độ chính xác SOTA, nhận diện câu lệnh đàm thoại tự nhiên và chuẩn xác đa dạng phương ngữ Bắc - Trung - Nam |
+| **Mức tiêu thụ tài nguyên**       | Cực thấp (tải CPU tối thiểu)                        | Vừa phải (phù hợp CPU hiện đại)                                                                            |
+| **Yêu cầu phần cứng**             | Tối ưu cho Raspberry Pi 4, NAS, thiết bị ít RAM     | Khuyên dùng Raspberry Pi 5, Mini PC x86 (Intel N100, Core i, AMD Ryzen...), máy chủ gia đình               |
 
 ---
 
 ## So sánh nhanh 2 engine TTS
 
-| Tiêu chí                      | Engine NghiTTS (`nghitts` - Mặc định)                             | Engine ZeroTTS (`zerotts`)                                                           |
-| :---------------------------- | :---------------------------------------------------------------- | :----------------------------------------------------------------------------------- |
-| **Kiến trúc cốt lõi**         | VITS qua runtime C++ `sherpa-onnx`                                | Neural Transformer (GGUF Q8_0) + MOSS Codec qua runtime C++ GGML                     |
-| **Chất lượng âm thanh**       | 22.05 kHz (rõ ràng, mạch lạc, dễ nghe)                            | 48 kHz (chất lượng âm thanh phòng thu, chi tiết cao)                                 |
-| **Tốc độ phản hồi (Latency)** | Siêu nhanh (< 0.2 giây), phản hồi gần như tức thì                 | Mượt mà (khoảng 0.5 đến 1.5 giây tùy hiệu năng CPU)                                  |
-| **Đặc trưng giọng đọc**       | Rõ ràng, dứt khoát, chuẩn phong cách trợ lý ảo và phát thanh viên | Rất tự nhiên, giàu cảm xúc, nhấn nhá và ngữ điệu chân thực như người thật            |
-| **Yêu cầu phần cứng**         | Rất nhẹ (phù hợp Raspberry Pi 4/5, Mini PC, NAS)                  | Yêu cầu CPU tương đối (khuyên dùng Mini PC x86 như Intel N100, Core i, AMD Ryzen...) |
-| **Số lượng giọng đọc**        | 20 giọng (Bắc, Trung, Nam)                                        | 8 giọng (Bắc)                                                                        |
+| Tiêu chí                      | Engine NghiTTS (`nghitts` - Mặc định)                             | Engine ZeroTTS (`zerotts`)                                                                                        |
+| :---------------------------- | :---------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------- |
+| **Kiến trúc cốt lõi**         | VITS qua runtime C++ `sherpa-onnx`                                | Neural Transformer (GGUF Q8_0) + MOSS Codec qua runtime C++ GGML                                                  |
+| **Chất lượng âm thanh**       | 22.05 kHz (rõ ràng, mạch lạc, dễ nghe)                            | 48 kHz (chất lượng âm thanh phòng thu, chi tiết cao)                                                              |
+| **Tốc độ phản hồi (Latency)** | Siêu nhanh (< 0.2 giây), phản hồi gần như tức thì                 | Mượt mà (khoảng 0.5 đến 1.5 giây tùy hiệu năng CPU)                                                               |
+| **Đặc trưng giọng đọc**       | Rõ ràng, dứt khoát, chuẩn phong cách trợ lý ảo và phát thanh viên | Rất tự nhiên, giàu cảm xúc, nhấn nhá và ngữ điệu chân thực như người thật                                         |
+| **Yêu cầu phần cứng**         | Rất nhẹ (phù hợp Raspberry Pi 4/5, Mini PC, NAS)                  | Yêu cầu CPU x86: tối ưu nhất với AVX-512, đáp ứng đủ trên AVX2 (Intel N100, Core i...); hiệu năng kém trên CPU cũ |
+| **Số lượng giọng đọc**        | 20 giọng (Bắc, Trung, Nam)                                        | 8 giọng (Bắc)                                                                                                     |
 
 ---
 
 ## Yêu cầu chuẩn bị
 
 - **Phần cứng**:
-  - Thiết bị chạy Docker: Raspberry Pi 4/5 (khuyên dùng với engine `nghitts`), x86 Mini PC (Intel N100, Core i3/i5/i7, AMD Ryzen...), NAS (Synology, QNAP, TrueNAS...) hoặc bất kỳ máy chủ Linux nào.
-  - Bộ nhớ RAM: Mức sử dụng tùy engine và số giọng được nạp. Dịch vụ sẽ cảnh báo trong log khi RAM khả dụng thấp.
-  - Dung lượng ổ cứng: Trống khoảng 2 - 3 GB để lưu trữ mô hình nhận diện giọng nói và các giọng đọc TTS.
+  - Thiết bị chạy Docker:
+    - **Raspberry Pi 4 / NAS cấu hình thấp**: Hoạt động tối ưu với cấu hình siêu nhẹ `STT_ENGINE: "zipformer"` kết hợp `TTS_ENGINE: "nghitts"`.
+    - **Raspberry Pi 5**: Khuyến nghị sử dụng cấu hình `STT_ENGINE: "gipformer"` kết hợp `TTS_ENGINE: "nghitts"` (nhận diện SOTA thông minh, giọng đọc phản hồi tức thì).
+    - **x86 Mini PC (Intel N100, Core i3/i5/i7, AMD Ryzen...) / Máy chủ Linux**: Khuyến nghị cấu hình `STT_ENGINE: "gipformer"`, có thể kết hợp cùng `TTS_ENGINE: "nghitts"` (phản hồi siêu nhanh) hoặc `TTS_ENGINE: "zerotts"` (hoạt động tốt nhất trên CPU có AVX-512, đáp ứng vừa đủ trên AVX2).
+  - Bộ nhớ RAM: Tối thiểu 1 - 2 GB cho cấu hình nhẹ (`zipformer` + `nghitts`), hoặc từ 3 - 4 GB trở lên nếu chọn `gipformer` hoặc `zerotts`. Dịch vụ sẽ tự động kiểm tra tài nguyên và ghi cảnh báo trong log khi RAM khả dụng thấp.
+  - Dung lượng ổ cứng: Trống khoảng 2 - 4 GB để lưu trữ mô hình nhận diện giọng nói và các giọng đọc TTS.
 - **Môi trường & Mạng**:
   - Thiết bị đã cài đặt sẵn **Docker** và **Docker Compose**.
   - Kết nối mạng nội bộ (LAN): Thiết bị chạy Wyoming và máy chủ Home Assistant kết nối chung mạng nội bộ và có thể liên lạc thông suốt với nhau.
@@ -81,7 +86,7 @@ docker compose -f docker-compose.online.yaml up -d --pull always
 
 ### 2. Theo dõi quá trình nạp mô hình
 
-Ở lần chạy đầu tiên, container sẽ tự động tải mô hình nhận diện giọng nói (STT Zipformer) và các giọng đọc TTS được chọn (thời gian tải thường từ 1 đến 3 phút tùy theo tốc độ mạng):
+Ở lần chạy đầu tiên, container sẽ tự động tải mô hình nhận diện giọng nói (STT Zipformer hoặc Gipformer tùy theo cấu hình `STT_ENGINE`) và các giọng đọc TTS được chọn (thời gian tải thường từ 1 đến 3 phút tùy theo tốc độ mạng):
 
 ```bash
 docker logs -f wyoming-vietnamese
@@ -132,6 +137,19 @@ Sau khi container đã khởi động thành công và mở cổng `10300`, bạ
 
 ---
 
+## Tùy chọn bộ nhận diện giọng nói (STT Engine)
+
+Container hỗ trợ 2 bộ nhận diện giọng nói tiếng Việt thông qua biến môi trường `STT_ENGINE`:
+
+1. **`zipformer` (Mặc định)**: Sử dụng mô hình `hynt/Zipformer-30M-RNNT-6000h` (30 triệu tham số) qua runtime `sherpa-onnx`.
+   - **Ưu điểm**: Cực kỳ nhẹ, tốc độ suy luận tức thì, tiêu tốn rất ít CPU và RAM.
+   - **Phù hợp nhất**: Raspberry Pi 4, thiết bị NAS hoặc hệ thống cần độ trễ phản hồi thấp nhất cho các câu lệnh nhà thông minh thông dụng.
+2. **`gipformer`**: Sử dụng mô hình thế hệ mới `g-group-ai-lab/gipformer1.5-68M-rnnt` (68 triệu tham số) từ G-Group AI Lab qua runtime `sherpa-onnx`.
+   - **Ưu điểm**: Đạt độ chính xác hàng đầu (SOTA), khả năng kháng ồn vượt trội trong môi trường thực tế (tiếng TV, quạt gió, tiếng nói chuyện xung quanh), bắt chuẩn xác từ ngữ đàm thoại tự nhiên và nhận diện rất tốt cả 3 phương ngữ Bắc - Trung - Nam.
+   - **Phù hợp nhất**: Raspberry Pi 5, x86 Mini PC (Intel N100, Core i, AMD Ryzen...) hoặc máy chủ gia đình, khi bạn muốn trợ lý ảo Assist nhận diện thông minh và chuẩn xác nhất.
+
+---
+
 ## Danh sách giọng đọc và tùy biến TTS
 
 Container hỗ trợ 2 bộ phát giọng đọc (TTS Engine) thông qua biến môi trường `TTS_ENGINE`:
@@ -145,30 +163,53 @@ Bạn có thể chỉnh sửa tệp `docker-compose.online.yaml`, thay đổi `T
 - Các mã giọng tiếp theo trong danh sách sẽ được nạp sẵn và hiển thị trong danh mục lựa chọn của Home Assistant.
 
 > [!IMPORTANT]
-> Mỗi engine chỉ nhận danh sách mã giọng tương ứng của nó. Không cấu hình lẫn lộn mã giọng của `nghitts` sang `zerotts` hoặc ngược lại.
+> Mỗi engine TTS chỉ nhận danh sách mã giọng tương ứng của nó. Không cấu hình lẫn lộn mã giọng của `nghitts` sang `zerotts` hoặc ngược lại.
 
-### Ví dụ 1: Cấu hình engine NghiTTS (Mặc định - Phản hồi siêu nhanh)
+### Các cấu hình mẫu thường dùng theo nhu cầu phần cứng
+
+Bạn có thể tùy ý kết hợp `STT_ENGINE` và `TTS_ENGINE` trong tệp `docker-compose.online.yaml` để phù hợp với thiết bị của mình:
+
+#### Cấu hình 1: Siêu nhẹ & Phản hồi tức thì (Mặc định - Tối ưu cho Raspberry Pi 4, NAS)
+
+Sử dụng STT Zipformer kết hợp NghiTTS giúp tối thiểu hóa tải phần cứng, phản hồi câu lệnh gần như không có độ trễ:
 
 ```yaml
 environment:
   WYOMING_PORT: 10300
+  STT_ENGINE: "zipformer"
   TTS_ENGINE: "nghitts"
   TTS_VOICE: "ngoc-huyen-moi, duy-onyx-moi, thanh-phuong-viettel, ngoc-ngan, mai-phuong"
   LOG_LEVEL: "info"
 ```
 
-### Ví dụ 2: Cấu hình engine ZeroTTS (Chất lượng cao - Biểu cảm tự nhiên)
+#### Cấu hình 2: Cân bằng hoàn hảo - Nhận diện SOTA thông minh, TTS mượt mà (Khuyên dùng cho Pi 5, Mini PC N100)
+
+Sử dụng STT Gipformer 1.5 68M giúp kháng ồn và nhận diện phương ngữ xuất sắc, kết hợp NghiTTS để giọng đọc phản hồi nhanh tức thì:
 
 ```yaml
 environment:
   WYOMING_PORT: 10300
+  STT_ENGINE: "gipformer"
+  TTS_ENGINE: "nghitts"
+  TTS_VOICE: "ngoc-huyen-moi, duy-onyx-moi, thanh-phuong-viettel, ngoc-ngan, mai-phuong"
+  LOG_LEVEL: "info"
+```
+
+#### Cấu hình 3: Chất lượng cao toàn diện - Nhận diện SOTA đỉnh cao & Giọng đọc phòng thu 48 kHz (Dành cho Mini PC x86 / Homelab có CPU hỗ trợ AVX-512 hoặc AVX2)
+
+Kết hợp STT Gipformer 1.5 SOTA và TTS ZeroTTS Neural 48 kHz mang lại trải nghiệm trợ lý nhà thông minh đỉnh cao, tự nhiên và giàu cảm xúc như người thật (lưu ý: ZeroTTS hoạt động tốt nhất trên CPU hỗ trợ AVX-512, đáp ứng vừa đủ trên AVX2, không khuyến nghị cho các đời CPU cũ hơn):
+
+```yaml
+environment:
+  WYOMING_PORT: 10300
+  STT_ENGINE: "gipformer"
   TTS_ENGINE: "zerotts"
   TTS_VOICE: "maichi, baotrang, giahuy, hamy, huuduc"
   LOG_LEVEL: "info"
 ```
 
 > [!TIP]
-> Biến môi trường chỉ có hiệu lực khi container được tạo mới. Sau khi chỉnh sửa `TTS_ENGINE` hoặc `TTS_VOICE`, bạn hãy chạy lệnh sau để Docker áp dụng ngay cấu hình mới:
+> Biến môi trường chỉ có hiệu lực khi container được tạo mới. Sau khi chỉnh sửa `STT_ENGINE`, `TTS_ENGINE` hoặc `TTS_VOICE`, bạn hãy chạy lệnh sau để Docker áp dụng ngay cấu hình mới:
 >
 > ```bash
 > docker compose -f docker-compose.online.yaml up -d --pull always --force-recreate
@@ -218,14 +259,14 @@ environment:
 
 ### Các biến môi trường thường dùng trong Compose
 
-| Biến môi trường |           Mặc định            | Mô tả chi tiết                                                                                                                   |
-| :-------------- | :---------------------------: | :------------------------------------------------------------------------------------------------------------------------------- |
-| `WYOMING_PORT`  |            `10300`            | Cổng TCP dịch vụ lắng nghe cho giao thức Wyoming.                                                                                |
-| `STT_ENGINE`    |          `zipformer`          | Bộ nhận diện giọng nói: `zipformer` (30M, siêu nhẹ) hoặc `gipformer` (Gipformer 1.5 68M SOTA).                                   |
-| `TTS_ENGINE`    |           `nghitts`           | Bộ tạo giọng đọc: `nghitts` (nhẹ, nhanh qua sherpa-onnx) hoặc `zerotts` (AI Neural 48 kHz qua GGML C-FFI).                       |
-| `TTS_VOICE`     | _(giọng mặc định của engine)_ | Danh sách mã giọng kích hoạt, phân cách bằng dấu phẩy hoặc khoảng trắng (giọng đầu tiên là mặc định).                            |
-| `LOG_LEVEL`     |            `info`             | Mức độ chi tiết của nhật ký hệ thống (`debug`, `info`, `warning`, `error`).                                                      |
-| `TZ`            |      _(Chưa thiết lập)_       | Múi giờ hệ thống để log hiển thị đúng giờ địa phương (ví dụ: `Asia/Ho_Chi_Minh`; chỉ có hiệu lực khi được truyền vào container). |
+| Biến môi trường |           Mặc định            | Mô tả chi tiết                                                                                                                                               |
+| :-------------- | :---------------------------: | :----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `WYOMING_PORT`  |            `10300`            | Cổng TCP dịch vụ lắng nghe cho giao thức Wyoming.                                                                                                            |
+| `STT_ENGINE`    |          `zipformer`          | Bộ nhận diện giọng nói STT: `zipformer` (30M, siêu nhẹ, phản hồi tức thì) hoặc `gipformer` (Gipformer 1.5 68M SOTA, kháng ồn và nhận diện 3 miền vượt trội). |
+| `TTS_ENGINE`    |           `nghitts`           | Bộ tạo giọng đọc: `nghitts` (nhẹ, nhanh qua sherpa-onnx) hoặc `zerotts` (AI Neural 48 kHz qua GGML C-FFI).                                                   |
+| `TTS_VOICE`     | _(giọng mặc định của engine)_ | Danh sách mã giọng kích hoạt, phân cách bằng dấu phẩy hoặc khoảng trắng (giọng đầu tiên là mặc định).                                                        |
+| `LOG_LEVEL`     |            `info`             | Mức độ chi tiết của nhật ký hệ thống (`debug`, `info`, `warning`, `error`).                                                                                  |
+| `TZ`            |      _(Chưa thiết lập)_       | Múi giờ hệ thống để log hiển thị đúng giờ địa phương (ví dụ: `Asia/Ho_Chi_Minh`; chỉ có hiệu lực khi được truyền vào container).                             |
 
 ### Tinh chỉnh nâng cao (Dành cho người dùng chuyên sâu)
 
@@ -263,12 +304,15 @@ docker run -d \
   --name wyoming-vietnamese \
   --restart unless-stopped \
   -p 10300:10300 \
+  -e STT_ENGINE="zipformer" \
   -e TTS_ENGINE="nghitts" \
   -e TTS_VOICE="ngoc-huyen-moi, duy-onyx-moi, thanh-phuong-viettel, ngoc-ngan, mai-phuong" \
   -v wyoming-vietnamese-cache:/app/.cache \
   -v wyoming-vietnamese-models:/app/models \
   ghcr.io/luuquangvu/wyoming-vietnamese:latest
 ```
+
+_(Nếu thiết bị có cấu hình tốt hơn như Pi 5 hoặc Mini PC x86, bạn có thể đổi thành `-e STT_ENGINE="gipformer"` để nhận diện giọng nói chuẩn xác hơn)._
 
 Khi muốn cập nhật ảnh mới hoặc thay đổi biến môi trường, hãy tải ảnh mới nhất, xóa container cũ rồi khởi chạy lại. Hai volume có tên (`wyoming-vietnamese-cache` và `wyoming-vietnamese-models`) vẫn được giữ nguyên nên mô hình không cần phải tải lại:
 
@@ -300,9 +344,9 @@ docker compose up --build -d
 
 ### 2. Container khởi động chậm hoặc bị thoát (exit) ở lần chạy đầu tiên
 
-- **Kiểm tra kết nối Internet**: Ở lần chạy đầu tiên, container bắt buộc phải có Internet để tải mô hình nhận diện giọng nói (STT Zipformer) và các giọng đọc TTS. Hãy kiểm tra kết nối mạng của máy chủ Docker.
+- **Kiểm tra kết nối Internet**: Container chỉ cần kết nối Internet khi các mô hình STT hoặc giọng đọc TTS được chọn chưa có sẵn trong volume lưu trữ. Hệ thống chỉ tự động tải về khi `OFFLINE: false` (mặc định). Hãy kiểm tra kết nối mạng của máy chủ Docker nếu container cần tải các tệp còn thiếu, hoặc đảm bảo đã có đủ mô hình trong volume nếu bạn bật chế độ ngoại tuyến (`OFFLINE: true`).
 - **Xem tiến trình tải**: Mở log thời gian thực bằng lệnh `docker logs -f wyoming-vietnamese` để theo dõi tiến độ tải file và xác thực mã băm SHA-256.
-- **Cấu hình phần cứng hạn chế**: Nếu thiết bị có dung lượng RAM thấp (dưới 2 GB), hãy chọn `TTS_ENGINE: "nghitts"` và chỉ cấu hình từ 1 đến 2 giọng đọc cần thiết nhất để tối ưu hóa bộ nhớ.
+- **Cấu hình phần cứng hạn chế**: Nếu thiết bị có dung lượng RAM thấp (dưới 2 GB), hãy chọn `STT_ENGINE: "zipformer"`, `TTS_ENGINE: "nghitts"` và chỉ cấu hình từ 1 đến 2 giọng đọc cần thiết nhất để tối ưu hóa bộ nhớ.
 
 ### 3. Đã đổi giọng trong `TTS_VOICE` nhưng Home Assistant không hiển thị giọng mới
 
@@ -314,9 +358,15 @@ docker compose up --build -d
 
 - Sau khi container khởi động lại xong, hãy vào Home Assistant > **Cài đặt (Settings)** > **Thiết bị & Dịch vụ (Devices & Services)** > tìm tích hợp **Wyoming Protocol** > bấm vào biểu tượng dấu 3 chấm góc phải và chọn **Tải lại (Reload)** để Home Assistant đồng bộ danh sách giọng mới.
 
-### 4. Giọng đọc bị giật cục hoặc phản hồi chậm trên Raspberry Pi
+### 4. Giọng đọc bị giật cục hoặc phản hồi chậm khi dùng engine ZeroTTS hoặc trên thiết bị ARM
 
-- Hãy chuyển sang sử dụng engine `nghitts` (`TTS_ENGINE: "nghitts"`). Engine này sử dụng mô hình VITS siêu nhẹ, được tối ưu hóa riêng cho các kiến trúc ARM như Raspberry Pi 4/5. Engine `zerotts` sử dụng mô hình ngôn ngữ giọng nói AI lớn hơn nhiều, chỉ phù hợp khi chạy trên các máy chủ có CPU x86 tương đối mạnh.
+- Hãy chuyển sang sử dụng engine `nghitts` (`TTS_ENGINE: "nghitts"`). Engine này sử dụng mô hình VITS siêu nhẹ, được tối ưu hóa cực tốt cho các kiến trúc ARM (chạy tức thì trên cả Raspberry Pi 4 và Pi 5) cũng như các thiết bị cấu hình khiêm tốn.
+- Engine `zerotts` sử dụng mô hình AI ngôn ngữ âm thanh lớn: hoạt động tốt nhất trên CPU x86 hỗ trợ tập lệnh **AVX-512**, đáp ứng vừa đủ trên **AVX2**, hiệu năng sẽ kém trên các đời CPU cũ hơn.
+
+### 5. Nhận diện giọng nói chưa chính xác hoặc môi trường có nhiều tạp âm
+
+- **Đổi sang engine Gipformer**: Nếu bạn nhận thấy trợ lý Assist nhận diện câu lệnh chưa chuẩn xác khi phòng có tiếng tivi, quạt gió, tiếng trẻ em nô đùa hoặc khi các thành viên nói giọng địa phương (miền Trung, miền Nam), hãy đổi sang engine **`gipformer`** (`STT_ENGINE: "gipformer"`). Mô hình Gipformer 1.5 68M có khả năng lọc nhiễu môi trường và bắt từ vựng tiếng Việt thực tế vượt trội.
+- **Cân nhắc tài nguyên phần cứng**: Gipformer yêu cầu năng lực xử lý CPU tốt hơn so với Zipformer (khuyên dùng trên Raspberry Pi 5 hoặc Mini PC x86 như Intel N100 trở lên) để đảm bảo độ trễ thấp nhất. Nếu bạn đang chạy Raspberry Pi 4 cấu hình thấp, `zipformer` vẫn là lựa chọn hàng đầu để giữ độ trễ tối thiểu.
 
 ---
 

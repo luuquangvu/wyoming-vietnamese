@@ -14,7 +14,7 @@ import signal
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from pathlib import Path
 from types import FrameType
 from typing import Final
@@ -283,7 +283,7 @@ _SignalHandler = Callable[[int, FrameType | None], object] | int | signal.Handle
 
 
 @contextlib.contextmanager
-def _handle_build_signals() -> Iterator[None]:
+def _handle_build_signals() -> Generator[None]:
     """Register signal handlers to terminate active CMake process on SIGTERM/SIGINT."""
     prev_signals: dict[int, _SignalHandler] = {}
     for sig_name in ("SIGTERM", "SIGINT"):
