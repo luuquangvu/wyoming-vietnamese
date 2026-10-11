@@ -125,7 +125,24 @@ def test_tts_cache_namespace_tracks_engine_and_voice_artifact_revision(
             "TTS_ENGINE": "zerotts",
         }
     )
-    assert _tts_cache_namespace(zerotts_config, (DEFAULT_ZEROTTS_VOICE,)) != initial
+    zerotts_default_ns = _tts_cache_namespace(zerotts_config, (DEFAULT_ZEROTTS_VOICE,))
+    assert zerotts_default_ns != initial
+
+    # ZeroTTS namespace changes when GGUF model identity changes
+    zerotts_q4_ns = _tts_cache_namespace(
+        zerotts_config, (DEFAULT_ZEROTTS_VOICE,), zerotts_model_identity="q4_sha256"
+    )
+    zerotts_q8_ns = _tts_cache_namespace(
+        zerotts_config, (DEFAULT_ZEROTTS_VOICE,), zerotts_model_identity="q8_sha256"
+    )
+    assert zerotts_q4_ns != zerotts_q8_ns
+    assert zerotts_q4_ns != zerotts_default_ns
+
+    # Non-ZeroTTS engines ignore zerotts_model_identity
+    nghitts_with_id = _tts_cache_namespace(
+        nghitts_config, (voice,), zerotts_model_identity="some_id"
+    )
+    assert nghitts_with_id == initial
 
     second_voice = NGHITTS_VOICES_BY_ID["chieu-thanh"]
     assert _tts_cache_namespace(nghitts_config, (voice, second_voice)) == _tts_cache_namespace(
@@ -136,15 +153,17 @@ def test_tts_cache_namespace_tracks_engine_and_voice_artifact_revision(
 def test_remove_obsolete_cache_namespaces_cleans_stale_entries(tmp_path: Path) -> None:
     """Remove old namespace directories and legacy flat entries, keeping the current one."""
     base = tmp_path / "tts-audio"
-    base.mkdir()
     current = "abcdef0123456789"
-    (base / current).mkdir()
-    (base / current / "entry.pcm").write_bytes(b"keep")
     old_ns = "9876543210fedcba"
-    (base / old_ns).mkdir()
-    (base / old_ns / "stale.pcm").write_bytes(b"stale")
-    (base / "legacy.pcm").write_bytes(b"flat")
-    (base / ".tts-partial").write_bytes(b"tmp")
+    fixture_files = {
+        base / current / "entry.pcm": b"keep",
+        base / old_ns / "stale.pcm": b"stale",
+        base / "legacy.pcm": b"flat",
+        base / ".tts-partial": b"tmp",
+    }
+    for file_path, content in fixture_files.items():
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_bytes(content)
 
     _remove_obsolete_cache_namespaces(base, current)
 
@@ -606,6 +625,117 @@ async def test_run_server_starts_zerotts_engine(
     init_nghitts.assert_not_called()
     warm_up.assert_called_once_with(tts, (DEFAULT_ZEROTTS_VOICE,), TtsEngine.ZEROTTS)
     get_tts_info_mock.assert_called_once_with((DEFAULT_ZEROTTS_VOICE,), engine=TtsEngine.ZEROTTS)
+
+
+async def _run_configured_zerotts_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    download_result: object,
+    env_overrides: dict[str, str] | None = None,
+) -> tuple[FakeServer, ClosableTTS, Mock, Mock, ServerConfig]:
+    """Mock ZeroTTS server dependencies and run the server until stopped."""
+    server = FakeServer()
+    tts = ClosableTTS()
+    init_zerotts = Mock(return_value=tts)
+    download = Mock(return_value=download_result)
+
+    monkeypatch.setattr("wyoming_vietnamese.__main__.download_models", download)
+    monkeypatch.setattr("wyoming_vietnamese.__main__.initialize_stt", Mock(return_value=object()))
+    monkeypatch.setattr("wyoming_vietnamese.__main__.warm_up_stt", Mock())
+    monkeypatch.setattr("wyoming_vietnamese.__main__.initialize_zerotts", init_zerotts)
+    monkeypatch.setattr("wyoming_vietnamese.__main__.warm_up_tts", Mock())
+    monkeypatch.setattr("wyoming_vietnamese.__main__.get_stt_info", Mock(return_value=Info()))
+    monkeypatch.setattr("wyoming_vietnamese.__main__.get_tts_info", Mock(return_value=Info()))
+    monkeypatch.setattr(
+        "wyoming_vietnamese.__main__.AsyncServer.from_uri",
+        Mock(side_effect=[server]),
+    )
+    monkeypatch.setattr(
+        "wyoming_vietnamese.__main__.create_inference_executor",
+        Mock(return_value=Mock()),
+    )
+    stop_event = asyncio.Event()
+    stop_event.set()
+
+    base_env = {
+        "WYOMING_PORT": "10300",
+        "CACHE_DIR": str(tmp_path / "cache"),
+        "DOWNLOAD_DIR": str(tmp_path / "models"),
+        "TTS_ENGINE": "zerotts",
+    }
+    if env_overrides:
+        base_env.update(env_overrides)
+    config = ServerConfig.from_env(base_env)
+    await run_server(config, stop_event)
+    return server, tts, init_zerotts, download, config
+
+
+async def test_run_server_forwards_custom_zerotts_model_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test run server forwards zerotts_gguf_model to download_models and initialize_zerotts."""
+    custom_gguf = tmp_path / "custom-zerotts.gguf"
+    download_ret = {STT_DIR: tmp_path / STT_DIR, TTS_DIR: tmp_path / TTS_DIR}
+    _server, _tts, init_zerotts, download, config = await _run_configured_zerotts_server(
+        tmp_path,
+        monkeypatch,
+        download_ret,
+        env_overrides={"ZEROTTS_GGUF_MODEL": str(custom_gguf)},
+    )
+
+    download.assert_called_once_with(
+        cache_dir=config.cache_dir,
+        download_dir=config.download_dir,
+        tts_voices=(DEFAULT_ZEROTTS_VOICE,),
+        offline=False,
+        tts_engine=TtsEngine.ZEROTTS,
+        stt_engine=SttEngine.ZIPFORMER,
+        zerotts_quant=str(custom_gguf),
+    )
+    init_zerotts.assert_called_once_with(
+        tmp_path / TTS_DIR,
+        (DEFAULT_ZEROTTS_VOICE,),
+        resolve_cpu_threads(0),
+        gguf_path=custom_gguf,
+    )
+
+
+async def test_run_server_incorporates_zerotts_resolution_in_cache_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test run server passes resolved ZeroTTS GGUF artifact hash to cache namespace."""
+    from wyoming_vietnamese.download import ModelDownloadResult
+    from wyoming_vietnamese.tts_model import ZEROTTS_Q4_MODEL, ZeroTtsModelResolution
+
+    res = ZeroTtsModelResolution(
+        spec=ZEROTTS_Q4_MODEL,
+        gguf_path=tmp_path / "zerotts-q4-hybrid.gguf",
+    )
+    download_result = ModelDownloadResult(
+        tmp_path / STT_DIR,
+        tmp_path / TTS_DIR,
+        zerotts_resolution=res,
+    )
+    server, _tts, _init_zerotts, _download, config = await _run_configured_zerotts_server(
+        tmp_path,
+        monkeypatch,
+        download_result,
+    )
+
+    handler_factory = server.factory
+    factory_args = getattr(handler_factory, "args", None)
+    assert isinstance(factory_args, tuple)
+    tts_handler_factory = factory_args[1]
+    factory_keywords = getattr(tts_handler_factory, "keywords", None)
+    assert isinstance(factory_keywords, dict)
+    expected_ns = _tts_cache_namespace(
+        config,
+        config.tts_voices,
+        zerotts_model_identity=(
+            ZEROTTS_Q4_MODEL.gguf_model.sha256 if ZEROTTS_Q4_MODEL.gguf_model else None
+        ),
+    )
+    assert factory_keywords["cache_namespace"] == expected_ns
 
 
 async def test_run_server_drains_stt_and_tts_concurrently(

@@ -19,6 +19,7 @@ from .const import (
     DEFAULT_PORT,
     DEFAULT_STT_ENGINE,
     DEFAULT_TTS_ENGINE,
+    ZEROTTS_GGUF_MODEL,
     ConnectionLimit,
     SttEngine,
     Timeout,
@@ -31,6 +32,7 @@ from .tts_model import (
     NghiTtsVoiceSpec,
     ZeroTtsVoiceSpec,
     get_voice,
+    normalize_zerotts_gguf_model,
 )
 
 AnyVoiceSpec = NghiTtsVoiceSpec | ZeroTtsVoiceSpec
@@ -174,6 +176,13 @@ def _get_tts_voices(
     return tuple(get_voice(voice_id, engine=tts_engine) for voice_id in voice_ids)
 
 
+def _get_zerotts_gguf_model(environ: Mapping[str, str]) -> str | None:
+    """Read and validate the optional ZeroTTS GGUF model filename or auto-selector."""
+    if raw_value := environ.get(ZEROTTS_GGUF_MODEL, "").strip():
+        return normalize_zerotts_gguf_model(raw_value, preserve_auto=True)
+    return None
+
+
 def _get_log_level(environ: Mapping[str, str]) -> str:
     """Read a logging level accepted by the standard library."""
     value = environ.get("LOG_LEVEL", "INFO").strip().upper()
@@ -206,6 +215,7 @@ class ServerConfig:
     max_stt_buffer_bytes: int
     tts_cache_enabled: bool = True
     stt_engine: str = DEFAULT_STT_ENGINE
+    zerotts_gguf_model: str | None = None
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> ServerConfig:
@@ -306,4 +316,5 @@ class ServerConfig:
                 * 1024
             ),
             tts_cache_enabled=get_env_bool("TTS_CACHE_ENABLED", True, env),
+            zerotts_gguf_model=_get_zerotts_gguf_model(env),
         )

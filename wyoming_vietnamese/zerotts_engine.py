@@ -9,10 +9,13 @@ import json
 import logging
 import os
 import platform
+import queue
 import shutil
 import signal
 import subprocess
 import sys
+import threading
+import time
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
@@ -53,6 +56,7 @@ _ZEROTTS_RUNTIME_DEPENDENCIES: Final[tuple[str, ...]] = (
 _ZEROTTS_BUILD_TIMEOUT_SECONDS: Final[float] = 1800.0
 _PROCESS_TERMINATION_TIMEOUT_SECONDS: Final[float] = 5.0
 _SIGKILL_GRACE_PERIOD_SECONDS: Final[float] = 15.0
+_WORKER_SHUTDOWN_TIMEOUT_SECONDS: Final[float] = 2.0
 
 
 class _ZeroTtsSampling(ctypes.Structure):
@@ -660,6 +664,8 @@ class ZeroTtsGgmlEngine:
         num_threads: int = 0,
         custom_lib_path: Path | None = None,
         seed: int = 1234,
+        codec_threads: int | None = None,
+        pipelined: bool = True,
     ) -> None:
         """Initialize the ZeroTTS GGML engine from local weights and configurations.
 
@@ -670,6 +676,8 @@ class ZeroTtsGgmlEngine:
             num_threads: CPU thread count for inference.
             custom_lib_path: Optional explicit path to libzerotts.so.
             seed: Default random generator seed for deterministic frame sampling.
+            codec_threads: Optional CPU thread count for MOSS ONNX decoder.
+            pipelined: Whether to overlap GGML frame synthesis and ONNX codec decoding.
 
         Raises:
             ValueError: If no voice is configured.
@@ -684,9 +692,12 @@ class ZeroTtsGgmlEngine:
         self.sample_rate: int = ZeroTtsAudio.SAMPLE_RATE
         self.chunks_are_sentences: bool = False
         self.threads: int = num_threads
+        self.pipelined: bool = pipelined
         self.model_dir: Path = model_dir
         self.gguf_path: Path = gguf_path
         self._ctx: ctypes.c_void_p | None = None
+        self._busy_worker: threading.Thread | None = None
+        self._cleanup_thread: threading.Thread | None = None
 
         self._lib = resolve_zerotts_ggml_lib(custom_lib_path)
         self._ctx = self._lib.zerotts_init_from_file(
@@ -717,9 +728,18 @@ class ZeroTtsGgmlEngine:
             self._normalize_fn = normalize_vi_text
 
             codec_dir = model_dir / "onnx" / "codec"
+            resolved_codec_threads = (
+                codec_threads
+                if codec_threads is not None
+                else (
+                    1
+                    if self.threads <= 2
+                    else (2 if self.threads <= 4 else min(self.threads // 2, 4))
+                )
+            )
             self._codec = MossCodecDecoder(
                 codec_dir,
-                intra_op_num_threads=self.threads,
+                intra_op_num_threads=resolved_codec_threads,
             )
 
             null_voice_path = model_dir / ZeroTtsFile.NULL_VOICE_EMB
@@ -861,8 +881,13 @@ class ZeroTtsGgmlEngine:
         if rc != 0:
             raise RuntimeError(f"zerotts_frame failed at step {t}")
 
-    def _generate_code_frames(self) -> Iterator[np.ndarray]:
+    def _generate_code_frames(
+        self, stop_event: threading.Event | None = None
+    ) -> Iterator[np.ndarray]:
         """Generate acoustic code frames sequentially from the initialized GGML context.
+
+        Args:
+            stop_event: Optional event signaled when synthesis is cancelled early.
 
         Yields:
             Numpy array of shape (k,) containing codebook indices for each frame.
@@ -880,6 +905,8 @@ class ZeroTtsGgmlEngine:
         tail_left = -1
 
         for t in range(max_frames):
+            if stop_event is not None and stop_event.is_set():
+                break
             forbid_eoa = (t < min_frames) or (tail_left >= 0)
             self._execute_frame_step(t, forbid_eoa, codes_buf, is_eoa)
 
@@ -889,6 +916,9 @@ class ZeroTtsGgmlEngine:
                 eoa_started = True
 
             yield np.array(codes_buf, dtype=np.int64)
+
+            if stop_event is not None and stop_event.is_set():
+                break
 
             if tail_left >= 0 and not eoa_started:
                 tail_left -= 1
@@ -937,6 +967,12 @@ class ZeroTtsGgmlEngine:
         if self._ctx is None:
             raise RuntimeError("ZeroTTS GGML context is closed")
 
+        if self._busy_worker is not None and self._busy_worker.is_alive():
+            self._busy_worker.join(timeout=_WORKER_SHUTDOWN_TIMEOUT_SECONDS)
+            if self._busy_worker.is_alive():
+                raise RuntimeError("Previous ZeroTTS synthesis worker is still executing")
+            self._busy_worker = None
+
         self._rng = np.random.default_rng(self._seed if seed is None else seed)
 
         text_tokens = self._tokenizer(text)
@@ -961,23 +997,101 @@ class ZeroTtsGgmlEngine:
         cap_chunk_target = 16
 
         stream = self._codec.streaming_decoder()
-        buf: list[np.ndarray] = []
-        target_chunk = first_chunk_target
-
         try:
-            for frame in self._generate_code_frames():
-                buf.append(frame)
-                if len(buf) >= target_chunk:
+            if not self.pipelined:
+                buf: list[np.ndarray] = []
+                target_chunk = first_chunk_target
+                for frame in self._generate_code_frames():
+                    buf.append(frame)
+                    if len(buf) >= target_chunk:
+                        audio_out = self._decode_audio_chunk(stream, buf)
+                        if audio_out is not None:
+                            yield audio_out
+                        buf.clear()
+                        target_chunk = min(cap_chunk_target, target_chunk * 2)
+
+                if buf:
                     audio_out = self._decode_audio_chunk(stream, buf)
                     if audio_out is not None:
                         yield audio_out
-                    buf.clear()
-                    target_chunk = min(cap_chunk_target, target_chunk * 2)
+                return
 
-            if buf:
-                audio_out = self._decode_audio_chunk(stream, buf)
-                if audio_out is not None:
-                    yield audio_out
+            chunk_queue: queue.Queue[list[np.ndarray] | BaseException | None] = queue.Queue(
+                maxsize=4
+            )
+            stop_event = threading.Event()
+            producer_error: list[BaseException] = []
+
+            def _enqueue(item: list[np.ndarray] | BaseException | None) -> bool:
+                while not stop_event.is_set():
+                    try:
+                        chunk_queue.put(item, timeout=0.1)
+                        return True
+                    except queue.Full:
+                        continue
+                return False
+
+            def producer() -> None:
+                try:
+                    buf: list[np.ndarray] = []
+                    target_chunk = first_chunk_target
+                    for frame in self._generate_code_frames(stop_event=stop_event):
+                        if stop_event.is_set():
+                            return
+                        buf.append(frame)
+                        if len(buf) >= target_chunk:
+                            if not _enqueue(list(buf)):
+                                return
+                            buf.clear()
+                            target_chunk = min(cap_chunk_target, target_chunk * 2)
+
+                    if buf and not _enqueue(list(buf)):
+                        return
+                    if not stop_event.is_set():
+                        _enqueue(None)
+                except BaseException as exc:
+                    producer_error.append(exc)
+                    _enqueue(exc)
+
+            worker = threading.Thread(target=producer, daemon=True)
+            self._busy_worker = worker
+            worker.start()
+
+            try:
+                while True:
+                    try:
+                        item = chunk_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        if not worker.is_alive():
+                            if producer_error:
+                                raise producer_error[0] from None
+                            break
+                        continue
+                    if item is None:
+                        break
+                    if isinstance(item, BaseException):
+                        raise item
+                    audio_out = self._decode_audio_chunk(stream, item)
+                    if audio_out is not None:
+                        yield audio_out
+                if producer_error:
+                    raise producer_error[0]
+            finally:
+                stop_event.set()
+                deadline = time.monotonic() + _WORKER_SHUTDOWN_TIMEOUT_SECONDS
+                while worker.is_alive() and time.monotonic() < deadline:
+                    with contextlib.suppress(queue.Empty):
+                        chunk_queue.get_nowait()
+                    remaining = deadline - time.monotonic()
+                    worker.join(timeout=min(0.05, max(0.001, remaining)))
+                if worker.is_alive():
+                    self._busy_worker = worker
+                    _LOGGER.warning(
+                        "ZeroTTS synthesis worker did not terminate within %g seconds",
+                        _WORKER_SHUTDOWN_TIMEOUT_SECONDS,
+                    )
+                else:
+                    self._busy_worker = None
         finally:
             stream.close()
 
@@ -988,6 +1102,34 @@ class ZeroTtsGgmlEngine:
 
     def close(self) -> None:
         """Release native model resources and tensor buffers."""
+        busy_worker = getattr(self, "_busy_worker", None)
+        if busy_worker is not None and busy_worker.is_alive():
+            busy_worker.join(timeout=_WORKER_SHUTDOWN_TIMEOUT_SECONDS)
+            if busy_worker.is_alive():
+                _LOGGER.warning(
+                    "ZeroTTS synthesis worker still executing after %g seconds; "
+                    "scheduling deferred native context deallocation",
+                    _WORKER_SHUTDOWN_TIMEOUT_SECONDS,
+                )
+                ctx_to_free = self._ctx
+                self._ctx = None
+                self._busy_worker = None
+                if ctx_to_free is not None:
+                    lib = self._lib
+
+                    def _deferred_cleanup() -> None:
+                        """Wait for worker exit before deallocating native context."""
+                        busy_worker.join()
+                        lib.zerotts_free(ctx_to_free)
+
+                    self._cleanup_thread = threading.Thread(
+                        target=_deferred_cleanup,
+                        name="ZeroTtsDeferredContextFree",
+                        daemon=True,
+                    )
+                    self._cleanup_thread.start()
+                return
+            self._busy_worker = None
         if getattr(self, "_ctx", None) is not None:
             self._lib.zerotts_free(self._ctx)
             self._ctx = None

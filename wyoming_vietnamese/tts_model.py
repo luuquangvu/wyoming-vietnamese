@@ -8,21 +8,37 @@ silently changing voice quality or executing unreviewed model content.
 
 from __future__ import annotations
 
+import contextlib
+import inspect
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal, overload
+from pathlib import Path
+from typing import Literal, NamedTuple, overload
 
 from .const import (
     DEFAULT_TTS_ENGINE,
+    DEFAULT_ZEROTTS_GGUF_MODEL,
     ZEROTTS_REPO_ID,
     NghiTtsFile,
     TtsEngine,
+    ZeroTtsDirectory,
     ZeroTtsFile,
+    ZeroTtsVariant,
 )
+from .cpu import detect_cpu_variant
 
 _NGHITTS_COMMON_CONFIG_SHA256 = "971f57f8d504223fee5b40d664f503cf769baf7db21f7d2ae0554a75d07de2f8"
 _NGHITTS_SOUTH_CONFIG_SHA256 = "77c49591a8786c1842e06c328360cb5ccd6aa8b57322b2373e19c69f81452a0a"
 
 DEFAULT_NGHITTS_VOICE_ID = "ngoc-huyen-moi"
+
+ZEROTTS_EDGE_VARIANTS: frozenset[str] = frozenset(
+    {
+        ZeroTtsVariant.AVX,
+        ZeroTtsVariant.SSE4,
+        ZeroTtsVariant.COMPAT,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,13 +214,15 @@ class ZeroTtsModelSpec:
     config: ZeroTtsArtifact
     tokenizer: ZeroTtsArtifact
     null_voice_emb: ZeroTtsArtifact
-    gguf_model: ZeroTtsArtifact
+    gguf_model: ZeroTtsArtifact | None
     codec_files: tuple[ZeroTtsArtifact, ...]
 
     @property
     def core_artifacts(self) -> tuple[ZeroTtsArtifact, ...]:
         """Return the core model assets."""
-        return (self.config, self.tokenizer, self.null_voice_emb, self.gguf_model)
+        if self.gguf_model is not None:
+            return (self.config, self.tokenizer, self.null_voice_emb, self.gguf_model)
+        return (self.config, self.tokenizer, self.null_voice_emb)
 
     @property
     def artifacts(self) -> tuple[ZeroTtsArtifact, ...]:
@@ -214,14 +232,18 @@ class ZeroTtsModelSpec:
     @property
     def allow_patterns(self) -> tuple[str, ...]:
         """Return the repository file patterns the service downloads."""
-        return (
+        patterns = [
             self.config.remote_name,
             self.tokenizer.remote_name,
             self.null_voice_emb.remote_name,
-            self.gguf_model.remote_name,
-            "onnx/codec/*",
-            "voices/*",
-        )
+        ]
+        if self.gguf_model is not None:
+            patterns.append(self.gguf_model.remote_name)
+            default_gguf = f"gguf/{ZeroTtsFile.DEFAULT_GGUF_MODEL}"
+            if default_gguf not in patterns:
+                patterns.append(default_gguf)
+        patterns.extend(["onnx/codec/*", "voices/*"])
+        return tuple(patterns)
 
 
 # Verified against the repository at the pinned commit on 2026-09-17.
@@ -271,6 +293,238 @@ ZEROTTS_MODEL = ZeroTtsModelSpec(
         ),
     ),
 )
+
+ZEROTTS_Q4_GGUF_SHA256 = "e91657d7e415f777dd59007bd69dc4306c2a296bb55a2b590f82bcf5718b7753"
+ZEROTTS_Q4_GGUF_ARTIFACT = ZeroTtsArtifact(
+    f"gguf/{ZeroTtsFile.DEFAULT_GGUF_MODEL}",
+    f"gguf/{ZeroTtsFile.Q4_HYBRID_GGUF_MODEL}",
+    ZEROTTS_Q4_GGUF_SHA256,
+)
+
+ZEROTTS_Q4_MODEL = ZeroTtsModelSpec(
+    repo=ZEROTTS_MODEL.repo,
+    revision=ZEROTTS_MODEL.revision,
+    config=ZEROTTS_MODEL.config,
+    tokenizer=ZEROTTS_MODEL.tokenizer,
+    null_voice_emb=ZEROTTS_MODEL.null_voice_emb,
+    gguf_model=ZEROTTS_Q4_GGUF_ARTIFACT,
+    codec_files=ZEROTTS_MODEL.codec_files,
+)
+
+ZEROTTS_BASE_MODEL = ZeroTtsModelSpec(
+    repo=ZEROTTS_MODEL.repo,
+    revision=ZEROTTS_MODEL.revision,
+    config=ZEROTTS_MODEL.config,
+    tokenizer=ZEROTTS_MODEL.tokenizer,
+    null_voice_emb=ZEROTTS_MODEL.null_voice_emb,
+    gguf_model=None,
+    codec_files=ZEROTTS_MODEL.codec_files,
+)
+
+_ZEROTTS_CPU_CACHE: tuple[Callable[[], str], str] | None = None
+
+
+def resolve_zerotts_cpu_variant(cpu_variant: str | ZeroTtsVariant | None = None) -> str:
+    """Return the centralized ZeroTTS CPU variant, detecting and memoizing host variant once.
+
+    Args:
+        cpu_variant: Optional explicit CPU variant override.
+
+    Returns:
+        Detected or overridden CPU variant identifier string.
+    """
+    if cpu_variant is not None:
+        return str(cpu_variant)
+    global _ZEROTTS_CPU_CACHE
+    if _ZEROTTS_CPU_CACHE is not None and _ZEROTTS_CPU_CACHE[0] is detect_cpu_variant:
+        return _ZEROTTS_CPU_CACHE[1]
+    result = detect_cpu_variant()
+    _ZEROTTS_CPU_CACHE = (detect_cpu_variant, result)
+    return result
+
+
+def reset_zerotts_cpu_variant() -> None:
+    """Reset the memoized ZeroTTS CPU variant (used in testing)."""
+    global _ZEROTTS_CPU_CACHE
+    _ZEROTTS_CPU_CACHE = None
+
+
+def normalize_zerotts_gguf_model(
+    raw_value: str | None,
+    *,
+    cpu_variant: str | ZeroTtsVariant | None = None,
+    preserve_auto: bool = False,
+) -> str | None:
+    """Normalize and validate a ZeroTTS GGUF model identifier, alias, or path.
+
+    Args:
+        raw_value: Model name, alias ('q4', 'q4_hybrid', 'q8', 'q8_0'), 'auto',
+            or absolute file path.
+        cpu_variant: Optional explicit CPU variant for 'auto' resolution.
+        preserve_auto: If True, preserves 'auto' and 'default' without resolving
+            to a concrete model filename.
+
+    Returns:
+        Canonical GGUF filename, resolved 'auto' filename, absolute path,
+        or None if raw_value is empty.
+
+    Raises:
+        ValueError: If raw_value is not recognized as a supported model or valid absolute path.
+    """
+    if raw_value is None:
+        return None
+    val = raw_value.strip()
+    if not val:
+        return None
+    val_lower = val.lower()
+    if val_lower in ("auto", "default"):
+        if preserve_auto:
+            return "auto"
+        resolved_variant = resolve_zerotts_cpu_variant(cpu_variant)
+        is_edge = resolved_variant in ZEROTTS_EDGE_VARIANTS
+        return ZeroTtsFile.Q4_HYBRID_GGUF_MODEL if is_edge else ZeroTtsFile.DEFAULT_GGUF_MODEL
+    if val_lower in (
+        "q4",
+        "q4_hybrid",
+        "q4-hybrid",
+        "hybrid",
+        ZeroTtsFile.Q4_HYBRID_GGUF_MODEL.lower(),
+    ):
+        return ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+    if val_lower in (
+        "q8",
+        "q8_0",
+        ZeroTtsFile.Q8_0_GGUF_MODEL.lower(),
+    ):
+        return ZeroTtsFile.Q8_0_GGUF_MODEL
+    path = Path(val)
+    if path.is_absolute():
+        if path.suffix.lower() != ".gguf":
+            raise ValueError(
+                f"ZEROTTS_GGUF_MODEL absolute path must have a '.gguf' file extension: {val!r}"
+            )
+        if path.is_dir():
+            raise ValueError(f"ZEROTTS_GGUF_MODEL absolute path cannot be a directory: {val!r}")
+        return str(path)
+    raise ValueError(
+        f"ZEROTTS_GGUF_MODEL is invalid: {val!r}. "
+        f"Expected 'auto', 'q4_hybrid', 'q8_0', or a supported GGUF model filename."
+    )
+
+
+def resolve_zerotts_model_spec(
+    quant_type_or_filename: str | None = None,
+    *,
+    cpu_variant: str | ZeroTtsVariant | None = None,
+) -> ZeroTtsModelSpec:
+    """Resolve the appropriate ZeroTtsModelSpec for a quantization type or model filename.
+
+    Args:
+        quant_type_or_filename: Optional quantization name ('auto', 'q4_hybrid', 'q8_0')
+            or GGUF filename or path. Defaults to 'auto'.
+        cpu_variant: Optional explicit CPU variant for 'auto' resolution.
+
+    Returns:
+        ZeroTtsModelSpec matching the requested quantization, or ZEROTTS_BASE_MODEL
+        for external custom model paths.
+    """
+    effective_name = quant_type_or_filename or DEFAULT_ZEROTTS_GGUF_MODEL
+    normalized = normalize_zerotts_gguf_model(effective_name, cpu_variant=cpu_variant)
+    if normalized is not None and Path(normalized).is_absolute():
+        return ZEROTTS_BASE_MODEL
+    return ZEROTTS_Q4_MODEL if normalized == ZeroTtsFile.Q4_HYBRID_GGUF_MODEL else ZEROTTS_MODEL
+
+
+class ZeroTtsModelResolution(NamedTuple):
+    """Resolved ZeroTTS model specification and target GGUF file path."""
+
+    spec: ZeroTtsModelSpec
+    gguf_path: Path
+
+
+def call_spec_resolver(
+    resolver: Callable[..., ZeroTtsModelSpec],
+    name_or_path: str | None,
+    *,
+    cpu_variant: str | ZeroTtsVariant | None = None,
+) -> ZeroTtsModelSpec:
+    """Invoke spec resolver, passing cpu_variant only if supported by the callable."""
+    supports_cpu_variant = False
+    with contextlib.suppress(ValueError, TypeError):
+        sig = inspect.signature(resolver)
+        supports_cpu_variant = (
+            any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            or "cpu_variant" in sig.parameters
+        )
+    if supports_cpu_variant:
+        return resolver(name_or_path, cpu_variant=cpu_variant)
+    return resolver(name_or_path)
+
+
+def resolve_zerotts_model(
+    model_dir: Path,
+    model_name_or_path: str | Path | None = None,
+    *,
+    cpu_variant: str | ZeroTtsVariant | None = None,
+    spec_resolver: Callable[..., ZeroTtsModelSpec] | None = None,
+) -> ZeroTtsModelResolution:
+    """Resolve the ZeroTTS model spec and local GGUF path consistently.
+
+    Args:
+        model_dir: Directory where ZeroTTS models and subdirectories reside.
+        model_name_or_path: Optional model name, alias, 'auto', or absolute GGUF path.
+        cpu_variant: Optional explicit CPU variant for 'auto' resolution.
+        spec_resolver: Optional spec resolver function (defaults to resolve_zerotts_model_spec).
+
+    Returns:
+        ZeroTtsModelResolution containing the selected ZeroTtsModelSpec and Path to GGUF model.
+    """
+    raw_str = str(model_name_or_path).strip() if model_name_or_path is not None else ""
+    if raw_str and Path(raw_str).is_absolute():
+        resolver = spec_resolver or resolve_zerotts_model_spec
+        spec = call_spec_resolver(resolver, raw_str, cpu_variant=cpu_variant)
+        if spec is ZEROTTS_MODEL:
+            spec = ZEROTTS_BASE_MODEL
+        return ZeroTtsModelResolution(spec=spec, gguf_path=Path(raw_str))
+
+    is_auto = not raw_str or raw_str.lower() in {"auto", "default"}
+    if is_auto:
+        eff_variant = resolve_zerotts_cpu_variant(cpu_variant)
+        is_edge = eff_variant in ZEROTTS_EDGE_VARIANTS
+        default_candidate = model_dir / ZeroTtsDirectory.GGUF / ZeroTtsFile.DEFAULT_GGUF_MODEL
+        hybrid_candidate = model_dir / ZeroTtsDirectory.GGUF / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+        resolver = spec_resolver or resolve_zerotts_model_spec
+
+        if is_edge:
+            # Note: This existing-file fallback is used during engine startup when the
+            # target hybrid model is absent. The download step must not use this fallback
+            # and must pass a normalized model selector instead.
+            if not hybrid_candidate.is_file() and default_candidate.is_file():
+                spec = call_spec_resolver(
+                    resolver, ZeroTtsFile.DEFAULT_GGUF_MODEL, cpu_variant=eff_variant
+                )
+                return ZeroTtsModelResolution(spec=spec, gguf_path=default_candidate)
+            spec = call_spec_resolver(
+                resolver, ZeroTtsFile.Q4_HYBRID_GGUF_MODEL, cpu_variant=eff_variant
+            )
+            return ZeroTtsModelResolution(spec=spec, gguf_path=hybrid_candidate)
+
+        if not default_candidate.is_file() and hybrid_candidate.is_file():
+            spec = call_spec_resolver(
+                resolver, ZeroTtsFile.Q4_HYBRID_GGUF_MODEL, cpu_variant=eff_variant
+            )
+            return ZeroTtsModelResolution(spec=spec, gguf_path=hybrid_candidate)
+        spec = call_spec_resolver(resolver, ZeroTtsFile.DEFAULT_GGUF_MODEL, cpu_variant=eff_variant)
+        return ZeroTtsModelResolution(spec=spec, gguf_path=default_candidate)
+
+    resolver = spec_resolver or resolve_zerotts_model_spec
+    spec = call_spec_resolver(resolver, raw_str, cpu_variant=cpu_variant)
+    if spec.gguf_model is not None:
+        model_filename = Path(spec.gguf_model.local_name).name
+        gguf_path = model_dir / ZeroTtsDirectory.GGUF / model_filename
+    else:
+        gguf_path = model_dir / ZeroTtsDirectory.GGUF / ZeroTtsFile.DEFAULT_GGUF_MODEL
+    return ZeroTtsModelResolution(spec=spec, gguf_path=gguf_path)
 
 
 @dataclass(frozen=True, slots=True)

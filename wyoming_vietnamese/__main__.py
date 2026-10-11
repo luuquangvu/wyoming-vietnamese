@@ -47,7 +47,13 @@ from .tts import (
     validate_tts_voices_for_engine,
     warm_up_tts,
 )
-from .tts_model import ZEROTTS_MODEL, NghiTtsVoiceSpec, ZeroTtsVoiceSpec
+from .tts_model import (
+    ZEROTTS_MODEL,
+    NghiTtsVoiceSpec,
+    ZeroTtsModelResolution,
+    ZeroTtsVoiceSpec,
+    resolve_zerotts_model,
+)
 from .voice_usage import RecentVoiceStore
 
 _LOGGER = logging.getLogger(PROGRAM_NAME)
@@ -116,6 +122,8 @@ def _log_startup_configuration(
         tts_provider_name.lower(),
         ", ".join(voice.name for voice in server_config.tts_voices),
     )
+    if server_config.tts_engine == TtsEngine.ZEROTTS and server_config.zerotts_gguf_model:
+        _LOGGER.info("ZeroTTS model selection: %s", server_config.zerotts_gguf_model)
     _LOGGER.info(
         "Transport limits: active_connections=%d event_timeout=%.1fs write_timeout=%.1fs "
         "stt_buffer_mb=%.1f",
@@ -134,12 +142,31 @@ def _initialize_configured_tts(
     *,
     all_voices: tuple[NghiTtsVoiceSpec | ZeroTtsVoiceSpec, ...] | None = None,
     max_loaded_voices: int | None = None,
+    zerotts_resolution: ZeroTtsModelResolution | None = None,
 ) -> TTSEngine:
     """Initialize the configured TTS engine according to selected engine."""
     selected_voices = server_config.tts_voices if voices is None else voices
     validate_tts_voices_for_engine(selected_voices, server_config.tts_engine)
     if server_config.tts_engine == TtsEngine.ZEROTTS:
         zerotts_voices = tuple(v for v in selected_voices if isinstance(v, ZeroTtsVoiceSpec))
+        if zerotts_resolution is not None:
+            return initialize_zerotts(
+                tts_path,
+                zerotts_voices,
+                cpu_threads,
+                resolution=zerotts_resolution,
+            )
+        if server_config.zerotts_gguf_model is not None:
+            _, zerotts_gguf = resolve_zerotts_model(
+                tts_path,
+                server_config.zerotts_gguf_model,
+            )
+            return initialize_zerotts(
+                tts_path,
+                zerotts_voices,
+                cpu_threads,
+                gguf_path=zerotts_gguf,
+            )
         return initialize_zerotts(
             tts_path,
             zerotts_voices,
@@ -200,11 +227,14 @@ def _select_loaded_voices(
 def _tts_cache_namespace(
     server_config: ServerConfig,
     voices: tuple[NghiTtsVoiceSpec | ZeroTtsVoiceSpec, ...],
+    zerotts_model_identity: str | None = None,
 ) -> bytes:
-    """Fingerprint engine, sentence silence, and voice artifacts for cache safety."""
+    """Fingerprint engine, sentence silence, voice artifacts, and ZeroTTS model for cache safety."""
     digest = hashlib.sha256(server_config.tts_engine.encode("utf-8"))
     if server_config.tts_engine == TtsEngine.ZEROTTS:
         digest.update(ZEROTTS_MODEL.revision.encode("ascii"))
+        if zerotts_model_identity:
+            digest.update(zerotts_model_identity.encode("utf-8"))
     digest.update(server_config.tts_sentence_silence_ms.to_bytes(4, "big"))
     for voice in sorted(voices, key=lambda v: v.id):
         digest.update(voice.id.encode("utf-8"))
@@ -355,14 +385,25 @@ async def run_server(
     _log_startup_configuration(server_config, cpu_threads, stt_model)
 
     validate_tts_voices_for_engine(server_config.tts_voices, server_config.tts_engine)
-    paths = download_models(
-        cache_dir=server_config.cache_dir,
-        download_dir=server_config.download_dir,
-        tts_voices=server_config.tts_voices,
-        offline=server_config.offline,
-        tts_engine=server_config.tts_engine,
-        stt_engine=server_config.stt_engine,
-    )
+    if server_config.zerotts_gguf_model is not None:
+        paths = download_models(
+            cache_dir=server_config.cache_dir,
+            download_dir=server_config.download_dir,
+            tts_voices=server_config.tts_voices,
+            offline=server_config.offline,
+            tts_engine=server_config.tts_engine,
+            stt_engine=server_config.stt_engine,
+            zerotts_quant=server_config.zerotts_gguf_model,
+        )
+    else:
+        paths = download_models(
+            cache_dir=server_config.cache_dir,
+            download_dir=server_config.download_dir,
+            tts_voices=server_config.tts_voices,
+            offline=server_config.offline,
+            tts_engine=server_config.tts_engine,
+            stt_engine=server_config.stt_engine,
+        )
 
     _LOGGER.info("Initializing Speech-to-Text engine (%s)", server_config.stt_engine)
     stt_recognizer = initialize_stt(
@@ -373,6 +414,7 @@ async def run_server(
     stt_info = get_stt_info(stt_model.repo, stt_model.revision, description=stt_model.description)
 
     _LOGGER.info("Initializing Text-to-Speech engine (%s)", server_config.tts_engine)
+    zerotts_resolution = getattr(paths, "zerotts_resolution", None)
     tts_engine = _initialize_configured_tts(
         server_config,
         paths[TTS_DIR],
@@ -380,6 +422,7 @@ async def run_server(
         active_voices,
         all_voices=server_config.tts_voices,
         max_loaded_voices=resources.max_tts_voices,
+        zerotts_resolution=zerotts_resolution,
     )
     await _warm_up_tts_safely(tts_engine, active_voices, server_config.tts_engine)
     tts_info = get_tts_info(server_config.tts_voices, engine=server_config.tts_engine)
@@ -391,7 +434,17 @@ async def run_server(
     tts_lock = asyncio.Lock()
     connection_limiter = ConnectionLimiter(server_config.max_active_connections)
     stt_buffer_budget = ByteBudget(server_config.max_stt_buffer_bytes)
-    tts_namespace = _tts_cache_namespace(server_config, server_config.tts_voices)
+    zerotts_model_identity: str | None = None
+    if server_config.tts_engine == TtsEngine.ZEROTTS and zerotts_resolution is not None:
+        if zerotts_resolution.spec.gguf_model is not None:
+            zerotts_model_identity = zerotts_resolution.spec.gguf_model.sha256
+        else:
+            zerotts_model_identity = zerotts_resolution.gguf_path.name
+    tts_namespace = _tts_cache_namespace(
+        server_config,
+        server_config.tts_voices,
+        zerotts_model_identity=zerotts_model_identity,
+    )
     tts_result_cache = _initialize_tts_cache(
         server_config,
         resources,
