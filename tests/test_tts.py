@@ -2627,3 +2627,75 @@ async def test_tts_stream_text_too_long() -> None:
         is False
     )
     assert len(written_events(writer)) > 0
+
+
+def test_stream_clause_detector_without_clause_splitting() -> None:
+    """Test StreamClauseDetector preserves clause delimiters when split_clauses is False."""
+    text = "Hôm nay thời tiết rất đẹp, chúng ta cùng đi dạo nhé."
+    detector = StreamClauseDetector(split_clauses=False)
+    pairs = detector.add_chunk_with_separators(text)
+    tail = detector.finish()
+    combined = [clause for clause, _ in pairs]
+    if tail:
+        combined.append(tail)
+    assert len(combined) == 1
+    assert combined[0] == text
+
+    # Multi-chunk streaming with chunk boundary immediately after the comma
+    detector_after = StreamClauseDetector(split_clauses=False)
+    p1 = detector_after.add_chunk_with_separators("Hôm nay rất đẹp, ")
+    p2 = detector_after.add_chunk_with_separators("chúng ta đi dạo.")
+    tail_after = detector_after.finish()
+    combined_after = [clause for clause, _ in (*p1, *p2)]
+    if tail_after:
+        combined_after.append(tail_after)
+    assert "".join(combined_after) == "Hôm nay rất đẹp, chúng ta đi dạo."
+
+    # Multi-chunk streaming with chunk boundary immediately before the comma
+    detector_before = StreamClauseDetector(split_clauses=False)
+    p1 = detector_before.add_chunk_with_separators("Hôm nay rất đẹp")
+    p2 = detector_before.add_chunk_with_separators(", chúng ta đi dạo.")
+    tail_before = detector_before.finish()
+    combined_before = [clause for clause, _ in (*p1, *p2)]
+    if tail_before:
+        combined_before.append(tail_before)
+    assert "".join(combined_before) == "Hôm nay rất đẹp, chúng ta đi dạo."
+
+    # Static splitting with split_clauses=False
+    static_pairs = StreamClauseDetector.split_clause_text_with_separators(text, split_clauses=False)
+    assert len(static_pairs) == 1
+    assert static_pairs[0][0] == text
+
+    static_clauses = StreamClauseDetector.split_clause_text(text, split_clauses=False)
+    assert static_clauses == [text]
+
+
+async def test_tts_streaming_subsentence_engine_does_not_split_commas() -> None:
+    """Test streaming with chunks_are_sentences=False avoids clause fragmentation."""
+    engine = FakeTTS([np.array([0.5], dtype=np.float32)], chunks_are_sentences=False)
+    handler, _writer = make_handler(engine)
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+
+    # First chunk contains a comma; must NOT trigger early synthesis
+    assert (
+        await handler.handle_event(SynthesizeChunk(text="Hôm nay thời tiết rất đẹp, ").event())
+        is True
+    )
+    assert len(engine.calls) == 0
+
+    # Second chunk ends the sentence with a period; triggers synthesis for sentence 1
+    assert (
+        await handler.handle_event(SynthesizeChunk(text="chúng ta cùng đi dạo nhé. ").event())
+        is True
+    )
+    assert len(engine.calls) == 1
+    assert engine.calls[0][0] == "Hôm nay thời tiết rất đẹp, chúng ta cùng đi dạo nhé."
+
+    # Third chunk has a second sentence, synthesized upon SynthesizeStop
+    assert (
+        await handler.handle_event(SynthesizeChunk(text="Ngày mai trời cũng đẹp.").event()) is True
+    )
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+
+    assert len(engine.calls) == 2
+    assert engine.calls[1][0] == "Ngày mai trời cũng đẹp."

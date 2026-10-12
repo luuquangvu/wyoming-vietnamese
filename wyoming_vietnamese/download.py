@@ -37,12 +37,19 @@ from .gguf_converter import (
     GGML_TYPE_F16,
     GGML_TYPE_F32,
     GGML_TYPE_Q4_0,
+    GGML_TYPE_Q4_1,
+    GGML_TYPE_Q5_0,
     GGML_TYPE_Q8_0,
     GGUF_MAGIC,
     GGUF_VERSION,
     convert_zerotts_q8_to_q4_hybrid,
+    convert_zerotts_second_order_hybrid,
+    is_attention_tensor,
     is_ffn_tensor,
+    is_pinned_q8_tensor,
     quantize_row_q8_0_to_q4_0,
+    quantize_row_q8_0_to_q4_1,
+    quantize_row_q8_0_to_q5_0,
 )
 from .stt_model import DEFAULT_STT_MODEL, SttArtifact, SttModelSpec, get_stt_model
 from .tts import validate_tts_voices_for_engine
@@ -64,14 +71,21 @@ __all__ = [
     "GGML_TYPE_F16",
     "GGML_TYPE_F32",
     "GGML_TYPE_Q4_0",
+    "GGML_TYPE_Q4_1",
+    "GGML_TYPE_Q5_0",
     "GGML_TYPE_Q8_0",
     "GGUF_MAGIC",
     "GGUF_VERSION",
     "ModelDownloadResult",
     "convert_zerotts_q8_to_q4_hybrid",
+    "convert_zerotts_second_order_hybrid",
     "download_models",
+    "is_attention_tensor",
     "is_ffn_tensor",
+    "is_pinned_q8_tensor",
     "quantize_row_q8_0_to_q4_0",
+    "quantize_row_q8_0_to_q4_1",
+    "quantize_row_q8_0_to_q5_0",
     "setup_hf_environment",
 ]
 
@@ -819,59 +833,60 @@ def _verified_zerotts_source(snapshot_path: Path, artifact: ZeroTtsArtifact) -> 
     return source
 
 
-def _structure_zerotts_files(
+def _structure_zerotts_hybrid_artifact(
+    snapshot_path: Path,
+    dst: Path,
+    artifact: ZeroTtsArtifact,
+) -> Path:
+    """Ensure ZeroTTS Q4-hybrid GGUF model is structured, generating from Q8 if needed."""
+    if _is_verified_file(dst, artifact.sha256):
+        return dst
+
+    hybrid_source = snapshot_path / artifact.local_name
+    if not hybrid_source.is_file():
+        alt_hybrid = snapshot_path / Path(artifact.local_name).name
+        if alt_hybrid.is_file():
+            hybrid_source = alt_hybrid
+    if hybrid_source.is_file() and _is_verified_file(hybrid_source, artifact.sha256):
+        _copy_or_link(hybrid_source, dst)
+        return dst
+
+    q8_artifact = ZEROTTS_MODEL.gguf_model
+    if q8_artifact is None:
+        raise RuntimeError("Base ZeroTTS Q8 GGUF artifact is missing")
+    q8_source = _verified_zerotts_source(snapshot_path, q8_artifact)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    convert_zerotts_q8_to_q4_hybrid(q8_source, dst)
+    if not _is_verified_file(dst, artifact.sha256):
+        raise RuntimeError(
+            f"Generated ZeroTTS hybrid model {dst!s} does not match its recorded SHA-256 digest"
+        )
+    return dst
+
+
+def _structure_zerotts_artifact(
     snapshot_path: Path,
     dest_dir: Path,
-    voices: Sequence[AnyVoiceSpec] | None = None,
-    zerotts_model: ZeroTtsModelSpec | None = None,
-) -> list[Path]:
-    """Verify pinned ZeroTTS assets and expose them under a stable local layout.
+    artifact: ZeroTtsArtifact,
+) -> Path:
+    """Structure a single ZeroTTS model artifact into destination directory."""
+    dst = dest_dir / artifact.local_name
+    if artifact.local_name == f"gguf/{ZeroTtsFile.Q4_HYBRID_GGUF_MODEL}":
+        return _structure_zerotts_hybrid_artifact(snapshot_path, dst, artifact)
 
-    When ``voices`` is provided, every listed ZeroTTS voice must exist in the
-    resulting layout and match its pinned digest.
-    """
-    dest_dir.mkdir(parents=True, exist_ok=True)
+    source = _verified_zerotts_source(snapshot_path, artifact)
+    _copy_or_link(source, dst)
+    if not _is_verified_file(dst, artifact.sha256):
+        raise RuntimeError(
+            f"Structured ZeroTTS artifact {artifact.local_name!r} does not match its "
+            f"recorded SHA-256 digest"
+        )
+    return dst
+
+
+def _structure_zerotts_voice_files(snapshot_path: Path, dest_dir: Path) -> list[Path]:
+    """Structure all packaged ZeroTTS voice npz files into the destination layout."""
     copied_paths: list[Path] = []
-    target_model = ZEROTTS_MODEL if zerotts_model is None else zerotts_model
-
-    for artifact in target_model.artifacts:
-        dst = dest_dir / artifact.local_name
-        if artifact.local_name == f"gguf/{ZeroTtsFile.Q4_HYBRID_GGUF_MODEL}":
-            if _is_verified_file(dst, artifact.sha256):
-                copied_paths.append(dst)
-                continue
-            hybrid_source = snapshot_path / artifact.local_name
-            if not hybrid_source.is_file():
-                alt_hybrid = snapshot_path / Path(artifact.local_name).name
-                if alt_hybrid.is_file():
-                    hybrid_source = alt_hybrid
-            if hybrid_source.is_file() and _is_verified_file(hybrid_source, artifact.sha256):
-                _copy_or_link(hybrid_source, dst)
-                copied_paths.append(dst)
-                continue
-            q8_artifact = ZEROTTS_MODEL.gguf_model
-            if q8_artifact is None:
-                raise RuntimeError("Base ZeroTTS Q8 GGUF artifact is missing")
-            q8_source = _verified_zerotts_source(snapshot_path, q8_artifact)
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            convert_zerotts_q8_to_q4_hybrid(q8_source, dst)
-            if not _is_verified_file(dst, artifact.sha256):
-                raise RuntimeError(
-                    f"Generated ZeroTTS hybrid model {dst!s} does not match its "
-                    f"recorded SHA-256 digest"
-                )
-            copied_paths.append(dst)
-            continue
-
-        source = _verified_zerotts_source(snapshot_path, artifact)
-        _copy_or_link(source, dst)
-        if not _is_verified_file(dst, artifact.sha256):
-            raise RuntimeError(
-                f"Structured ZeroTTS artifact {artifact.local_name!r} does not match its "
-                f"recorded SHA-256 digest"
-            )
-        copied_paths.append(dst)
-
     for voice in ZEROTTS_VOICES:
         source = snapshot_path / voice.artifact.remote_name
         if not source.is_file():
@@ -887,20 +902,50 @@ def _structure_zerotts_files(
         dst = dest_dir / "voices" / voice.id / "voice.npz"
         _copy_or_link(source, dst)
         copied_paths.append(dst)
+    return copied_paths
+
+
+def _verify_configured_zerotts_voices(
+    snapshot_path: Path,
+    dest_dir: Path,
+    voices: Sequence[AnyVoiceSpec],
+) -> None:
+    """Verify that all explicitly configured ZeroTTS voices exist and match pinned digests."""
+    for v in voices:
+        if isinstance(v, ZeroTtsVoiceSpec):
+            expected_dst = dest_dir / "voices" / v.id / "voice.npz"
+            if not expected_dst.is_file():
+                raise FileNotFoundError(
+                    f"Configured ZeroTTS voice {v.id!r} is missing from {snapshot_path!s}"
+                )
+            if not _is_verified_file(expected_dst, v.artifact.sha256):
+                raise RuntimeError(
+                    f"Configured ZeroTTS voice {v.id!r} does not match its recorded SHA-256 digest"
+                )
+
+
+def _structure_zerotts_files(
+    snapshot_path: Path,
+    dest_dir: Path,
+    voices: Sequence[AnyVoiceSpec] | None = None,
+    zerotts_model: ZeroTtsModelSpec | None = None,
+) -> list[Path]:
+    """Verify pinned ZeroTTS assets and expose them under a stable local layout.
+
+    When ``voices`` is provided, every listed ZeroTTS voice must exist in the
+    resulting layout and match its pinned digest.
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    target_model = ZEROTTS_MODEL if zerotts_model is None else zerotts_model
+
+    copied_paths: list[Path] = [
+        _structure_zerotts_artifact(snapshot_path, dest_dir, artifact)
+        for artifact in target_model.artifacts
+    ]
+    copied_paths.extend(_structure_zerotts_voice_files(snapshot_path, dest_dir))
 
     if voices:
-        for v in voices:
-            if isinstance(v, ZeroTtsVoiceSpec):
-                expected_dst = dest_dir / "voices" / v.id / "voice.npz"
-                if not expected_dst.is_file():
-                    raise FileNotFoundError(
-                        f"Configured ZeroTTS voice {v.id!r} is missing from {snapshot_path!s}"
-                    )
-                if not _is_verified_file(expected_dst, v.artifact.sha256):
-                    raise RuntimeError(
-                        f"Configured ZeroTTS voice {v.id!r} does not match its recorded "
-                        f"SHA-256 digest"
-                    )
+        _verify_configured_zerotts_voices(snapshot_path, dest_dir, voices)
 
     return copied_paths
 

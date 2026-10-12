@@ -23,16 +23,29 @@ if __name__ == "__main__" and not __package__:
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
-from wyoming_vietnamese.gguf_converter import convert_zerotts_q8_to_q4_hybrid
+from wyoming_vietnamese.gguf_converter import (
+    GGML_TYPE_Q4_1,
+    GGML_TYPE_Q5_0,
+    convert_zerotts_q8_to_q4_hybrid,
+)
 
 
-def print_q4_hybrid_summary(input_path: Path, output_path: Path) -> None:
+def print_q4_hybrid_summary(
+    input_path: Path, output_path: Path, attention_quant: str = "q8"
+) -> None:
     """Print architectural summary and validation info for the Q4-Hybrid model.
 
     Args:
         input_path: Source GGUF input file path.
         output_path: Target hybrid GGUF output file path.
+        attention_quant: Selected quantization format for attention layers.
     """
+    attn_label = {
+        "q8": "[Q8_0 / Native]",
+        "q5_0": "[Q5_0         ]",
+        "q4_1": "[Q4_1         ]",
+    }.get(attention_quant, "[Q8_0 / Native]")
+
     print("=" * 64)
     print("ZeroTTS Q4-Hybrid (Mixed Precision) Architecture Summary")
     print("=" * 64)
@@ -40,7 +53,7 @@ def print_q4_hybrid_summary(input_path: Path, output_path: Path) -> None:
     print(f"Target Hybrid: {output_path}")
     print("\nTensor Quantization Mapping:")
     print("  [Q8_0 / Native] Audio Embedding & Prediction Codebook Heads")
-    print("  [Q8_0 / Native] Self-Attention & Cross-Attention (Q, K, V, O)")
+    print(f"  {attn_label} Self-Attention & Cross-Attention (Q, K, V, O)")
     print("  [Q8_0 / Native] Text Encoder & Layer Norms")
     print("  [Q4_0         ] Transformer Feed-Forward Networks (FFN / MLP)")
     print("\nBenefits:")
@@ -67,6 +80,16 @@ def main() -> None:
         default=None,
         help="Path to target hybrid GGUF file (default: <parent>/zerotts-q4-hybrid.gguf)",
     )
+    parser.add_argument(
+        "--attention-quant",
+        choices=["q8", "q5_0", "q4_1"],
+        default="q8",
+        help=(
+            "Quantization precision for Attention layers (Self-Attention & Cross-Attention): "
+            "'q8' (default: keep Q8_0), 'q5_0' (Technique 3 Second-Order Mixed Precision), "
+            "or 'q4_1'."
+        ),
+    )
     args = parser.parse_args()
 
     input_path = args.input.resolve()
@@ -74,13 +97,16 @@ def main() -> None:
         args.output.resolve() if args.output else input_path.parent / "zerotts-q4-hybrid.gguf"
     )
 
-    print_q4_hybrid_summary(input_path, output_path)
+    print_q4_hybrid_summary(input_path, output_path, attention_quant=args.attention_quant)
     if not input_path.is_file():
         print(f"Error: Source file {input_path} not found.")
         sys.exit(1)
 
-    print(f"Converting {input_path} -> {output_path}...")
-    convert_zerotts_q8_to_q4_hybrid(input_path, output_path)
+    attn_map = {"q8": None, "q5_0": GGML_TYPE_Q5_0, "q4_1": GGML_TYPE_Q4_1}
+    attention_type = attn_map[args.attention_quant]
+
+    print(f"Converting {input_path} -> {output_path} (attention_quant={args.attention_quant})...")
+    convert_zerotts_q8_to_q4_hybrid(input_path, output_path, attention_type=attention_type)
     print(f"Done! Hybrid model saved ({output_path.stat().st_size:,} bytes).")
 
 

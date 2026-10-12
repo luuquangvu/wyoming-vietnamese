@@ -9,6 +9,7 @@ import struct
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
+from typing import BinaryIO
 from unittest.mock import Mock
 
 import numpy as np
@@ -32,6 +33,8 @@ from wyoming_vietnamese.download import (
     GGML_TYPE_F16,
     GGML_TYPE_F32,
     GGML_TYPE_Q4_0,
+    GGML_TYPE_Q4_1,
+    GGML_TYPE_Q5_0,
     GGML_TYPE_Q8_0,
     GGUF_MAGIC,
     GGUF_VERSION,
@@ -51,9 +54,14 @@ from wyoming_vietnamese.download import (
     _sync_nghitts_model,
     _sync_repo,
     convert_zerotts_q8_to_q4_hybrid,
+    convert_zerotts_second_order_hybrid,
     download_models,
+    is_attention_tensor,
     is_ffn_tensor,
+    is_pinned_q8_tensor,
     quantize_row_q8_0_to_q4_0,
+    quantize_row_q8_0_to_q4_1,
+    quantize_row_q8_0_to_q5_0,
     setup_hf_environment,
 )
 from wyoming_vietnamese.stt_model import (
@@ -1429,6 +1437,160 @@ def test_quantize_row_q8_0_to_q4_0_size_mismatch() -> None:
         quantize_row_q8_0_to_q4_0(b"\x00" * 50, 32)
 
 
+@pytest.mark.parametrize(
+    ("tensor_name", "expected"),
+    [
+        ("model.layers.0.self_attn.weight", True),
+        ("dec.0.self_q.weight", True),
+        ("dec.0.self_k.weight", True),
+        ("dec.0.self_v.weight", True),
+        ("dec.0.self_o.weight", True),
+        ("dec.0.cross_q.weight", True),
+        ("loc.0.attn_q.weight", True),
+        ("loc.0.attn_k.weight", True),
+        ("loc.0.attn_v.weight", True),
+        ("loc.0.attn_o.weight", True),
+        ("attention.q_proj.weight", True),
+        ("attention.query.weight", True),
+        ("attention.q_proj", True),
+        ("attention.query", True),
+        ("transformer.layers.0.attention.wq", True),
+        ("transformer.layers.0.attention.wk", True),
+        ("transformer.layers.0.attention.wv", True),
+        ("transformer.layers.0.attention.wo", True),
+        ("model.layers.0.self_attention.weight", True),
+        ("model.layers.0.cross_attention.weight", True),
+        ("model.layers.0.q_proj.weight", True),
+        ("model.layers.0.k_proj.weight", True),
+        ("model.layers.0.v_proj.weight", True),
+        ("model.layers.0.o_proj.weight", True),
+        ("model.layers.0.out_proj.weight", True),
+        ("ahead_attention.q_proj.weight", True),
+        ("member_attn.k_proj.weight", True),
+        ("assembly_attn.v_proj.weight", True),
+        ("model.layers.0.attn.norm.weight", False),
+        ("model.layers.0.norm_attn.weight", False),
+        ("model.layers.0.attn.bias", False),
+        ("audio_head.0.weight", False),
+        ("audio_embed.0.weight", False),
+        ("codebook.attn.weight", False),
+    ],
+)
+def test_is_attention_tensor_patterns(tensor_name: str, expected: bool) -> None:
+    """Test is_attention_tensor correctly classifies attention projection weights."""
+    assert is_attention_tensor(tensor_name) is expected
+
+
+@pytest.mark.parametrize(
+    ("tensor_name", "expected"),
+    [
+        ("audio_head.0.weight", True),
+        ("audio_embed.15.weight", True),
+        ("codebook.weight", True),
+        ("text_encoder.weight", True),
+        ("txt.0.attn_q.weight", True),
+        ("dec.0.self_q.weight", False),
+        ("dec.0.ffn_up.weight", False),
+        ("loc.0.ffn_down.weight", False),
+    ],
+)
+def test_is_pinned_q8_tensor_patterns(tensor_name: str, expected: bool) -> None:
+    """Test is_pinned_q8_tensor correctly identifies audio heads and codebooks."""
+    assert is_pinned_q8_tensor(tensor_name) is expected
+
+
+def test_quantize_row_q8_0_to_q5_0_cases() -> None:
+    """Test quantize_row_q8_0_to_q5_0 produces 22 bytes per block with expected layout."""
+    delta = np.float16(1.0).tobytes()
+    q8_zeros = delta + (b"\x00" * 32)
+    q5_bytes = quantize_row_q8_0_to_q5_0(q8_zeros, 32)
+    assert len(q5_bytes) == 22
+    assert q5_bytes[:2] == np.float16(0.0).tobytes()
+    assert q5_bytes[2:6] == b"\xff" * 4
+    assert q5_bytes[6:22] == b"\x00" * 16
+
+    # Non-zero gradient exercising both 0 and 1 high-bit flags and nibble packing
+    w = np.linspace(-15.0, 15.0, 32, dtype=np.float32)
+    q8_d = np.float32(np.float16(np.max(np.abs(w)) / 127.0))
+    q8_qs = np.round(w / q8_d).astype(np.int8)
+    q8_bytes = np.float16(q8_d).tobytes() + q8_qs.tobytes()
+
+    q5_bytes_grad = quantize_row_q8_0_to_q5_0(q8_bytes, 32)
+    assert len(q5_bytes_grad) == 22
+    d = np.frombuffer(q5_bytes_grad[:2], dtype=np.float16)[0]
+    qh = int.from_bytes(q5_bytes_grad[2:6], "little")
+    qs = np.frombuffer(q5_bytes_grad[6:22], dtype=np.uint8)
+
+    deq = np.empty(32, dtype=np.float32)
+    for j in range(16):
+        x0 = int(qs[j] & 0x0F)
+        x1 = int(qs[j] >> 4)
+        xh0 = ((qh >> j) & 1) << 4
+        xh1 = ((qh >> (j + 16)) & 1) << 4
+        deq[j] = ((x0 | xh0) - 16) * float(d)
+        deq[j + 16] = ((x1 | xh1) - 16) * float(d)
+
+    assert float(d) > 0
+    assert np.max(np.abs(w - deq)) <= float(d) + 0.1
+    assert 0 < qh < 0xFFFFFFFF
+
+
+def test_quantize_row_q8_0_to_q5_0_size_mismatch() -> None:
+    """Test quantize_row_q8_0_to_q5_0 raises ValueError on invalid elements or payloads."""
+    with pytest.raises(ValueError, match="Invalid n_elements: 0"):
+        quantize_row_q8_0_to_q5_0(b"\x00" * 34, 0)
+
+    with pytest.raises(ValueError, match="Invalid n_elements: -32"):
+        quantize_row_q8_0_to_q5_0(b"\x00" * 34, -32)
+
+    with pytest.raises(ValueError, match="Invalid n_elements: 33"):
+        quantize_row_q8_0_to_q5_0(b"\x00" * 34, 33)
+
+    with pytest.raises(ValueError, match="Unexpected Q8_0 size"):
+        quantize_row_q8_0_to_q5_0(b"\x00" * 20, 32)
+
+
+def _assert_quantize_q4_1_block(
+    qs: np.ndarray | bytes,
+    expected_d: float,
+    expected_m: float,
+    expected_qs: bytes,
+) -> None:
+    """Validate that Q8_0 payload quantizes to Q4_1 with expected scale, min, and nibbles."""
+    delta = np.float16(1.0).tobytes()
+    qs_bytes = qs.tobytes() if isinstance(qs, np.ndarray) else qs
+    q8_bytes = delta + qs_bytes
+    q4_1_bytes = quantize_row_q8_0_to_q4_1(q8_bytes, 32)
+    assert len(q4_1_bytes) == 20
+    assert q4_1_bytes[:2] == np.float16(expected_d).tobytes()
+    assert q4_1_bytes[2:4] == np.float16(expected_m).tobytes()
+    assert q4_1_bytes[4:20] == expected_qs
+
+
+def test_quantize_row_q8_0_to_q4_1_cases() -> None:
+    """Test quantize_row_q8_0_to_q4_1 produces 20 bytes per block with expected layout."""
+    _assert_quantize_q4_1_block(b"\x00" * 32, 0.0, 0.0, b"\x00" * 16)
+    _assert_quantize_q4_1_block(
+        np.array([-15] * 16 + [15] * 16, dtype=np.int8), 2.0, -15.0, b"\xf0" * 16
+    )
+    _assert_quantize_q4_1_block(np.array([5] * 32, dtype=np.int8), 0.0, 5.0, b"\x00" * 16)
+
+
+def test_quantize_row_q8_0_to_q4_1_size_mismatch() -> None:
+    """Test quantize_row_q8_0_to_q4_1 raises ValueError on invalid elements or payloads."""
+    with pytest.raises(ValueError, match="Invalid n_elements: 0"):
+        quantize_row_q8_0_to_q4_1(b"\x00" * 34, 0)
+
+    with pytest.raises(ValueError, match="Invalid n_elements: -32"):
+        quantize_row_q8_0_to_q4_1(b"\x00" * 34, -32)
+
+    with pytest.raises(ValueError, match="Invalid n_elements: 33"):
+        quantize_row_q8_0_to_q4_1(b"\x00" * 34, 33)
+
+    with pytest.raises(ValueError, match="Unexpected Q8_0 size"):
+        quantize_row_q8_0_to_q4_1(b"\x00" * 20, 32)
+
+
 def _pack_tensor_meta(name: bytes, dims: tuple[int, ...], ttype: int, offset: int = 0) -> bytes:
     """Pack GGUF tensor header metadata into bytes."""
     header = struct.pack("<Q", len(name)) + name + struct.pack("<I", len(dims))
@@ -1440,7 +1602,7 @@ def _pack_tensor_meta(name: bytes, dims: tuple[int, ...], ttype: int, offset: in
 def _write_synthetic_gguf(path: Path) -> None:
     """Write a synthetic GGUF model exercising all KV and tensor parsing branches."""
     with path.open("wb") as fout:
-        fout.write(struct.pack("<IIQQ", GGUF_MAGIC, GGUF_VERSION, 5, 8))
+        fout.write(struct.pack("<IIQQ", GGUF_MAGIC, GGUF_VERSION, 6, 8))
 
         def write_kv(key: bytes, vtype: int, raw_bytes: bytes) -> None:
             fout.write(struct.pack("<Q", len(key)) + key + struct.pack("<I", vtype) + raw_bytes)
@@ -1460,6 +1622,7 @@ def _write_synthetic_gguf(path: Path) -> None:
             (b"model.layers.0.norm.weight", (32,), GGML_TYPE_F32, 128),
             (b"model.layers.0.bias", (32,), GGML_TYPE_F16, 256),
             (b"model.layers.0.existing_q4", (32,), GGML_TYPE_Q4_0, 320),
+            (b"audio_head.weight", (32, 1), GGML_TYPE_Q8_0, 352),
         )
         for name, dims, ttype, offset in tensors:
             fout.write(_pack_tensor_meta(name, dims, ttype, offset))
@@ -1478,6 +1641,61 @@ def _write_synthetic_gguf(path: Path) -> None:
         fout.write(b"\x00" * 64)
         fout.write(b"\x00" * 18 + (b"\x00" * 14))
 
+        t5_data = np.float16(2.0).tobytes() + (b"\x05" * 32)
+        fout.write(t5_data + (b"\x00" * 30))
+
+
+def _skip_inspect_kv_value(fin: BinaryIO, vt: int) -> None:
+    """Skip an uninspected GGUF KV payload based on its type."""
+    if vt in {0, 1, 7}:
+        fin.seek(1, 1)
+    elif vt in {2, 3}:
+        fin.seek(2, 1)
+    elif vt in {4, 5, 6}:
+        fin.seek(4, 1)
+    elif vt in {10, 11, 12}:
+        fin.seek(8, 1)
+    elif vt == 8:
+        s_len = struct.unpack("<Q", fin.read(8))[0]
+        fin.seek(s_len, 1)
+    elif vt == 9:
+        ayt, cnt = struct.unpack("<IQ", fin.read(12))
+        step = 4 if ayt in {4, 5, 6} else 8
+        fin.seek(step * cnt, 1)
+
+
+def _parse_inspect_alignment(fin: BinaryIO, n_kv: int) -> int:
+    """Scan GGUF KV headers and return alignment value (default 32)."""
+    alignment = 32
+    for _ in range(n_kv):
+        k_len = struct.unpack("<Q", fin.read(8))[0]
+        k_name = fin.read(k_len).decode("utf-8", errors="replace")
+        vt = struct.unpack("<I", fin.read(4))[0]
+        if k_name == "general.alignment":
+            if vt in {4, 5}:
+                fmt = "<I" if vt == 4 else "<i"
+                alignment = struct.unpack(fmt, fin.read(4))[0]
+            elif vt == 10:
+                alignment = struct.unpack("<Q", fin.read(8))[0]
+            else:
+                fin.seek(4, 1)
+        else:
+            _skip_inspect_kv_value(fin, vt)
+    return alignment
+
+
+def _parse_inspect_tensors(fin: BinaryIO, n_tensors: int) -> dict[str, tuple[int, int]]:
+    """Parse GGUF tensor names, types, and offsets."""
+    tensors: dict[str, tuple[int, int]] = {}
+    for _ in range(n_tensors):
+        n_len = struct.unpack("<Q", fin.read(8))[0]
+        name = fin.read(n_len).decode("utf-8")
+        n_dims = struct.unpack("<I", fin.read(4))[0]
+        fin.seek(n_dims * 8, 1)
+        ttype, offset = struct.unpack("<IQ", fin.read(12))
+        tensors[name] = (ttype, offset)
+    return tensors
+
 
 def _inspect_gguf_tensors(
     path: Path,
@@ -1488,43 +1706,8 @@ def _inspect_gguf_tensors(
         if magic != GGUF_MAGIC or version != GGUF_VERSION:
             raise ValueError("Corrupt test GGUF file")
 
-        alignment = 32
-        for _ in range(n_kv):
-            k_len = struct.unpack("<Q", fin.read(8))[0]
-            k_name = fin.read(k_len).decode("utf-8", errors="replace")
-            vt = struct.unpack("<I", fin.read(4))[0]
-            if k_name == "general.alignment":
-                if vt in {4, 5}:
-                    fmt = "<I" if vt == 4 else "<i"
-                    alignment = struct.unpack(fmt, fin.read(4))[0]
-                elif vt == 10:
-                    alignment = struct.unpack("<Q", fin.read(8))[0]
-                else:
-                    fin.seek(4, 1)
-            elif vt in {0, 1, 7}:
-                fin.seek(1, 1)
-            elif vt in {2, 3}:
-                fin.seek(2, 1)
-            elif vt in {4, 5, 6}:
-                fin.seek(4, 1)
-            elif vt in {10, 11, 12}:
-                fin.seek(8, 1)
-            elif vt == 8:
-                s_len = struct.unpack("<Q", fin.read(8))[0]
-                fin.seek(s_len, 1)
-            elif vt == 9:
-                ayt, cnt = struct.unpack("<IQ", fin.read(12))
-                step = 4 if ayt in {4, 5, 6} else 8
-                fin.seek(step * cnt, 1)
-
-        tensors: dict[str, tuple[int, int]] = {}
-        for _ in range(n_tensors):
-            n_len = struct.unpack("<Q", fin.read(8))[0]
-            name = fin.read(n_len).decode("utf-8")
-            n_dims = struct.unpack("<I", fin.read(4))[0]
-            fin.seek(n_dims * 8, 1)
-            ttype, offset = struct.unpack("<IQ", fin.read(12))
-            tensors[name] = (ttype, offset)
+        alignment = _parse_inspect_alignment(fin, n_kv)
+        tensors = _parse_inspect_tensors(fin, n_tensors)
 
         header_end = fin.tell()
         pad = (alignment - (header_end % alignment)) % alignment
@@ -1550,16 +1733,116 @@ def test_convert_zerotts_q8_to_q4_hybrid_success(tmp_path: Path) -> None:
 
     tensors, q4_payload, data_start = _inspect_gguf_tensors(dst)
     assert data_start % 32 == 0
-    assert len(tensors) == 5
+    assert len(tensors) == 6
     assert tensors["model.layers.0.mlp.weight"][0] == GGML_TYPE_Q4_0
     assert tensors["model.layers.0.self_attn.weight"][0] == GGML_TYPE_Q8_0
     assert tensors["model.layers.0.norm.weight"][0] == GGML_TYPE_F32
     assert tensors["model.layers.0.bias"][0] == GGML_TYPE_F16
     assert tensors["model.layers.0.existing_q4"][0] == GGML_TYPE_Q4_0
+    assert tensors["audio_head.weight"][0] == GGML_TYPE_Q8_0
 
     assert len(q4_payload) == 18
     expected_q4 = quantize_row_q8_0_to_q4_0(np.float16(1.0).tobytes() + (b"\x01" * 32), 32)
     assert q4_payload == expected_q4
+
+    with dst.open("rb") as fin:
+        head_offset = tensors["audio_head.weight"][1]
+        fin.seek(data_start + head_offset)
+        head_payload = fin.read(34)
+    expected_head = np.float16(2.0).tobytes() + (b"\x05" * 32)
+    assert head_payload == expected_head
+
+
+def test_convert_zerotts_second_order_hybrid_success(tmp_path: Path) -> None:
+    """Test convert_zerotts_second_order_hybrid quantizes FFN to Q4_0 and Attention to Q5_0."""
+    src = tmp_path / "model-q8_0.gguf"
+    dst = tmp_path / "model-second-order.gguf"
+    _write_synthetic_gguf(src)
+
+    result = convert_zerotts_second_order_hybrid(src, dst)
+    assert result == dst
+    assert dst.is_file()
+
+    tensors, _, data_start = _inspect_gguf_tensors(dst)
+    assert data_start % 32 == 0
+    assert len(tensors) == 6
+    assert tensors["model.layers.0.mlp.weight"][0] == GGML_TYPE_Q4_0
+    assert tensors["model.layers.0.self_attn.weight"][0] == GGML_TYPE_Q5_0
+    assert tensors["model.layers.0.norm.weight"][0] == GGML_TYPE_F32
+    assert tensors["model.layers.0.bias"][0] == GGML_TYPE_F16
+    assert tensors["model.layers.0.existing_q4"][0] == GGML_TYPE_Q4_0
+    assert tensors["audio_head.weight"][0] == GGML_TYPE_Q8_0
+
+    with dst.open("rb") as fin:
+        attn_offset = tensors["model.layers.0.self_attn.weight"][1]
+        fin.seek(data_start + attn_offset)
+        q5_payload = fin.read(22)
+    assert len(q5_payload) == 22
+    expected_q5 = quantize_row_q8_0_to_q5_0(np.float16(1.0).tobytes() + (b"\x02" * 32), 32)
+    assert q5_payload == expected_q5
+
+    with dst.open("rb") as fin:
+        head_offset = tensors["audio_head.weight"][1]
+        fin.seek(data_start + head_offset)
+        head_payload = fin.read(34)
+    expected_head = np.float16(2.0).tobytes() + (b"\x05" * 32)
+    assert head_payload == expected_head
+
+
+def test_convert_zerotts_second_order_hybrid_q4_1(tmp_path: Path) -> None:
+    """Test convert_zerotts_second_order_hybrid supports Q4_1 attention precision."""
+    src = tmp_path / "model-q8_0.gguf"
+    dst = tmp_path / "model-second-order-q4_1.gguf"
+    _write_synthetic_gguf(src)
+
+    result = convert_zerotts_second_order_hybrid(src, dst, attention_type=GGML_TYPE_Q4_1)
+    assert result == dst
+    assert dst.is_file()
+
+    tensors, _, data_start = _inspect_gguf_tensors(dst)
+    assert tensors["model.layers.0.self_attn.weight"][0] == GGML_TYPE_Q4_1
+    assert tensors["audio_head.weight"][0] == GGML_TYPE_Q8_0
+
+    with dst.open("rb") as fin:
+        attn_offset = tensors["model.layers.0.self_attn.weight"][1]
+        fin.seek(data_start + attn_offset)
+        q4_1_payload = fin.read(20)
+    assert len(q4_1_payload) == 20
+    expected_q4_1 = quantize_row_q8_0_to_q4_1(np.float16(1.0).tobytes() + (b"\x02" * 32), 32)
+    assert q4_1_payload == expected_q4_1
+
+    with dst.open("rb") as fin:
+        head_offset = tensors["audio_head.weight"][1]
+        fin.seek(data_start + head_offset)
+        head_payload = fin.read(34)
+    expected_head = np.float16(2.0).tobytes() + (b"\x05" * 32)
+    assert head_payload == expected_head
+
+
+def test_convert_zerotts_q8_to_q4_hybrid_invalid_attention_type(tmp_path: Path) -> None:
+    """Test convert_zerotts_q8_to_q4_hybrid rejects unsupported attention quantization type."""
+    src = tmp_path / "model-q8_0.gguf"
+    dst = tmp_path / "model-out.gguf"
+    _write_synthetic_gguf(src)
+
+    with pytest.raises(ValueError, match="Unsupported attention quantization type: 99"):
+        convert_zerotts_q8_to_q4_hybrid(src, dst, attention_type=99)
+
+    assert not dst.exists()
+    assert not dst.with_suffix(".tmp").exists()
+
+
+def test_convert_zerotts_second_order_hybrid_invalid_attention_type(tmp_path: Path) -> None:
+    """Test convert_zerotts_second_order_hybrid rejects unsupported attention quantization type."""
+    src = tmp_path / "model-q8_0.gguf"
+    dst = tmp_path / "model-second-order-invalid.gguf"
+    _write_synthetic_gguf(src)
+
+    with pytest.raises(ValueError, match="Unsupported attention quantization type: 99"):
+        convert_zerotts_second_order_hybrid(src, dst, attention_type=99)
+
+    assert not dst.exists()
+    assert not dst.with_suffix(".tmp").exists()
 
 
 def _write_gguf_with_alignment(path: Path, alignment_val: int, *, n_tensors: int = 0) -> None:
@@ -1870,6 +2153,8 @@ def test_create_q4_hybrid_cli_tool(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     _write_synthetic_gguf(src)
 
     mod.print_q4_hybrid_summary(src, dst)
+    mod.print_q4_hybrid_summary(src, dst, attention_quant="q4_1")
+    mod.print_q4_hybrid_summary(src, dst, attention_quant="q5_0")
 
     monkeypatch.setattr(
         sys, "argv", ["create_q4_hybrid.py", "--input", str(tmp_path / "missing.gguf")]
@@ -1885,3 +2170,65 @@ def test_create_q4_hybrid_cli_tool(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     )
     mod.main()
     assert dst.is_file()
+
+    tensors_default, _, _ = _inspect_gguf_tensors(dst)
+    assert tensors_default["model.layers.0.self_attn.weight"][0] == GGML_TYPE_Q8_0
+    assert tensors_default["model.layers.0.mlp.weight"][0] == GGML_TYPE_Q4_0
+    assert tensors_default["audio_head.weight"][0] == GGML_TYPE_Q8_0
+
+    dst_q5 = tmp_path / "model-q4-hybrid-q5.gguf"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "create_q4_hybrid.py",
+            "--input",
+            str(src),
+            "--output",
+            str(dst_q5),
+            "--attention-quant",
+            "q5_0",
+        ],
+    )
+    mod.main()
+    assert dst_q5.is_file()
+
+    tensors_q5, _, _ = _inspect_gguf_tensors(dst_q5)
+    assert tensors_q5["model.layers.0.self_attn.weight"][0] == GGML_TYPE_Q5_0
+    assert tensors_q5["model.layers.0.mlp.weight"][0] == GGML_TYPE_Q4_0
+    assert tensors_q5["audio_head.weight"][0] == GGML_TYPE_Q8_0
+
+    dst_q4_1 = tmp_path / "model-q4-hybrid-q4_1.gguf"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "create_q4_hybrid.py",
+            "--input",
+            str(src),
+            "--output",
+            str(dst_q4_1),
+            "--attention-quant",
+            "q4_1",
+        ],
+    )
+    mod.main()
+    assert dst_q4_1.is_file()
+
+    tensors_q4_1, _, _ = _inspect_gguf_tensors(dst_q4_1)
+    assert tensors_q4_1["model.layers.0.self_attn.weight"][0] == GGML_TYPE_Q4_1
+    assert tensors_q4_1["model.layers.0.mlp.weight"][0] == GGML_TYPE_Q4_0
+    assert tensors_q4_1["audio_head.weight"][0] == GGML_TYPE_Q8_0
+
+    default_out = src.parent / "zerotts-q4-hybrid.gguf"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["create_q4_hybrid.py", "--input", str(src), "--attention-quant", "q8"],
+    )
+    mod.main()
+    assert default_out.is_file()
+    tensors_q8, _, _ = _inspect_gguf_tensors(default_out)
+    assert tensors_q8["model.layers.0.self_attn.weight"][0] == GGML_TYPE_Q8_0
+    assert tensors_q8["model.layers.0.mlp.weight"][0] == GGML_TYPE_Q4_0
+    assert tensors_q8["audio_head.weight"][0] == GGML_TYPE_Q8_0

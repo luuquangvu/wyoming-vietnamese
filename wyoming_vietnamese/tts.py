@@ -684,9 +684,14 @@ class StreamClauseDetector:
     sound clipped.
     """
 
-    def __init__(self, min_clause_chars: int = _MIN_CLAUSE_CHARS) -> None:
+    def __init__(
+        self,
+        min_clause_chars: int = _MIN_CLAUSE_CHARS,
+        split_clauses: bool = True,
+    ) -> None:
         """Initialize the minimum length for a clause-level punctuation boundary."""
         self.min_clause_chars = min_clause_chars
+        self.split_clauses = split_clauses
         self.buffer = ""
         # Whitespace discarded after the most recent boundary, kept so a merged
         # final tail can be restored without rewriting the requested text.
@@ -708,19 +713,21 @@ class StreamClauseDetector:
         return text
 
     @staticmethod
-    def split_clause_text_with_separators(text: str) -> list[tuple[str, str]]:
+    def split_clause_text_with_separators(
+        text: str, split_clauses: bool = True
+    ) -> list[tuple[str, str]]:
         """Split a static block into clauses and trailing separators."""
         trimmed = text.strip()
         if not trimmed:
             return []
-        detector = StreamClauseDetector()
+        detector = StreamClauseDetector(split_clauses=split_clauses)
         pairs = detector.add_chunk_with_separators(trimmed)
         remainder = detector.finish()
         if not remainder:
             return pairs
         if (
             not pairs
-            or len(remainder) >= _MIN_CLAUSE_CHARS
+            or len(remainder) >= detector.min_clause_chars
             or _boundary_kind(pairs[-1][0], pairs[-1][1]) in ("paragraph", "sentence")
         ):
             pairs.append((remainder, ""))
@@ -732,10 +739,13 @@ class StreamClauseDetector:
         return pairs
 
     @staticmethod
-    def split_clause_text(text: str) -> list[str]:
+    def split_clause_text(text: str, split_clauses: bool = True) -> list[str]:
         """Split a static block only at configured text boundaries."""
         return [
-            clause for clause, _ in StreamClauseDetector.split_clause_text_with_separators(text)
+            clause
+            for clause, _ in StreamClauseDetector.split_clause_text_with_separators(
+                text, split_clauses=split_clauses
+            )
         ]
 
     def _drain(self) -> list[tuple[str, str]]:
@@ -768,10 +778,14 @@ class StreamClauseDetector:
         """Find the earliest paragraph, sentence, or sufficiently long clause delimiter."""
         paragraph_match = self._first_text_boundary(_PARAGRAPH_DELIM_RE.finditer(self.buffer))
         sentence_match = self._first_text_boundary(_SENTENCE_DELIM_RE.finditer(self.buffer))
-        clause_match = self._first_text_boundary(
-            match
-            for match in _CLAUSE_DELIM_RE.finditer(self.buffer)
-            if match.end() >= self.min_clause_chars
+        clause_match = (
+            self._first_text_boundary(
+                match
+                for match in _CLAUSE_DELIM_RE.finditer(self.buffer)
+                if match.end() >= self.min_clause_chars
+            )
+            if self.split_clauses
+            else None
         )
         if candidates := [
             match for match in (paragraph_match, sentence_match, clause_match) if match is not None
@@ -1052,7 +1066,9 @@ class TTSEventHandler(SafeAsyncEventHandler):
             len(final_text),
         )
         if final_text:
-            clause_pairs = StreamClauseDetector.split_clause_text_with_separators(final_text)
+            clause_pairs = StreamClauseDetector.split_clause_text_with_separators(
+                final_text, split_clauses=self.chunks_are_sentences
+            )
             try:
                 normalized_clauses = [
                     (
@@ -1732,7 +1748,9 @@ class TTSEventHandler(SafeAsyncEventHandler):
         self.stream_output_seconds = 0.0
         self.stream_synthesis_seconds = 0.0
         self.stream_voice_name = None
-        self.sentence_boundary = StreamClauseDetector()
+        self.sentence_boundary = StreamClauseDetector(
+            split_clauses=getattr(self, "chunks_are_sentences", True)
+        )
 
     async def disconnect(self) -> None:
         """Release buffered streaming text when the client disconnects."""
