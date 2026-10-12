@@ -82,11 +82,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--attention-quant",
-        choices=["q5_0", "q8", "q4_1"],
-        default="q5_0",
+        choices=["q8", "q5_0", "q4_1"],
+        default="q8",
         help=(
             "Quantization precision for Attention layers (Self-Attention & Cross-Attention): "
-            "'q5_0' (default: Q5_0 mixed precision), 'q8' (keep native Q8_0), "
+            "'q8' (default: keep native Q8_0 precision), 'q5_0' (Q5_0 mixed precision), "
             "or 'q4_1'."
         ),
     )
