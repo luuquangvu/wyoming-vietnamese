@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import logging
 import math
 import os
 import platform
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Final
 
 from .const import ZeroTtsVariant
+
+_LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 _MAX_WINDOWS_WORKERS: Final[int] = 61 if sys.version_info >= (3, 10) else 60
 _PHYSICAL_CORES_CACHE: Final[dict[frozenset[int] | None, int]] = {}
@@ -373,7 +376,7 @@ def _cpu_count_affinity_set() -> set[int] | None:
         Set of allowed logical CPU indices, or None if affinity cannot be determined.
     """
     if hasattr(os, "sched_getaffinity"):
-        with contextlib.suppress(OSError, NotImplementedError):
+        with contextlib.suppress(OSError, NotImplementedError, ValueError):
             return set(os.sched_getaffinity(0))
 
     with contextlib.suppress(Exception):
@@ -705,9 +708,13 @@ def available_cpu_count(*, only_physical_cores: bool = False) -> int:
     if sys.platform == "win32":
         os_cpu_count = min(os_cpu_count, _MAX_WINDOWS_WORKERS)
 
+    proc_cpus: int | None = None
     if hasattr(os, "process_cpu_count"):
-        proc_cpus = os.process_cpu_count()
-        cpu_count_affinity = proc_cpus if proc_cpus is not None else os_cpu_count
+        with contextlib.suppress(OSError, NotImplementedError, ValueError):
+            proc_cpus = os.process_cpu_count()
+
+    if proc_cpus is not None:
+        cpu_count_affinity = proc_cpus
     else:
         affinity_set = _cpu_count_affinity_set()
         cpu_count_affinity = len(affinity_set) if affinity_set is not None else os_cpu_count
@@ -748,3 +755,38 @@ def resolve_cpu_threads(
         raise ValueError("configured threads must not be negative")
     available_threads = available_cpu_count(only_physical_cores=only_physical_cores)
     return min(configured_threads, available_threads) if configured_threads else available_threads
+
+
+def get_process_affinity_cpus() -> list[int]:
+    """Return sorted list of logical CPU IDs allowed for the current process.
+
+    Uses detected process affinity if available, or falls back to process-available
+    CPU count indexed from 0, constrained to available CPU limits.
+
+    Returns:
+        Sorted list of integer CPU IDs available to this process.
+    """
+    limit = available_cpu_count()
+    if affinity_set := _cpu_count_affinity_set():
+        allowed = sorted(affinity_set)
+        return allowed[:limit] if len(allowed) > limit else allowed
+    return list(range(limit))
+
+
+def set_thread_affinity(cpu_ids: Sequence[int] | set[int]) -> bool:
+    """Assign current calling thread affinity to specific CPU cores.
+
+    Args:
+        cpu_ids: Collection of CPU core IDs to pin the calling thread to.
+
+    Returns:
+        True if affinity was successfully applied, False otherwise.
+    """
+    if not hasattr(os, "sched_setaffinity"):
+        return False
+    try:
+        os.sched_setaffinity(0, set(cpu_ids))
+        return True
+    except (OSError, ValueError, TypeError) as err:
+        _LOGGER.debug("Could not set CPU affinity to %s: %s", cpu_ids, err)
+        return False
