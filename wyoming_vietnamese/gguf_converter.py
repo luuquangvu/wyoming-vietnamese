@@ -245,19 +245,21 @@ def convert_zerotts_q8_to_q4_hybrid(
     src_path: Path,
     dst_path: Path,
     *,
-    attention_type: int | None = None,
+    attention_type: int | None = GGML_TYPE_Q5_0,
 ) -> Path:
     """Convert a source ZeroTTS Q8_0 GGUF model into a Q4-Hybrid GGUF model.
 
-    Preserves Attention, Audio Embeddings, and Codebook Output Heads in native/Q8_0 precision.
-    Quantizes only Transformer FFN / MLP layers to Q4_0 for optimal CPU cache utilization.
-    Optionally quantizes Attention layers when attention_type is specified (e.g. Q5_0 or Q4_1).
+    Preserves Audio Embeddings and Codebook Output Heads in native/Q8_0 precision.
+    Quantizes Transformer FFN / MLP layers to Q4_0 and Attention projections to Q5_0
+    (or Q4_1, or preserves Q8_0 when attention_type is None) for optimal CPU cache
+    utilization and memory bandwidth reduction on edge processors.
     Validates GGUF magic, versions, structure bounds, key-values, and tensor offsets.
 
     Args:
         src_path: Path to input Q8_0 GGUF model.
         dst_path: Path to target Q4-Hybrid GGUF model.
-        attention_type: Optional quantization format for Attention layers (e.g. GGML_TYPE_Q5_0).
+        attention_type: Quantization format for Attention layers (default: GGML_TYPE_Q5_0;
+            pass None to preserve native/Q8_0 precision).
 
     Returns:
         Path to the generated GGUF file.

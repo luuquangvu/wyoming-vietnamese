@@ -166,6 +166,7 @@ def _initialize_configured_tts(
                 zerotts_voices,
                 cpu_threads,
                 resolution=zerotts_resolution,
+                pipelined=server_config.zerotts_pipelined,
             )
         if server_config.zerotts_gguf_model is not None:
             _, zerotts_gguf = resolve_zerotts_model(
@@ -177,11 +178,13 @@ def _initialize_configured_tts(
                 zerotts_voices,
                 cpu_threads,
                 gguf_path=zerotts_gguf,
+                pipelined=server_config.zerotts_pipelined,
             )
         return initialize_zerotts(
             tts_path,
             zerotts_voices,
             cpu_threads,
+            pipelined=server_config.zerotts_pipelined,
         )
     nghitts_voices = tuple(v for v in selected_voices if isinstance(v, NghiTtsVoiceSpec))
     configured_nghitts = (

@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 
 from wyoming_vietnamese.const import (
+    ZEROTTS_PIPELINED,
     ZEROTTS_SOURCE_COMMIT,
     TtsEngine,
     ZeroTtsAudio,
@@ -47,6 +48,12 @@ from wyoming_vietnamese.zerotts_engine import (
     resolve_zerotts_ggml_lib,
     resolve_zerotts_thread_budget,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_zerotts_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear ambient ZeroTTS environment variables before test execution."""
+    monkeypatch.delenv(ZEROTTS_PIPELINED, raising=False)
 
 
 @pytest.mark.parametrize("native", [False, True])
@@ -712,6 +719,8 @@ def test_zerotts_engine_mismatched_voice_embedding_size_raises(tmp_path: Path) -
 def _setup_engine_fixture(
     tmp_path: Path,
     num_threads: int = 2,
+    *,
+    pipelined: bool | None = None,
 ) -> tuple[ZeroTtsGgmlEngine, MagicMock, MagicMock, Mock]:
     """Helper creating a test ZeroTtsGgmlEngine with mocked dependencies."""
     model_dir, gguf_path = _setup_mock_zerotts_assets(tmp_path)
@@ -751,6 +760,7 @@ def _setup_engine_fixture(
             gguf_path=gguf_path,
             voices=voices,
             num_threads=num_threads,
+            pipelined=pipelined,
         )
 
     return engine, fake_cdll, fake_stream_decoder, fake_tokenizer
@@ -3447,6 +3457,38 @@ def test_zerotts_engine_dynamic_thread_allocation(tmp_path: Path) -> None:
     # Negative thread count raises ValueError
     with pytest.raises(ValueError, match="configured threads must not be negative"):
         _setup_engine_fixture(tmp_path, num_threads=-1)
+
+
+def test_zerotts_engine_pipelining_env_and_explicit_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test ZeroTtsGgmlEngine respects explicit pipelined argument and ZEROTTS_PIPELINED env var."""
+
+    def _create_engine(*, pipelined: bool | None = None) -> ZeroTtsGgmlEngine:
+        engine, _, _, _ = _setup_engine_fixture(tmp_path, num_threads=4, pipelined=pipelined)
+        return engine
+
+    # Default is pipelined
+    engine_default = _create_engine()
+    assert engine_default.pipelined is True
+    assert engine_default.threads == 3
+    assert engine_default.codec_threads == 1
+
+    # Override via env var ZEROTTS_PIPELINED=0
+    monkeypatch.setenv("ZEROTTS_PIPELINED", "0")
+    engine_env_off = _create_engine()
+    assert engine_env_off.pipelined is False
+    assert engine_env_off.threads == 4  # All 4 threads dedicated to GGML
+    assert engine_env_off.codec_threads == 2
+
+    # Explicit pipelined=True overrides env var
+    engine_explicit_on = _create_engine(pipelined=True)
+    assert engine_explicit_on.pipelined is True
+
+    # Invalid ZEROTTS_PIPELINED raises ValueError
+    monkeypatch.setenv("ZEROTTS_PIPELINED", "invalid")
+    with pytest.raises(ValueError, match="ZEROTTS_PIPELINED must be one of"):
+        _create_engine()
 
 
 def test_zerotts_engine_inplace_tensor_reuse_and_zero_copy_buffers(tmp_path: Path) -> None:

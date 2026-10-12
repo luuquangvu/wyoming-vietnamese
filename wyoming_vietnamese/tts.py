@@ -2034,6 +2034,7 @@ def initialize_zerotts(
     *,
     cpu_variant: str | ZeroTtsVariant | None = None,
     resolution: ZeroTtsModelResolution | None = None,
+    pipelined: bool | None = None,
 ) -> ZeroTtsGgmlEngine:
     """Initialize ZeroTTS using default GGUF and runtime paths unless overridden.
 
@@ -2045,6 +2046,7 @@ def initialize_zerotts(
         gguf_path: Optional explicit path to the target GGUF model file.
         cpu_variant: Optional explicit CPU variant for model selection.
         resolution: Optional pre-resolved ZeroTTS model resolution carrying spec and path.
+        pipelined: Optional override for pipelined streaming execution.
 
     Returns:
         Configured ZeroTtsGgmlEngine instance.
@@ -2082,13 +2084,23 @@ def initialize_zerotts(
         actual_gguf_path,
     )
     initialization_started = perf_counter()
-    engine = ZeroTtsGgmlEngine(
-        model_dir=model_dir,
-        gguf_path=actual_gguf_path,
-        voices=voices,
-        num_threads=threads,
-        custom_lib_path=custom_lib_path,
-    )
+    if pipelined is not None:
+        engine = ZeroTtsGgmlEngine(
+            model_dir=model_dir,
+            gguf_path=actual_gguf_path,
+            voices=voices,
+            num_threads=threads,
+            custom_lib_path=custom_lib_path,
+            pipelined=pipelined,
+        )
+    else:
+        engine = ZeroTtsGgmlEngine(
+            model_dir=model_dir,
+            gguf_path=actual_gguf_path,
+            voices=voices,
+            num_threads=threads,
+            custom_lib_path=custom_lib_path,
+        )
     _LOGGER.info(
         "Initialized ZeroTTS GGML: sample_rate=%d duration_ms=%.3f",
         engine.sample_rate,

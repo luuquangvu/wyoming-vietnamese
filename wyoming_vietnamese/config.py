@@ -20,6 +20,7 @@ from .const import (
     DEFAULT_STT_ENGINE,
     DEFAULT_TTS_ENGINE,
     ZEROTTS_GGUF_MODEL,
+    ZEROTTS_PIPELINED,
     ConnectionLimit,
     SttEngine,
     Timeout,
@@ -216,6 +217,7 @@ class ServerConfig:
     tts_cache_enabled: bool = True
     stt_engine: str = DEFAULT_STT_ENGINE
     zerotts_gguf_model: str | None = None
+    zerotts_pipelined: bool = True
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> ServerConfig:
@@ -317,4 +319,5 @@ class ServerConfig:
             ),
             tts_cache_enabled=get_env_bool("TTS_CACHE_ENABLED", True, env),
             zerotts_gguf_model=_get_zerotts_gguf_model(env),
+            zerotts_pipelined=get_env_bool(ZEROTTS_PIPELINED, True, env),
         )

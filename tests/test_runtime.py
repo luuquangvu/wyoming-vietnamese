@@ -861,6 +861,7 @@ async def test_run_server_starts_zerotts_engine(
         tmp_path / TTS_DIR,
         (DEFAULT_ZEROTTS_VOICE,),
         resolve_cpu_threads(0),
+        pipelined=True,
     )
     init_nghitts.assert_not_called()
     warm_up.assert_called_once_with(tts, (DEFAULT_ZEROTTS_VOICE,), TtsEngine.ZEROTTS)
@@ -937,6 +938,26 @@ async def test_run_server_forwards_custom_zerotts_model_selection(
         (DEFAULT_ZEROTTS_VOICE,),
         resolve_cpu_threads(0),
         gguf_path=custom_gguf,
+        pipelined=True,
+    )
+
+
+async def test_run_server_forwards_zerotts_pipelined_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test run server forwards zerotts_pipelined=False to initialize_zerotts when disabled."""
+    download_ret = {STT_DIR: tmp_path / STT_DIR, TTS_DIR: tmp_path / TTS_DIR}
+    _server, _tts, init_zerotts, _download, _config = await _run_configured_zerotts_server(
+        tmp_path,
+        monkeypatch,
+        download_ret,
+        env_overrides={"ZEROTTS_PIPELINED": "false"},
+    )
+    init_zerotts.assert_called_once_with(
+        tmp_path / TTS_DIR,
+        (DEFAULT_ZEROTTS_VOICE,),
+        resolve_cpu_threads(0),
+        pipelined=False,
     )
 
 
@@ -961,6 +982,7 @@ async def test_run_server_incorporates_zerotts_resolution_in_cache_namespace(
         monkeypatch,
         download_result,
     )
+    assert _init_zerotts.call_args.kwargs["pipelined"] is config.zerotts_pipelined
 
     handler_factory = server.factory
     factory_args = getattr(handler_factory, "args", None)
