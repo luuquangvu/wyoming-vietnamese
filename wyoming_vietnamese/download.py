@@ -839,8 +839,21 @@ def _structure_zerotts_hybrid_artifact(
     artifact: ZeroTtsArtifact,
 ) -> Path:
     """Ensure ZeroTTS Q4-hybrid GGUF model is structured, generating from Q8 if needed."""
-    if _is_verified_file(dst, artifact.sha256):
+    if not dst.is_symlink() and _is_verified_file(dst, artifact.sha256):
         return dst
+
+    if dst.is_symlink():
+        _LOGGER.info("Clearing stale ZeroTTS hybrid model symlink at %s", dst)
+        dst.unlink(missing_ok=True)
+    elif dst.is_dir():
+        _LOGGER.info("Clearing stale ZeroTTS hybrid model directory at %s", dst)
+        shutil.rmtree(dst)
+    elif dst.is_file():
+        _LOGGER.info("Clearing stale or mismatched ZeroTTS hybrid model cache at %s", dst)
+        dst.unlink(missing_ok=True)
+    elif dst.exists():
+        _LOGGER.info("Clearing stale ZeroTTS hybrid model non-regular path at %s", dst)
+        dst.unlink(missing_ok=True)
 
     hybrid_source = snapshot_path / artifact.local_name
     if not hybrid_source.is_file():
@@ -856,11 +869,19 @@ def _structure_zerotts_hybrid_artifact(
         raise RuntimeError("Base ZeroTTS Q8 GGUF artifact is missing")
     q8_source = _verified_zerotts_source(snapshot_path, q8_artifact)
     dst.parent.mkdir(parents=True, exist_ok=True)
-    convert_zerotts_q8_to_q4_hybrid(q8_source, dst)
-    if not _is_verified_file(dst, artifact.sha256):
-        raise RuntimeError(
-            f"Generated ZeroTTS hybrid model {dst!s} does not match its recorded SHA-256 digest"
-        )
+    _LOGGER.info("Rebuilding ZeroTTS hybrid model %s from base Q8 artifact", dst)
+    try:
+        convert_zerotts_q8_to_q4_hybrid(q8_source, dst)
+        if not _is_verified_file(dst, artifact.sha256):
+            raise RuntimeError(
+                f"Generated ZeroTTS hybrid model {dst!s} does not match its recorded SHA-256 digest"
+            )
+    except Exception:
+        if dst.is_dir() and not dst.is_symlink():
+            shutil.rmtree(dst)
+        else:
+            dst.unlink(missing_ok=True)
+        raise
     return dst
 
 

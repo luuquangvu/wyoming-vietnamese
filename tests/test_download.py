@@ -1020,6 +1020,248 @@ def test_download_models_structures_zerotts_q4_converts_from_q8_when_hybrid_abse
     assert dst_hybrid.read_bytes() == converted_content
 
 
+def test_download_models_clears_stale_zerotts_hybrid_cache_and_rebuilds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test download clears stale or mismatched hybrid model cache and rebuilds from Q8."""
+    stt, tts_snapshot, tts_spec, test_voice = _setup_zerotts_download_test(tmp_path, monkeypatch)
+    converted_content = b"FRESH_REBUILT_Q4_HYBRID_BYTES"
+    q4_spec = _make_hybrid_model_spec(tts_spec, sha256(converted_content).hexdigest())
+
+    monkeypatch.setattr(
+        "wyoming_vietnamese.download.resolve_zerotts_model_spec",
+        lambda quant, **kw: q4_spec,
+    )
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec)
+
+    def fake_convert(src: Path, dst: Path) -> Path:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(converted_content)
+        return dst
+
+    monkeypatch.setattr("wyoming_vietnamese.download.convert_zerotts_q8_to_q4_hybrid", fake_convert)
+
+    stale_dst = (
+        tmp_path
+        / "models"
+        / TTS_DIR
+        / TtsEngine.ZEROTTS
+        / ZeroTtsDirectory.GGUF
+        / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+    )
+    stale_dst.parent.mkdir(parents=True, exist_ok=True)
+    stale_dst.write_bytes(b"STALE_CORRUPTED_CACHE_BYTES")
+
+    paths, _sync = _execute_zerotts_download(
+        tmp_path, monkeypatch, stt, tts_snapshot, test_voice, zerotts_quant="q4_hybrid"
+    )
+
+    dst_hybrid = paths[TTS_DIR] / ZeroTtsDirectory.GGUF / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+    assert dst_hybrid.is_file()
+    assert dst_hybrid.read_bytes() == converted_content
+
+
+def test_download_models_clears_stale_zerotts_hybrid_directory_cache_and_rebuilds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test download removes stale directory located at hybrid path and rebuilds as file."""
+    stt, tts_snapshot, tts_spec, test_voice = _setup_zerotts_download_test(tmp_path, monkeypatch)
+    converted_content = b"FRESH_REBUILT_FROM_DIR_CACHE"
+    q4_spec = _make_hybrid_model_spec(tts_spec, sha256(converted_content).hexdigest())
+
+    monkeypatch.setattr(
+        "wyoming_vietnamese.download.resolve_zerotts_model_spec",
+        lambda quant, **kw: q4_spec,
+    )
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec)
+
+    def fake_convert(src: Path, dst: Path) -> Path:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(converted_content)
+        return dst
+
+    monkeypatch.setattr("wyoming_vietnamese.download.convert_zerotts_q8_to_q4_hybrid", fake_convert)
+
+    stale_dir = (
+        tmp_path
+        / "models"
+        / TTS_DIR
+        / TtsEngine.ZEROTTS
+        / ZeroTtsDirectory.GGUF
+        / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+    )
+    stale_dir.mkdir(parents=True, exist_ok=True)
+    (stale_dir / "nested_dummy.txt").write_text("STALE_NESTED_CONTENT", encoding="utf-8")
+
+    paths, _sync = _execute_zerotts_download(
+        tmp_path, monkeypatch, stt, tts_snapshot, test_voice, zerotts_quant="q4_hybrid"
+    )
+
+    dst_hybrid = paths[TTS_DIR] / ZeroTtsDirectory.GGUF / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+    assert dst_hybrid.is_file()
+    assert not dst_hybrid.is_dir()
+    assert dst_hybrid.read_bytes() == converted_content
+
+
+@pytest.mark.parametrize("target_is_directory", [True, False])
+def test_download_models_clears_stale_zerotts_hybrid_symlink_cache_and_rebuilds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target_is_directory: bool
+) -> None:
+    """Test download unlinks symlinks (directory or verified file) and rebuilds as file."""
+    stt, tts_snapshot, tts_spec, test_voice = _setup_zerotts_download_test(tmp_path, monkeypatch)
+    converted_content = b"FRESH_REBUILT_FROM_SYMLINK"
+    q4_spec = _make_hybrid_model_spec(tts_spec, sha256(converted_content).hexdigest())
+
+    monkeypatch.setattr(
+        "wyoming_vietnamese.download.resolve_zerotts_model_spec",
+        lambda quant, **kw: q4_spec,
+    )
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec)
+
+    def fake_convert(src: Path, dst: Path) -> Path:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(converted_content)
+        return dst
+
+    monkeypatch.setattr("wyoming_vietnamese.download.convert_zerotts_q8_to_q4_hybrid", fake_convert)
+
+    external_target = tmp_path / (
+        "external_target_dir" if target_is_directory else "external_verified.gguf"
+    )
+    if target_is_directory:
+        external_target.mkdir(parents=True, exist_ok=True)
+        (external_target / "protected.txt").write_text("PROTECTED", encoding="utf-8")
+    else:
+        external_target.write_bytes(converted_content)
+
+    stale_symlink = (
+        tmp_path
+        / "models"
+        / TTS_DIR
+        / TtsEngine.ZEROTTS
+        / ZeroTtsDirectory.GGUF
+        / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+    )
+    stale_symlink.parent.mkdir(parents=True, exist_ok=True)
+    stale_symlink.symlink_to(external_target, target_is_directory=target_is_directory)
+
+    paths, _sync = _execute_zerotts_download(
+        tmp_path, monkeypatch, stt, tts_snapshot, test_voice, zerotts_quant="q4_hybrid"
+    )
+
+    dst_hybrid = paths[TTS_DIR] / ZeroTtsDirectory.GGUF / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+    assert dst_hybrid.is_file()
+    assert not dst_hybrid.is_symlink()
+    assert dst_hybrid.read_bytes() == converted_content
+    # Ensure external target was unlinked, not deleted or corrupted
+    if target_is_directory:
+        assert external_target.is_dir()
+        assert (external_target / "protected.txt").is_file()
+    else:
+        assert external_target.is_file()
+        assert external_target.read_bytes() == converted_content
+
+
+def test_download_models_clears_invalid_generated_hybrid_and_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test download removes invalid generated hybrid model file if digest check fails."""
+    stt, tts_snapshot, tts_spec, test_voice = _setup_zerotts_download_test(tmp_path, monkeypatch)
+    q4_spec = _make_hybrid_model_spec(
+        tts_spec, "0000000000000000000000000000000000000000000000000000000000000000"
+    )
+
+    monkeypatch.setattr(
+        "wyoming_vietnamese.download.resolve_zerotts_model_spec",
+        lambda quant, **kw: q4_spec,
+    )
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec)
+
+    def fake_convert(src: Path, dst: Path) -> Path:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(b"BAD_CONVERTED_BYTES")
+        return dst
+
+    monkeypatch.setattr("wyoming_vietnamese.download.convert_zerotts_q8_to_q4_hybrid", fake_convert)
+
+    with pytest.raises(RuntimeError, match="does not match its recorded SHA-256 digest"):
+        _execute_zerotts_download(
+            tmp_path, monkeypatch, stt, tts_snapshot, test_voice, zerotts_quant="q4_hybrid"
+        )
+
+    dst_hybrid = (
+        tmp_path
+        / "models"
+        / TTS_DIR
+        / TtsEngine.ZEROTTS
+        / ZeroTtsDirectory.GGUF
+        / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+    )
+    assert not dst_hybrid.exists()
+    assert not dst_hybrid.is_symlink()
+
+
+@pytest.mark.parametrize("artifact_kind", ["file", "directory", "dangling_symlink"])
+def test_download_models_clears_partial_hybrid_on_conversion_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, artifact_kind: str
+) -> None:
+    """Test download removes partial destination and propagates conversion error."""
+    stt, tts_snapshot, tts_spec, test_voice = _setup_zerotts_download_test(tmp_path, monkeypatch)
+    converted_content = b"FRESH_Q4_HYBRID"
+    q4_spec = _make_hybrid_model_spec(tts_spec, sha256(converted_content).hexdigest())
+
+    monkeypatch.setattr(
+        "wyoming_vietnamese.download.resolve_zerotts_model_spec",
+        lambda quant, **kw: q4_spec,
+    )
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec)
+
+    stale_dst = (
+        tmp_path
+        / "models"
+        / TTS_DIR
+        / TtsEngine.ZEROTTS
+        / ZeroTtsDirectory.GGUF
+        / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+    )
+    stale_dst.parent.mkdir(parents=True, exist_ok=True)
+    stale_dst.write_bytes(b"STALE_OLD_CONTENT")
+
+    def failing_convert(src: Path, dst: Path) -> Path:
+        assert not dst.exists()
+        assert not dst.is_symlink()
+        if artifact_kind == "directory":
+            dst.mkdir(parents=True, exist_ok=True)
+            (dst / "partial.bin").write_bytes(b"NESTED_PARTIAL_DATA")
+        elif artifact_kind == "dangling_symlink":
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.symlink_to(tmp_path / "nonexistent_target")
+        else:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(b"PARTIAL_MALFORMED_GGUF_DATA")
+        raise RuntimeError("GGUF conversion failed during quantization")
+
+    monkeypatch.setattr(
+        "wyoming_vietnamese.download.convert_zerotts_q8_to_q4_hybrid", failing_convert
+    )
+
+    with pytest.raises(RuntimeError, match="GGUF conversion failed during quantization"):
+        _execute_zerotts_download(
+            tmp_path, monkeypatch, stt, tts_snapshot, test_voice, zerotts_quant="q4_hybrid"
+        )
+
+    dst_hybrid = (
+        tmp_path
+        / "models"
+        / TTS_DIR
+        / TtsEngine.ZEROTTS
+        / ZeroTtsDirectory.GGUF
+        / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+    )
+    assert not dst_hybrid.exists()
+    assert not dst_hybrid.is_symlink()
+
+
 def test_download_models_structures_zerotts_auto_higher_capability_processor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1755,6 +1997,19 @@ def _assert_synthetic_hybrid_tensors(
     assert tensors["audio_head.weight"][0] == GGML_TYPE_Q8_0
 
 
+def _assert_tensor_payload(
+    fin: BinaryIO,
+    data_start: int,
+    offset: int,
+    expected: bytes,
+) -> None:
+    """Assert a tensor payload at data_start + offset matches expected bytes."""
+    fin.seek(data_start + offset)
+    payload = fin.read(len(expected))
+    assert len(payload) == len(expected)
+    assert payload == expected
+
+
 def _assert_hybrid_attention_and_head_payloads(
     dst: Path,
     tensors: dict[str, tuple[int, int]],
@@ -1766,15 +2021,8 @@ def _assert_hybrid_attention_and_head_payloads(
     head_offset = tensors["audio_head.weight"][1]
     expected_head = np.float16(2.0).tobytes() + (b"\x05" * 32)
     with dst.open("rb") as fin:
-        fin.seek(data_start + attn_offset)
-        attn_payload = fin.read(len(expected_attn))
-        assert len(attn_payload) == len(expected_attn)
-        assert attn_payload == expected_attn
-
-        fin.seek(data_start + head_offset)
-        head_payload = fin.read(len(expected_head))
-        assert len(head_payload) == len(expected_head)
-        assert head_payload == expected_head
+        _assert_tensor_payload(fin, data_start, attn_offset, expected_attn)
+        _assert_tensor_payload(fin, data_start, head_offset, expected_head)
 
 
 def test_convert_zerotts_q8_to_q4_hybrid_success(tmp_path: Path) -> None:
