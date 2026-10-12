@@ -86,6 +86,7 @@ class ZeroTtsFile(StrEnum):
 
 ZEROTTS_GGUF_MODEL = "ZEROTTS_GGUF_MODEL"
 DEFAULT_ZEROTTS_GGUF_MODEL = "auto"
+ZEROTTS_PIPELINED = "ZEROTTS_PIPELINED"
 
 
 class ZeroTtsDirectory(StrEnum):

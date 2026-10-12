@@ -1741,6 +1741,42 @@ def _inspect_gguf_tensors(
         return tensors, q4_payload, data_start
 
 
+def _assert_synthetic_hybrid_tensors(
+    tensors: dict[str, tuple[int, int]],
+    expected_attn_type: int = GGML_TYPE_Q5_0,
+) -> None:
+    """Assert common synthetic GGUF tensor types and count."""
+    assert len(tensors) == 6
+    assert tensors["model.layers.0.mlp.weight"][0] == GGML_TYPE_Q4_0
+    assert tensors["model.layers.0.self_attn.weight"][0] == expected_attn_type
+    assert tensors["model.layers.0.norm.weight"][0] == GGML_TYPE_F32
+    assert tensors["model.layers.0.bias"][0] == GGML_TYPE_F16
+    assert tensors["model.layers.0.existing_q4"][0] == GGML_TYPE_Q4_0
+    assert tensors["audio_head.weight"][0] == GGML_TYPE_Q8_0
+
+
+def _assert_hybrid_attention_and_head_payloads(
+    dst: Path,
+    tensors: dict[str, tuple[int, int]],
+    data_start: int,
+    expected_attn: bytes,
+) -> None:
+    """Assert attention tensor and audio head payloads match expected byte content."""
+    attn_offset = tensors["model.layers.0.self_attn.weight"][1]
+    head_offset = tensors["audio_head.weight"][1]
+    expected_head = np.float16(2.0).tobytes() + (b"\x05" * 32)
+    with dst.open("rb") as fin:
+        fin.seek(data_start + attn_offset)
+        attn_payload = fin.read(len(expected_attn))
+        assert len(attn_payload) == len(expected_attn)
+        assert attn_payload == expected_attn
+
+        fin.seek(data_start + head_offset)
+        head_payload = fin.read(len(expected_head))
+        assert len(head_payload) == len(expected_head)
+        assert head_payload == expected_head
+
+
 def test_convert_zerotts_q8_to_q4_hybrid_success(tmp_path: Path) -> None:
     """Test convert_zerotts_q8_to_q4_hybrid converts GGUF tensors correctly."""
     src = tmp_path / "model-q8_0.gguf"
@@ -1753,24 +1789,19 @@ def test_convert_zerotts_q8_to_q4_hybrid_success(tmp_path: Path) -> None:
 
     tensors, q4_payload, data_start = _inspect_gguf_tensors(dst)
     assert data_start % 32 == 0
-    assert len(tensors) == 6
-    assert tensors["model.layers.0.mlp.weight"][0] == GGML_TYPE_Q4_0
-    assert tensors["model.layers.0.self_attn.weight"][0] == GGML_TYPE_Q8_0
-    assert tensors["model.layers.0.norm.weight"][0] == GGML_TYPE_F32
-    assert tensors["model.layers.0.bias"][0] == GGML_TYPE_F16
-    assert tensors["model.layers.0.existing_q4"][0] == GGML_TYPE_Q4_0
-    assert tensors["audio_head.weight"][0] == GGML_TYPE_Q8_0
+    _assert_synthetic_hybrid_tensors(tensors, GGML_TYPE_Q5_0)
 
     assert len(q4_payload) == 18
     expected_q4 = quantize_row_q8_0_to_q4_0(np.float16(1.0).tobytes() + (b"\x01" * 32), 32)
     assert q4_payload == expected_q4
 
-    with dst.open("rb") as fin:
-        head_offset = tensors["audio_head.weight"][1]
-        fin.seek(data_start + head_offset)
-        head_payload = fin.read(34)
-    expected_head = np.float16(2.0).tobytes() + (b"\x05" * 32)
-    assert head_payload == expected_head
+    expected_q5 = quantize_row_q8_0_to_q5_0(np.float16(1.0).tobytes() + (b"\x02" * 32), 32)
+    _assert_hybrid_attention_and_head_payloads(dst, tensors, data_start, expected_q5)
+
+    dst_q8_attn = tmp_path / "model-q4-hybrid-q8-attn.gguf"
+    convert_zerotts_q8_to_q4_hybrid(src, dst_q8_attn, attention_type=None)
+    tensors_q8, _, _ = _inspect_gguf_tensors(dst_q8_attn)
+    assert tensors_q8["model.layers.0.self_attn.weight"][0] == GGML_TYPE_Q8_0
 
 
 def test_convert_zerotts_second_order_hybrid_success(tmp_path: Path) -> None:
@@ -1785,28 +1816,10 @@ def test_convert_zerotts_second_order_hybrid_success(tmp_path: Path) -> None:
 
     tensors, _, data_start = _inspect_gguf_tensors(dst)
     assert data_start % 32 == 0
-    assert len(tensors) == 6
-    assert tensors["model.layers.0.mlp.weight"][0] == GGML_TYPE_Q4_0
-    assert tensors["model.layers.0.self_attn.weight"][0] == GGML_TYPE_Q5_0
-    assert tensors["model.layers.0.norm.weight"][0] == GGML_TYPE_F32
-    assert tensors["model.layers.0.bias"][0] == GGML_TYPE_F16
-    assert tensors["model.layers.0.existing_q4"][0] == GGML_TYPE_Q4_0
-    assert tensors["audio_head.weight"][0] == GGML_TYPE_Q8_0
+    _assert_synthetic_hybrid_tensors(tensors, GGML_TYPE_Q5_0)
 
-    with dst.open("rb") as fin:
-        attn_offset = tensors["model.layers.0.self_attn.weight"][1]
-        fin.seek(data_start + attn_offset)
-        q5_payload = fin.read(22)
-    assert len(q5_payload) == 22
     expected_q5 = quantize_row_q8_0_to_q5_0(np.float16(1.0).tobytes() + (b"\x02" * 32), 32)
-    assert q5_payload == expected_q5
-
-    with dst.open("rb") as fin:
-        head_offset = tensors["audio_head.weight"][1]
-        fin.seek(data_start + head_offset)
-        head_payload = fin.read(34)
-    expected_head = np.float16(2.0).tobytes() + (b"\x05" * 32)
-    assert head_payload == expected_head
+    _assert_hybrid_attention_and_head_payloads(dst, tensors, data_start, expected_q5)
 
 
 def test_convert_zerotts_second_order_hybrid_q4_1(tmp_path: Path) -> None:
@@ -1823,20 +1836,8 @@ def test_convert_zerotts_second_order_hybrid_q4_1(tmp_path: Path) -> None:
     assert tensors["model.layers.0.self_attn.weight"][0] == GGML_TYPE_Q4_1
     assert tensors["audio_head.weight"][0] == GGML_TYPE_Q8_0
 
-    with dst.open("rb") as fin:
-        attn_offset = tensors["model.layers.0.self_attn.weight"][1]
-        fin.seek(data_start + attn_offset)
-        q4_1_payload = fin.read(20)
-    assert len(q4_1_payload) == 20
     expected_q4_1 = quantize_row_q8_0_to_q4_1(np.float16(1.0).tobytes() + (b"\x02" * 32), 32)
-    assert q4_1_payload == expected_q4_1
-
-    with dst.open("rb") as fin:
-        head_offset = tensors["audio_head.weight"][1]
-        fin.seek(data_start + head_offset)
-        head_payload = fin.read(34)
-    expected_head = np.float16(2.0).tobytes() + (b"\x05" * 32)
-    assert head_payload == expected_head
+    _assert_hybrid_attention_and_head_payloads(dst, tensors, data_start, expected_q4_1)
 
 
 def test_convert_zerotts_q8_to_q4_hybrid_invalid_attention_type(tmp_path: Path) -> None:
@@ -2192,7 +2193,7 @@ def test_create_q4_hybrid_cli_tool(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert dst.is_file()
 
     tensors_default, _, _ = _inspect_gguf_tensors(dst)
-    assert tensors_default["model.layers.0.self_attn.weight"][0] == GGML_TYPE_Q8_0
+    assert tensors_default["model.layers.0.self_attn.weight"][0] == GGML_TYPE_Q5_0
     assert tensors_default["model.layers.0.mlp.weight"][0] == GGML_TYPE_Q4_0
     assert tensors_default["audio_head.weight"][0] == GGML_TYPE_Q8_0
 

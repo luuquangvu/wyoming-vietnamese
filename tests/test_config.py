@@ -84,6 +84,7 @@ def test_server_config_defaults() -> None:
     assert config.tts_sentence_silence_ms == TtsSilenceMs.SENTENCE
     assert config.tts_clause_silence_ms == TtsSilenceMs.CLAUSE
     assert config.tts_paragraph_silence_ms == TtsSilenceMs.PARAGRAPH
+    assert config.zerotts_pipelined is True
 
 
 def test_server_config_custom_values() -> None:
@@ -309,3 +310,21 @@ def test_server_config_zerotts_gguf_model_absolute_path() -> None:
     """Test server config accepts valid absolute path for custom model."""
     config = ServerConfig.from_env({ZEROTTS_GGUF_MODEL: "/models/custom.gguf"})
     assert config.zerotts_gguf_model == "/models/custom.gguf"
+
+
+def test_server_config_zerotts_pipelined_default() -> None:
+    """Test server config enables ZeroTTS pipelining by default."""
+    config = ServerConfig.from_env({})
+    assert config.zerotts_pipelined is True
+
+
+def test_server_config_zerotts_pipelined_explicit() -> None:
+    """Test server config parses explicit ZEROTTS_PIPELINED values."""
+    config_off = ServerConfig.from_env({"ZEROTTS_PIPELINED": "false"})
+    assert config_off.zerotts_pipelined is False
+
+    config_on = ServerConfig.from_env({"ZEROTTS_PIPELINED": "1"})
+    assert config_on.zerotts_pipelined is True
+
+    with pytest.raises(ValueError, match="ZEROTTS_PIPELINED must be one of"):
+        ServerConfig.from_env({"ZEROTTS_PIPELINED": "invalid"})

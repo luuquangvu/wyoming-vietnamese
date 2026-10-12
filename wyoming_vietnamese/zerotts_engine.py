@@ -25,7 +25,9 @@ import numpy as np
 if TYPE_CHECKING:
     from zerotts.codec import MossStreamingDecoder
 
+from .config import get_env_bool
 from .const import (
+    ZEROTTS_PIPELINED,
     ZEROTTS_REPO_URL,
     ZEROTTS_SOURCE_COMMIT,
     ZeroTtsAudio,
@@ -727,7 +729,7 @@ class ZeroTtsGgmlEngine:
         custom_lib_path: Path | None = None,
         seed: int = 1234,
         codec_threads: int | None = None,
-        pipelined: bool = True,
+        pipelined: bool | None = None,
     ) -> None:
         """Initialize the ZeroTTS GGML engine from local weights and configurations.
 
@@ -759,7 +761,11 @@ class ZeroTtsGgmlEngine:
         self.total_threads: int = (
             resolve_cpu_threads(num_threads) if num_threads == 0 else num_threads
         )
-        self.pipelined: bool = pipelined and self.total_threads > 1
+        effective_pipelined = (
+            get_env_bool(ZEROTTS_PIPELINED, True) if pipelined is None else pipelined
+        )
+
+        self.pipelined: bool = effective_pipelined and self.total_threads > 1
 
         resolved_ggml_threads, resolved_codec_threads = resolve_zerotts_thread_budget(
             self.total_threads,
