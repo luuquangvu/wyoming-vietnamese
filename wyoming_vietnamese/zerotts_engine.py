@@ -32,7 +32,7 @@ from .const import (
     ZeroTtsFile,
     ZeroTtsVariant,
 )
-from .cpu import detect_cpu_variant
+from .cpu import detect_cpu_variant, resolve_cpu_threads
 from .tts_model import ZEROTTS_VOICES_BY_ID, ZeroTtsVoiceSpec
 
 _LOGGER = logging.getLogger(__name__)
@@ -653,6 +653,68 @@ def _configure_zerotts_lib_signatures(lib: ctypes.CDLL) -> ctypes.CDLL:
     return lib
 
 
+def resolve_zerotts_thread_budget(
+    total_threads: int,
+    *,
+    pipelined: bool = True,
+    codec_threads: int | None = None,
+) -> tuple[int, int]:
+    """Dynamically allocate CPU threads between GGML frame generation and ONNX codec.
+
+    When pipelined streaming overlaps GGML autoregression with ONNX codec decoding,
+    allocating full threads to both causes severe thread oversubscription, context switching,
+    and CPU cache thrashing on multi-core systems (e.g. 4 GGML + 2 Codec = 6 threads on 4 cores).
+
+    Note on single-core systems: When pipelined is True and total_threads <= 1,
+    strict budget compliance is impossible because both runtimes require at least 1 thread.
+    In this case, (1, 1) is returned as an explicit minimum-runnable fallback; engines
+    should disable pipelining on single-thread systems to avoid concurrent thread contention.
+
+    Args:
+        total_threads: Total CPU threads budget available for the engine (at least 1).
+        pipelined: Whether frame generation and codec decoding run concurrently.
+        codec_threads: Optional explicit override for MOSS ONNX decoder threads.
+
+    Returns:
+        Tuple of (ggml_threads, codec_threads), both >= 1.
+    """
+    total = max(1, total_threads)
+    if not pipelined:
+        c_threads = (
+            max(1, codec_threads)
+            if codec_threads is not None
+            else (1 if total <= 2 else (2 if total <= 4 else min(total // 2, 4)))
+        )
+        return total, c_threads
+
+    if codec_threads is not None:
+        c_requested = max(1, codec_threads)
+        if total <= 1:
+            return 1, 1
+        c_threads = min(c_requested, total - 1)
+        g_threads = total - c_threads
+        return g_threads, c_threads
+
+    if total <= 2:
+        return 1, 1
+
+    if total <= 4:
+        # On 3 or 4 cores (e.g. Intel N5105 / Raspberry Pi 4): dedicate 1 core to
+        # the ONNX neural codec and remaining 2 or 3 cores to the compute-heavy GGML transformer.
+        c_threads = 1
+    elif total <= 8:
+        # On 5 to 8 cores: dedicate 2 cores to codec, remaining 3-6 cores to GGML.
+        c_threads = 2
+    elif total <= 12:
+        # On 9 to 12 cores: dedicate 3 cores to codec, remaining 6-9 cores to GGML.
+        c_threads = 3
+    else:
+        # On 13+ cores: cap codec at 4 threads (diminishing returns beyond 4 for MOSS decoder).
+        c_threads = 4
+
+    return total - c_threads, c_threads
+
+
 class ZeroTtsGgmlEngine:
     """ZeroTTS speech synthesis engine using native GGML runtime and MOSS neural codec."""
 
@@ -689,10 +751,24 @@ class ZeroTtsGgmlEngine:
         if not gguf_path.is_file():
             raise FileNotFoundError(f"Missing ZeroTTS GGUF model weights: {gguf_path}")
 
+        if num_threads < 0:
+            raise ValueError(f"configured threads must not be negative: {num_threads}")
+
         self.sample_rate: int = ZeroTtsAudio.SAMPLE_RATE
         self.chunks_are_sentences: bool = False
-        self.threads: int = num_threads
-        self.pipelined: bool = pipelined
+        self.total_threads: int = (
+            resolve_cpu_threads(num_threads) if num_threads == 0 else num_threads
+        )
+        self.pipelined: bool = pipelined and self.total_threads > 1
+
+        resolved_ggml_threads, resolved_codec_threads = resolve_zerotts_thread_budget(
+            self.total_threads,
+            pipelined=self.pipelined,
+            codec_threads=codec_threads,
+        )
+        self.threads: int = resolved_ggml_threads
+        self.codec_threads: int = resolved_codec_threads
+
         self.model_dir: Path = model_dir
         self.gguf_path: Path = gguf_path
         self._ctx: ctypes.c_void_p | None = None
@@ -728,18 +804,17 @@ class ZeroTtsGgmlEngine:
             self._normalize_fn = normalize_vi_text
 
             codec_dir = model_dir / "onnx" / "codec"
-            resolved_codec_threads = (
-                codec_threads
-                if codec_threads is not None
-                else (
-                    1
-                    if self.threads <= 2
-                    else (2 if self.threads <= 4 else min(self.threads // 2, 4))
-                )
-            )
             self._codec = MossCodecDecoder(
                 codec_dir,
-                intra_op_num_threads=resolved_codec_threads,
+                intra_op_num_threads=self.codec_threads,
+            )
+            _LOGGER.info(
+                "ZeroTTS thread allocation: ggml_threads=%d codec_threads=%d "
+                "pipelined=%s (budget=%d)",
+                self.threads,
+                self.codec_threads,
+                self.pipelined,
+                self.total_threads,
             )
 
             null_voice_path = model_dir / ZeroTtsFile.NULL_VOICE_EMB
@@ -767,6 +842,8 @@ class ZeroTtsGgmlEngine:
 
             self._seed: int = seed
             self._rng = np.random.default_rng(self._seed)
+            self._au_buf: np.ndarray = np.empty(self.num_codebooks, dtype=np.float32)
+            self._au_buf_ptr = self._au_buf.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
         except Exception:
             self.close()
             raise
@@ -832,18 +909,19 @@ class ZeroTtsGgmlEngine:
 
     @staticmethod
     def _decode_audio_chunk(
-        stream: MossStreamingDecoder, buf: list[np.ndarray]
+        stream: MossStreamingDecoder, buf: list[np.ndarray] | np.ndarray
     ) -> np.ndarray | None:
         """Decode a sequence of acoustic code frames into an audio waveform array.
 
         Args:
             stream: Active MOSS streaming codec decoder instance.
-            buf: List of code frames to decode.
+            buf: List of code frames or contiguous array of shape (1, K, T) to decode.
 
         Returns:
             Decoded 1D float32 audio array if audio was generated, or None.
         """
-        chunk_audio = stream.decode_chunk(np.stack(buf, axis=-1))
+        chunk_codes = buf if isinstance(buf, np.ndarray) else np.stack(buf, axis=-1)
+        chunk_audio = stream.decode_chunk(chunk_codes)
         audio_out = np.asarray(chunk_audio, dtype=np.float32).ravel()
         return audio_out if audio_out.size else None
 
@@ -866,15 +944,14 @@ class ZeroTtsGgmlEngine:
             RuntimeError: If zerotts_frame returns non-zero.
         """
         cu = float(self._rng.random())
-        au = self._rng.random(self.num_codebooks, dtype=np.float32)
-        au_ptr = au.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        self._rng.random(out=self._au_buf, dtype=np.float32)
 
         rc = self._lib.zerotts_frame(
             self._ctx,
             forbid_eoa,
             ctypes.byref(self._sp),
             cu,
-            au_ptr,
+            self._au_buf_ptr,
             codes_buf,
             ctypes.byref(is_eoa),
         )
@@ -915,7 +992,7 @@ class ZeroTtsGgmlEngine:
                 tail_left = eoa_extra
                 eoa_started = True
 
-            yield np.array(codes_buf, dtype=np.int64)
+            yield np.frombuffer(codes_buf, dtype=np.int32).copy()
 
             if stop_event is not None and stop_event.is_set():
                 break
@@ -999,30 +1076,32 @@ class ZeroTtsGgmlEngine:
         stream = self._codec.streaming_decoder()
         try:
             if not self.pipelined:
-                buf: list[np.ndarray] = []
+                chunk_buf = np.empty((1, self.num_codebooks, cap_chunk_target), dtype=np.int32)
                 target_chunk = first_chunk_target
+                count = 0
                 for frame in self._generate_code_frames():
-                    buf.append(frame)
-                    if len(buf) >= target_chunk:
-                        audio_out = self._decode_audio_chunk(stream, buf)
+                    chunk_buf[0, :, count] = frame
+                    count += 1
+                    if count >= target_chunk:
+                        audio_out = self._decode_audio_chunk(stream, chunk_buf[:, :, :count])
                         if audio_out is not None:
                             yield audio_out
-                        buf.clear()
+                        count = 0
                         target_chunk = min(cap_chunk_target, target_chunk * 2)
 
-                if buf:
-                    audio_out = self._decode_audio_chunk(stream, buf)
+                if count > 0:
+                    audio_out = self._decode_audio_chunk(stream, chunk_buf[:, :, :count])
                     if audio_out is not None:
                         yield audio_out
                 return
 
-            chunk_queue: queue.Queue[list[np.ndarray] | BaseException | None] = queue.Queue(
-                maxsize=4
+            chunk_queue: queue.Queue[np.ndarray | list[np.ndarray] | BaseException | None] = (
+                queue.Queue(maxsize=4)
             )
             stop_event = threading.Event()
             producer_error: list[BaseException] = []
 
-            def _enqueue(item: list[np.ndarray] | BaseException | None) -> bool:
+            def _enqueue(item: np.ndarray | list[np.ndarray] | BaseException | None) -> bool:
                 while not stop_event.is_set():
                     try:
                         chunk_queue.put(item, timeout=0.1)
@@ -1033,20 +1112,25 @@ class ZeroTtsGgmlEngine:
 
             def producer() -> None:
                 try:
-                    buf: list[np.ndarray] = []
+                    chunk_buf = np.empty((1, self.num_codebooks, cap_chunk_target), dtype=np.int32)
                     target_chunk = first_chunk_target
+                    count = 0
                     for frame in self._generate_code_frames(stop_event=stop_event):
                         if stop_event.is_set():
                             return
-                        buf.append(frame)
-                        if len(buf) >= target_chunk:
-                            if not _enqueue(list(buf)):
+                        chunk_buf[0, :, count] = frame
+                        count += 1
+                        if count >= target_chunk:
+                            chunk_slice = chunk_buf[:, :, :count].copy(order="C")
+                            if not _enqueue(chunk_slice):
                                 return
-                            buf.clear()
+                            count = 0
                             target_chunk = min(cap_chunk_target, target_chunk * 2)
 
-                    if buf and not _enqueue(list(buf)):
-                        return
+                    if count > 0:
+                        chunk_slice = chunk_buf[:, :, :count].copy(order="C")
+                        if not _enqueue(chunk_slice):
+                            return
                     if not stop_event.is_set():
                         _enqueue(None)
                 except BaseException as exc:

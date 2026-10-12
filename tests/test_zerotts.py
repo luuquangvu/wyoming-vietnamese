@@ -45,6 +45,7 @@ from wyoming_vietnamese.zerotts_engine import (
     _ZeroTtsHParams,
     get_zerotts_candidate_lib_paths,
     resolve_zerotts_ggml_lib,
+    resolve_zerotts_thread_budget,
 )
 
 
@@ -710,6 +711,7 @@ def test_zerotts_engine_mismatched_voice_embedding_size_raises(tmp_path: Path) -
 
 def _setup_engine_fixture(
     tmp_path: Path,
+    num_threads: int = 2,
 ) -> tuple[ZeroTtsGgmlEngine, MagicMock, MagicMock, Mock]:
     """Helper creating a test ZeroTtsGgmlEngine with mocked dependencies."""
     model_dir, gguf_path = _setup_mock_zerotts_assets(tmp_path)
@@ -748,7 +750,7 @@ def _setup_engine_fixture(
             model_dir=model_dir,
             gguf_path=gguf_path,
             voices=voices,
-            num_threads=2,
+            num_threads=num_threads,
         )
 
     return engine, fake_cdll, fake_stream_decoder, fake_tokenizer
@@ -834,6 +836,45 @@ def test_zerotts_engine_generation_stops_at_maximum_frames(tmp_path: Path) -> No
     assert fake_cdll.zerotts_frame.call_count == 1500
     assert fake_cdll.zerotts_advance.call_count == 1500
     assert fake_stream_decoder.close.called
+
+
+@pytest.mark.parametrize("num_codebooks", [1, 8])
+def test_zerotts_engine_queued_chunks_survive_buffer_reuse(
+    tmp_path: Path, num_codebooks: int
+) -> None:
+    """Test slow decoding preserves full and residual chunks after producer buffer reuse."""
+    engine, _, decoder, _ = _setup_engine_fixture(tmp_path)
+    engine.num_codebooks = num_codebooks
+    producer_finished = threading.Event()
+
+    def generate_frames(*, stop_event: threading.Event) -> Generator[np.ndarray]:
+        for frame_index in range(47):
+            if stop_event.is_set():
+                return
+            yield np.full(num_codebooks, frame_index, dtype=np.int32)
+        producer_finished.set()
+
+    def decode_chunk(codes: np.ndarray) -> np.ndarray:
+        # Hold the consumer until the producer has overwritten both full-size chunks.
+        assert producer_finished.wait(timeout=5)
+        assert codes.flags.c_contiguous
+        assert codes.flags.owndata
+        return np.zeros(960, dtype=np.float32)
+
+    decoder.decode_chunk.side_effect = decode_chunk
+    with patch.object(engine, "_generate_code_frames", side_effect=generate_frames):
+        list(engine.infer_stream("Xin chào Việt Nam", voice="Mai Chi"))
+
+    offset = 0
+    for decode_call, chunk_size in zip(
+        decoder.decode_chunk.call_args_list, (2, 4, 8, 16, 16, 1), strict=True
+    ):
+        expected = np.broadcast_to(
+            np.arange(offset, offset + chunk_size, dtype=np.int32), (1, num_codebooks, chunk_size)
+        )
+        np.testing.assert_array_equal(decode_call.args[0], expected)
+        offset += chunk_size
+    assert decoder.close.called
 
 
 def test_zerotts_engine_begin_failure(tmp_path: Path) -> None:
@@ -3301,3 +3342,172 @@ def test_build_zerotts_handle_build_signals_context_manager() -> None:
 
     restored_handler = signal.getsignal(signal.SIGTERM)
     assert restored_handler == original_handler
+
+
+@pytest.mark.parametrize(
+    ("total_threads", "expected_ggml", "expected_codec"),
+    [
+        (0, 1, 1),
+        (-4, 1, 1),
+        (1, 1, 1),
+        (2, 1, 1),
+        (3, 2, 1),
+        (4, 3, 1),
+        (5, 3, 2),
+        (6, 4, 2),
+        (8, 6, 2),
+        (10, 7, 3),
+        (12, 9, 3),
+        (16, 12, 4),
+        (20, 16, 4),
+    ],
+)
+def test_resolve_zerotts_thread_budget_pipelined(
+    total_threads: int, expected_ggml: int, expected_codec: int
+) -> None:
+    """Test dynamic thread budget allocation under pipelined streaming."""
+    ggml, codec = resolve_zerotts_thread_budget(total_threads, pipelined=True)
+    assert ggml == expected_ggml
+    assert codec == expected_codec
+    if total_threads >= 2:
+        assert ggml + codec <= total_threads
+
+
+def test_resolve_zerotts_thread_budget_custom_codec_override() -> None:
+    """Test explicit codec thread count overrides dynamic calculation."""
+    # Standard override within budget
+    ggml, codec = resolve_zerotts_thread_budget(4, pipelined=True, codec_threads=2)
+    assert ggml == 2
+    assert codec == 2
+
+    # Non-positive override clamps to 1
+    ggml, codec = resolve_zerotts_thread_budget(4, pipelined=True, codec_threads=0)
+    assert ggml == 3
+    assert codec == 1
+
+    ggml, codec = resolve_zerotts_thread_budget(4, pipelined=True, codec_threads=-2)
+    assert ggml == 3
+    assert codec == 1
+
+    # Override >= total budget preserves the budget limit (codec capped at total - 1)
+    ggml, codec = resolve_zerotts_thread_budget(4, pipelined=True, codec_threads=4)
+    assert ggml == 1
+    assert codec == 3
+    assert ggml + codec <= 4
+
+    ggml, codec = resolve_zerotts_thread_budget(4, pipelined=True, codec_threads=10)
+    assert ggml == 1
+    assert codec == 3
+    assert ggml + codec <= 4
+
+    # Budget of 1 thread always yields (1, 1)
+    ggml, codec = resolve_zerotts_thread_budget(1, pipelined=True, codec_threads=4)
+    assert ggml == 1
+    assert codec == 1
+
+
+def test_resolve_zerotts_thread_budget_non_pipelined() -> None:
+    """Test non-pipelined thread allocation gives full budget to GGML."""
+    assert resolve_zerotts_thread_budget(1, pipelined=False) == (1, 1)
+    assert resolve_zerotts_thread_budget(2, pipelined=False) == (2, 1)
+    assert resolve_zerotts_thread_budget(4, pipelined=False) == (4, 2)
+    assert resolve_zerotts_thread_budget(8, pipelined=False) == (8, 4)
+    assert resolve_zerotts_thread_budget(16, pipelined=False) == (16, 4)
+
+    # Explicit codec override
+    assert resolve_zerotts_thread_budget(4, pipelined=False, codec_threads=3) == (4, 3)
+    assert resolve_zerotts_thread_budget(4, pipelined=False, codec_threads=0) == (4, 1)
+    assert resolve_zerotts_thread_budget(4, pipelined=False, codec_threads=-1) == (4, 1)
+
+
+def test_zerotts_engine_dynamic_thread_allocation(tmp_path: Path) -> None:
+    """Test ZeroTtsGgmlEngine sets up dynamic thread allocation across configurations."""
+    # Explicit 2 threads
+    engine, _, _, _ = _setup_engine_fixture(tmp_path, num_threads=2)
+    assert engine.threads == 1
+    assert engine.codec_threads == 1
+    assert engine.total_threads == 2
+    assert engine.pipelined is True
+
+    # Single-thread system: auto-disables pipelining to avoid thread contention
+    engine_single, _, _, _ = _setup_engine_fixture(tmp_path, num_threads=1)
+    assert engine_single.threads == 1
+    assert engine_single.codec_threads == 1
+    assert engine_single.total_threads == 1
+    assert engine_single.pipelined is False
+
+    # Auto thread detection with num_threads=0, resolving to 4 threads
+    with patch("wyoming_vietnamese.zerotts_engine.resolve_cpu_threads", return_value=4):
+        engine_auto, _, _, _ = _setup_engine_fixture(tmp_path, num_threads=0)
+        assert engine_auto.total_threads == 4
+        assert engine_auto.threads == 3
+        assert engine_auto.codec_threads == 1
+        assert engine_auto.pipelined is True
+
+    # Negative thread count raises ValueError
+    with pytest.raises(ValueError, match="configured threads must not be negative"):
+        _setup_engine_fixture(tmp_path, num_threads=-1)
+
+
+def test_zerotts_engine_inplace_tensor_reuse_and_zero_copy_buffers(tmp_path: Path) -> None:
+    """Test Technique 4: in-place au_buf reuse and zero-copy codec decoding."""
+    engine, fake_cdll, fake_stream_decoder, _ = _setup_engine_fixture(tmp_path, num_threads=2)
+
+    # 1. Pre-allocated au_buf and pointer
+    assert hasattr(engine, "_au_buf")
+    assert isinstance(engine._au_buf, np.ndarray)
+    assert engine._au_buf.dtype == np.float32
+    assert engine._au_buf.shape == (engine.num_codebooks,)
+    assert engine._au_buf_ptr is not None
+
+    # 2. _execute_frame_step modifies _au_buf in place without allocating a new buffer
+    original_buf = engine._au_buf
+    codes_buf = (ctypes.c_int32 * engine.num_codebooks)()
+    is_eoa = ctypes.c_int(0)
+    engine._execute_frame_step(0, forbid_eoa=True, codes_buf=codes_buf, is_eoa=is_eoa)
+    assert engine._au_buf is original_buf
+    assert fake_cdll.zerotts_frame.called
+
+    # 3. _generate_code_frames yields int32 arrays
+    step_count = 0
+    eoa_signalled = False
+
+    def fake_frame_eoa(*args: object, **kwargs: object) -> int:
+        nonlocal step_count, eoa_signalled
+        step_count += 1
+        if step_count >= 5:
+            eoa_arg = args[6] if len(args) > 6 else kwargs.get("is_eoa")
+            eoa_target = getattr(eoa_arg, "_obj", eoa_arg)
+            if isinstance(eoa_target, ctypes.c_int):
+                eoa_target.value = 1
+                eoa_signalled = True
+        return 0
+
+    fake_cdll.zerotts_frame.side_effect = fake_frame_eoa
+    frames = list(engine._generate_code_frames())
+    assert eoa_signalled
+    assert len(frames) == 6
+    for frame in frames:
+        assert isinstance(frame, np.ndarray)
+        assert frame.dtype == np.int32
+        assert frame.shape == (engine.num_codebooks,)
+
+    # 4. _decode_audio_chunk accepts both contiguous 3D numpy arrays and legacy frame lists
+    fake_stream_decoder.decode_chunk.return_value = np.zeros(960, dtype=np.float32)
+    chunk_array = np.zeros((1, engine.num_codebooks, 8), dtype=np.int32)
+    audio_from_arr = engine._decode_audio_chunk(fake_stream_decoder, chunk_array)
+    assert audio_from_arr is not None
+    assert audio_from_arr.shape == (960,)
+    assert fake_stream_decoder.decode_chunk.call_args[0][0] is chunk_array
+
+    # Legacy list input fallback
+    frame_list = [np.zeros(engine.num_codebooks, dtype=np.int32) for _ in range(4)]
+    audio_from_list = engine._decode_audio_chunk(fake_stream_decoder, frame_list)
+    assert audio_from_list is not None
+    assert audio_from_list.shape == (960,)
+
+    # 5. Non-pipelined streaming uses zero-copy chunk buffers
+    engine_seq, _, fake_seq_stream, _ = _setup_engine_fixture(tmp_path, num_threads=1)
+    chunks_seq = list(engine_seq.infer_stream("Xin chào Việt Nam", voice="Mai Chi"))
+    assert chunks_seq
+    assert fake_seq_stream.close.called

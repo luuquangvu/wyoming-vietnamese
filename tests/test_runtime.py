@@ -5,24 +5,35 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import os
+import signal
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
+import numpy as np
 import pytest
 from wyoming.event import Event, write_event
 from wyoming.info import Info
+from wyoming.server import AsyncServer, HandlerFactory
 
 from tests.helpers import make_reader, memory_writer, stream_writer
 from wyoming_vietnamese import __main__ as main_module
 from wyoming_vietnamese import healthcheck
 from wyoming_vietnamese.__main__ import (
+    _create_server_handler_factory,
+    _download_configured_models,
     _drain_inference,
     _initialize_configured_tts,
+    _register_shutdown_signals,
     _remove_obsolete_cache_namespaces,
+    _resolve_zerotts_identity,
     _select_loaded_voices,
     _select_startup_voices,
+    _shutdown_server,
     _tts_cache_namespace,
+    configure_process_environment,
     main,
     run_server,
 )
@@ -39,7 +50,7 @@ from wyoming_vietnamese.const import (
     TtsEngine,
 )
 from wyoming_vietnamese.cpu import resolve_cpu_threads
-from wyoming_vietnamese.protocol import ConnectionLimiter
+from wyoming_vietnamese.protocol import ByteBudget, ConnectionLimiter
 from wyoming_vietnamese.resources import DeviceResources, DeviceTier
 from wyoming_vietnamese.stt import get_stt_info
 from wyoming_vietnamese.stt_model import GIPFORMER_MODEL
@@ -49,6 +60,7 @@ from wyoming_vietnamese.tts_model import (
     DEFAULT_ZEROTTS_VOICE,
     NGHITTS_VOICES_BY_ID,
     ZEROTTS_VOICES_BY_ID,
+    ZeroTtsModelResolution,
 )
 
 
@@ -251,21 +263,26 @@ def test_loaded_voice_limits_are_specific_to_nghitts_memory_use() -> None:
     assert _select_loaded_voices(zerotts_voices, (), TtsEngine.ZEROTTS, 1) == zerotts_voices
 
 
-class FakeServer:
+class FakeServer(AsyncServer):
     """Provide a test double for FakeServer."""
 
     def __init__(
         self, *, start_error: Exception | None = None, stop_error: Exception | None = None
-    ):
+    ) -> None:
         """Initialize the test double."""
+        super().__init__()
         self.start_error = start_error
         self.stop_error = stop_error
         self.factory: object | None = None
         self.stopped = False
 
-    async def start(self, factory: object) -> None:
+    async def run(self, handler_factory: HandlerFactory) -> None:
+        """Build test support for run."""
+        await self.start(handler_factory)
+
+    async def start(self, handler_factory: HandlerFactory) -> None:
         """Build test support for start."""
-        self.factory = factory
+        self.factory = handler_factory
         if self.start_error is not None:
             raise self.start_error
 
@@ -282,7 +299,13 @@ class ClosableTTS:
     def __init__(self) -> None:
         """Initialize the test double."""
         self._preset_voices = {"voice": {"description": "Voice"}}
+        self.sample_rate = 22050
+        self.chunks_are_sentences = False
         self.closed = False
+
+    def infer_stream(self, text: str, *, voice: str | None = None) -> Iterator[np.ndarray]:
+        """Synthesize dummy waveform."""
+        return iter(())
 
     def close(self) -> None:
         """Build test support for close."""
@@ -451,6 +474,223 @@ async def test_run_server_starts_one_combined_service(
         (DEFAULT_NGHITTS_VOICE,),
         resolve_cpu_threads(0),
     )
+
+
+def test_register_shutdown_signals() -> None:
+    """Test _register_shutdown_signals attaches handlers to the event loop."""
+    loop = Mock()
+    shutdown_event = asyncio.Event()
+    signals = _register_shutdown_signals(loop, shutdown_event)
+    assert signals == [signal.SIGINT, signal.SIGTERM]
+    assert loop.add_signal_handler.call_count == 2
+
+
+def test_register_shutdown_signals_not_implemented() -> None:
+    """Test _register_shutdown_signals gracefully handles NotImplementedError."""
+    loop = Mock()
+    loop.add_signal_handler.side_effect = NotImplementedError
+    shutdown_event = asyncio.Event()
+    signals = _register_shutdown_signals(loop, shutdown_event)
+    assert signals == []
+
+
+async def test_shutdown_server_when_not_started() -> None:
+    """Test _shutdown_server skips stopping server if server_started is False."""
+    server = FakeServer()
+    limiter = ConnectionLimiter(5)
+    stt_lock = asyncio.Lock()
+    tts_lock = asyncio.Lock()
+    cache = Mock()
+    cache.clear.return_value = (2, 100)
+    executor = Mock()
+    tts_engine = ClosableTTS()
+    loop = Mock()
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(asyncio, "get_running_loop", Mock(return_value=loop))
+        await _shutdown_server(
+            server,
+            limiter,
+            stt_lock,
+            tts_lock,
+            cache,
+            executor,
+            tts_engine,
+            [signal.SIGINT],
+            server_started=False,
+        )
+
+    loop.remove_signal_handler.assert_called_once_with(signal.SIGINT)
+    assert server.stopped is False
+    assert limiter.accepting is True
+    cache.clear.assert_called_once_with()
+    executor.shutdown.assert_called_once_with()
+    assert tts_engine.closed is True
+
+
+async def test_shutdown_server_when_started_clean() -> None:
+    """Test _shutdown_server drains inference, stops server, and releases resources."""
+    server = FakeServer()
+    limiter = ConnectionLimiter(5)
+    stt_lock = asyncio.Lock()
+    tts_lock = asyncio.Lock()
+    cache = Mock()
+    cache.clear.return_value = (0, 0)
+    executor = Mock()
+    tts_engine = ClosableTTS()
+    loop = Mock()
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(asyncio, "get_running_loop", Mock(return_value=loop))
+        await _shutdown_server(
+            server,
+            limiter,
+            stt_lock,
+            tts_lock,
+            cache,
+            executor,
+            tts_engine,
+            [signal.SIGINT, signal.SIGTERM],
+            server_started=True,
+        )
+
+    assert loop.remove_signal_handler.call_count == 2
+    assert server.stopped is True
+    assert limiter.accepting is False
+    cache.clear.assert_called_once_with()
+    executor.shutdown.assert_called_once_with()
+    assert tts_engine.closed is True
+
+
+async def test_shutdown_server_handles_stop_failure_and_idle_timeout(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test _shutdown_server handles server.stop exception and wait_idle timeout gracefully."""
+    server = FakeServer(stop_error=RuntimeError("stop crashed"))
+    limiter = ConnectionLimiter(5)
+    limiter.try_acquire()
+    stt_lock = asyncio.Lock()
+    tts_lock = asyncio.Lock()
+    cache = Mock()
+    cache.clear.return_value = (1, 50)
+    executor = Mock()
+    tts_engine = ClosableTTS()
+    loop = Mock()
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(asyncio, "get_running_loop", Mock(return_value=loop))
+        with caplog.at_level(logging.WARNING, logger=PROGRAM_NAME):
+            await _shutdown_server(
+                server,
+                limiter,
+                stt_lock,
+                tts_lock,
+                cache,
+                executor,
+                tts_engine,
+                [],
+                server_started=True,
+            )
+
+    assert server.stopped is True
+    assert any("Server shutdown failed" in m for m in caplog.messages)
+    assert any("Releasing models while" in m for m in caplog.messages)
+    cache.clear.assert_called_once_with()
+    executor.shutdown.assert_called_once_with()
+    assert tts_engine.closed is True
+
+
+def test_resolve_zerotts_identity_cases(tmp_path: Path) -> None:
+    """Test _resolve_zerotts_identity returns expected SHA-256 or filename."""
+    assert _resolve_zerotts_identity(TtsEngine.NGHITTS, None) is None
+    assert _resolve_zerotts_identity(TtsEngine.ZEROTTS, None) is None
+
+    spec = Mock()
+    spec.gguf_model = Mock(sha256="test-sha256")
+    resolution = ZeroTtsModelResolution(spec=spec, gguf_path=tmp_path / "model.gguf")
+    assert _resolve_zerotts_identity(TtsEngine.ZEROTTS, resolution) == "test-sha256"
+
+    spec_no_gguf = Mock()
+    spec_no_gguf.gguf_model = None
+    resolution_path = ZeroTtsModelResolution(spec=spec_no_gguf, gguf_path=tmp_path / "custom.gguf")
+    assert _resolve_zerotts_identity(TtsEngine.ZEROTTS, resolution_path) == "custom.gguf"
+
+
+def test_create_server_handler_factory(tmp_path: Path) -> None:
+    """Test _create_server_handler_factory returns partial CombinedEventHandler."""
+    config = _config(tmp_path)
+    stt_rec = Mock()
+    stt_event = Event(type="info")
+    stt_lock = asyncio.Lock()
+    stt_budget = ByteBudget(1024)
+    tts_engine = ClosableTTS()
+    tts_event = Event(type="info")
+    tts_lock = asyncio.Lock()
+    cache = Mock()
+    store = Mock()
+    executor = Mock()
+    limiter = ConnectionLimiter(5)
+    combined_event = Event(type="info")
+
+    factory = _create_server_handler_factory(
+        config,
+        stt_rec,
+        stt_event,
+        stt_lock,
+        "repo/stt",
+        stt_budget,
+        tts_engine,
+        tts_event,
+        tts_lock,
+        cache,
+        b"namespace",
+        store,
+        executor,
+        limiter,
+        combined_event,
+    )
+    assert getattr(factory, "func", None) is CombinedEventHandler
+    args = getattr(factory, "args", ())
+    assert len(args) == 3
+    assert args[2] is combined_event
+    keywords = getattr(factory, "keywords", {})
+    assert keywords["connection_limiter"] is limiter
+
+
+def test_download_configured_models_branches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test _download_configured_models forwards zerotts_quant only when set."""
+    download_mock = Mock(return_value={})
+    monkeypatch.setattr("wyoming_vietnamese.__main__.download_models", download_mock)
+    monkeypatch.setattr("wyoming_vietnamese.__main__.validate_tts_voices_for_engine", Mock())
+
+    cfg_default = _config(tmp_path)
+    _download_configured_models(cfg_default)
+    assert "zerotts_quant" not in download_mock.call_args.kwargs
+
+    download_mock.reset_mock()
+    cfg_quant = replace(_config(tmp_path), zerotts_gguf_model="q4_hybrid")
+    _download_configured_models(cfg_quant)
+    assert download_mock.call_args.kwargs["zerotts_quant"] == "q4_hybrid"
+
+
+def test_configure_process_environment_sets_passive(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test configure_process_environment sets OMP_WAIT_POLICY to PASSIVE if unset."""
+    monkeypatch.delenv("OMP_WAIT_POLICY", raising=False)
+    configure_process_environment()
+    assert os.environ.get("OMP_WAIT_POLICY") == "PASSIVE"
+
+
+@pytest.mark.parametrize("existing_val", ["ACTIVE", "active", "PASSIVE", "passive", ""])
+def test_configure_process_environment_preserves_existing(
+    monkeypatch: pytest.MonkeyPatch,
+    existing_val: str,
+) -> None:
+    """Test configure_process_environment preserves existing pre-configured OMP_WAIT_POLICY."""
+    monkeypatch.setenv("OMP_WAIT_POLICY", existing_val)
+    configure_process_environment()
+    assert os.environ.get("OMP_WAIT_POLICY") == existing_val
 
 
 async def test_run_server_applies_resource_limits_to_selected_recent_voice(
@@ -664,7 +904,7 @@ async def _run_configured_zerotts_server(
         "TTS_ENGINE": "zerotts",
     }
     if env_overrides:
-        base_env.update(env_overrides)
+        base_env |= env_overrides
     config = ServerConfig.from_env(base_env)
     await run_server(config, stop_event)
     return server, tts, init_zerotts, download, config

@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import shutil
 import signal
 import sys
+from concurrent.futures import Executor
 from functools import partial
 from pathlib import Path
 
@@ -15,6 +17,7 @@ if __name__ == "__main__" and not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     sys.modules[__name__].__package__ = "wyoming_vietnamese"
 
+from wyoming.event import Event
 from wyoming.server import AsyncServer, HandlerFactory
 
 from .cache import BoundedLruCache, PersistentAudioCache, ResultCache
@@ -31,11 +34,11 @@ from .const import (
     TtsProvider,
 )
 from .cpu import resolve_cpu_threads
-from .download import download_models
+from .download import ModelDownloadResult, download_models
 from .inference import create_inference_executor
 from .protocol import ByteBudget, ConnectionLimiter
 from .resources import DeviceResources, detect_device_resources, warn_if_low_startup_memory
-from .stt import SherpaSTTEventHandler, get_stt_info, initialize_stt, warm_up_stt
+from .stt import SherpaSTTEventHandler, STTRecognizer, get_stt_info, initialize_stt, warm_up_stt
 from .stt_model import SttModelSpec, get_stt_model
 from .tts import (
     TTSEngine,
@@ -57,6 +60,14 @@ from .tts_model import (
 from .voice_usage import RecentVoiceStore
 
 _LOGGER = logging.getLogger(PROGRAM_NAME)
+
+
+def configure_process_environment() -> None:
+    """Set process-wide environment defaults before initializing native runtimes."""
+    os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+
+
+configure_process_environment()
 
 
 def _configure_logging(level: str) -> None:
@@ -351,6 +362,217 @@ async def _warm_up_tts_safely(
         raise
 
 
+def _download_configured_models(server_config: ServerConfig) -> ModelDownloadResult:
+    """Download required STT and TTS models based on server configuration.
+
+    Args:
+        server_config: Active server configuration instance.
+
+    Returns:
+        Structured mapping of downloaded model asset directories.
+    """
+    validate_tts_voices_for_engine(server_config.tts_voices, server_config.tts_engine)
+    if server_config.zerotts_gguf_model is not None:
+        return download_models(
+            cache_dir=server_config.cache_dir,
+            download_dir=server_config.download_dir,
+            tts_voices=server_config.tts_voices,
+            offline=server_config.offline,
+            tts_engine=server_config.tts_engine,
+            stt_engine=server_config.stt_engine,
+            zerotts_quant=server_config.zerotts_gguf_model,
+        )
+    return download_models(
+        cache_dir=server_config.cache_dir,
+        download_dir=server_config.download_dir,
+        tts_voices=server_config.tts_voices,
+        offline=server_config.offline,
+        tts_engine=server_config.tts_engine,
+        stt_engine=server_config.stt_engine,
+    )
+
+
+def _resolve_zerotts_identity(
+    tts_engine: str,
+    zerotts_resolution: ZeroTtsModelResolution | None,
+) -> str | None:
+    """Resolve GGUF model identity digest or filename for cache namespacing.
+
+    Args:
+        tts_engine: Selected TTS engine name.
+        zerotts_resolution: Optional resolved ZeroTTS model specification and paths.
+
+    Returns:
+        SHA-256 digest or local filename string, or None if not applicable.
+    """
+    if tts_engine != TtsEngine.ZEROTTS or zerotts_resolution is None:
+        return None
+    if zerotts_resolution.spec.gguf_model is not None:
+        return zerotts_resolution.spec.gguf_model.sha256
+    return zerotts_resolution.gguf_path.name
+
+
+def _create_server_handler_factory(
+    server_config: ServerConfig,
+    stt_recognizer: STTRecognizer,
+    stt_info_event: Event,
+    stt_lock: asyncio.Lock,
+    stt_model_repo: str,
+    stt_buffer_budget: ByteBudget,
+    tts_engine: TTSEngine,
+    tts_info_event: Event,
+    tts_lock: asyncio.Lock,
+    tts_result_cache: ResultCache,
+    tts_namespace: bytes,
+    voice_usage_store: RecentVoiceStore,
+    inference_executor: Executor,
+    connection_limiter: ConnectionLimiter,
+    combined_info_event: Event,
+) -> HandlerFactory:
+    """Construct combined Wyoming handler factory wrapping STT and TTS services.
+
+    Args:
+        server_config: Active server configuration instance.
+        stt_recognizer: Shared initialized Sherpa STT recognizer.
+        stt_info_event: Wyoming info event describing the STT service.
+        stt_lock: Synchronization lock protecting concurrent STT inference.
+        stt_model_repo: HuggingFace model repository name for STT.
+        stt_buffer_budget: Byte budget limiter for buffered STT audio chunks.
+        tts_engine: Shared initialized TTS engine instance.
+        tts_info_event: Wyoming info event describing the TTS service.
+        tts_lock: Synchronization lock protecting concurrent TTS inference.
+        tts_result_cache: Two-tier RAM/disk cache for synthesized audio clips.
+        tts_namespace: Deterministic namespace bytes isolating cached audio.
+        voice_usage_store: Persistent usage store recording recently used voices.
+        inference_executor: Dedicated thread pool executor for CPU-heavy inference.
+        connection_limiter: Connection concurrency tracker and rejection guard.
+        combined_info_event: Wyoming info event describing both STT and TTS services.
+
+    Returns:
+        Wyoming AsyncServer handler factory callback.
+    """
+    stt_handler_factory: HandlerFactory = partial(
+        SherpaSTTEventHandler,
+        stt_recognizer,
+        stt_info_event,
+        stt_lock,
+        stt_model_repo,
+        server_config.max_stt_audio_seconds,
+        server_config.inference_queue_timeout,
+        buffer_budget=stt_buffer_budget,
+        event_timeout=server_config.event_timeout,
+        write_timeout=server_config.write_timeout,
+        inference_executor=inference_executor,
+    )
+    tts_handler_factory: HandlerFactory = partial(
+        TTSEventHandler,
+        tts_engine,
+        tts_info_event,
+        tts_lock,
+        tts_result_cache,
+        server_config.max_tts_text_chars,
+        server_config.inference_queue_timeout,
+        event_timeout=server_config.event_timeout,
+        write_timeout=server_config.write_timeout,
+        sentence_silence_ms=server_config.tts_sentence_silence_ms,
+        clause_silence_ms=server_config.tts_clause_silence_ms,
+        paragraph_silence_ms=server_config.tts_paragraph_silence_ms,
+        inference_executor=inference_executor,
+        voice_usage_store=voice_usage_store,
+        cache_namespace=tts_namespace,
+    )
+    return partial(
+        CombinedEventHandler,
+        stt_handler_factory,
+        tts_handler_factory,
+        combined_info_event,
+        connection_limiter=connection_limiter,
+        event_timeout=server_config.event_timeout,
+        write_timeout=server_config.write_timeout,
+    )
+
+
+def _register_shutdown_signals(
+    loop: asyncio.AbstractEventLoop,
+    shutdown_event: asyncio.Event,
+) -> list[signal.Signals]:
+    """Register SIGINT/SIGTERM handlers to trigger graceful shutdown event.
+
+    Args:
+        loop: Active asyncio event loop.
+        shutdown_event: Event signaled when shutdown signal is captured.
+
+    Returns:
+        List of signal numbers successfully attached to the event loop.
+    """
+    registered: list[signal.Signals] = []
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(signum, shutdown_event.set)
+        except NotImplementedError:
+            break
+        registered.append(signum)
+    return registered
+
+
+async def _shutdown_server(
+    server: AsyncServer,
+    connection_limiter: ConnectionLimiter,
+    stt_lock: asyncio.Lock,
+    tts_lock: asyncio.Lock,
+    tts_result_cache: ResultCache,
+    inference_executor: Executor,
+    tts_engine: TTSEngine,
+    registered_signals: list[signal.Signals],
+    server_started: bool,
+) -> None:
+    """Drain in-flight inference, stop the server, and release model/cache resources.
+
+    Args:
+        server: Running AsyncServer instance.
+        connection_limiter: Limiter tracking active connection handlers.
+        stt_lock: Synchronization lock protecting STT inference.
+        tts_lock: Synchronization lock protecting TTS inference.
+        tts_result_cache: RAM/disk cache to flush during shutdown.
+        inference_executor: Background executor running inference tasks.
+        tts_engine: TTS engine instance to close.
+        registered_signals: POSIX signals to detach from the loop.
+        server_started: True if server socket listener started accepting connections.
+    """
+    _LOGGER.info("Stopping Wyoming services")
+    loop = asyncio.get_running_loop()
+    for signum in registered_signals:
+        loop.remove_signal_handler(signum)
+    if server_started:
+        # Reject new handlers before observing the locks so a newly admitted
+        # connection cannot start inference after a service has been drained.
+        # Existing clients retain their writers until both independent model calls
+        # have completed or timed out.
+        connection_limiter.stop_accepting()
+        await asyncio.gather(
+            _drain_inference(stt_lock, "STT"),
+            _drain_inference(tts_lock, "TTS"),
+        )
+        try:
+            await server.stop()
+        except Exception as err:
+            _LOGGER.exception("Server shutdown failed: %s", err)
+        if not await connection_limiter.wait_idle(Timeout.SHUTDOWN_DRAIN):
+            _LOGGER.warning(
+                "Releasing models while %d client handler(s) are still active",
+                connection_limiter.active,
+            )
+    tts_entries, tts_bytes = tts_result_cache.clear()
+    _LOGGER.debug(
+        "Cleared TTS RAM cache: entries=%d bytes=%d; persistent disk entries retained",
+        tts_entries,
+        tts_bytes,
+    )
+    await asyncio.to_thread(inference_executor.shutdown)
+    await asyncio.to_thread(tts_engine.close)
+    _LOGGER.info("Wyoming services stopped")
+
+
 async def run_server(
     config: ServerConfig | None = None,
     stop_event: asyncio.Event | None = None,
@@ -384,26 +606,7 @@ async def run_server(
     server_config.download_dir.mkdir(parents=True, exist_ok=True)
     _log_startup_configuration(server_config, cpu_threads, stt_model)
 
-    validate_tts_voices_for_engine(server_config.tts_voices, server_config.tts_engine)
-    if server_config.zerotts_gguf_model is not None:
-        paths = download_models(
-            cache_dir=server_config.cache_dir,
-            download_dir=server_config.download_dir,
-            tts_voices=server_config.tts_voices,
-            offline=server_config.offline,
-            tts_engine=server_config.tts_engine,
-            stt_engine=server_config.stt_engine,
-            zerotts_quant=server_config.zerotts_gguf_model,
-        )
-    else:
-        paths = download_models(
-            cache_dir=server_config.cache_dir,
-            download_dir=server_config.download_dir,
-            tts_voices=server_config.tts_voices,
-            offline=server_config.offline,
-            tts_engine=server_config.tts_engine,
-            stt_engine=server_config.stt_engine,
-        )
+    paths = _download_configured_models(server_config)
 
     _LOGGER.info("Initializing Speech-to-Text engine (%s)", server_config.stt_engine)
     stt_recognizer = initialize_stt(
@@ -426,20 +629,15 @@ async def run_server(
     )
     await _warm_up_tts_safely(tts_engine, active_voices, server_config.tts_engine)
     tts_info = get_tts_info(server_config.tts_voices, engine=server_config.tts_engine)
-    stt_info_event = stt_info.event()
-    tts_info_event = tts_info.event()
-    combined_info_event = combine_service_info(stt_info, tts_info).event()
 
     stt_lock = asyncio.Lock()
     tts_lock = asyncio.Lock()
     connection_limiter = ConnectionLimiter(server_config.max_active_connections)
     stt_buffer_budget = ByteBudget(server_config.max_stt_buffer_bytes)
-    zerotts_model_identity: str | None = None
-    if server_config.tts_engine == TtsEngine.ZEROTTS and zerotts_resolution is not None:
-        if zerotts_resolution.spec.gguf_model is not None:
-            zerotts_model_identity = zerotts_resolution.spec.gguf_model.sha256
-        else:
-            zerotts_model_identity = zerotts_resolution.gguf_path.name
+    zerotts_model_identity = _resolve_zerotts_identity(
+        server_config.tts_engine,
+        zerotts_resolution,
+    )
     tts_namespace = _tts_cache_namespace(
         server_config,
         server_config.tts_voices,
@@ -452,59 +650,31 @@ async def run_server(
         tts_namespace,
     )
     inference_executor = create_inference_executor()
-    stt_handler_factory: HandlerFactory = partial(
-        SherpaSTTEventHandler,
+    handler_factory = _create_server_handler_factory(
+        server_config,
         stt_recognizer,
-        stt_info_event,
+        stt_info.event(),
         stt_lock,
         stt_model.repo,
-        server_config.max_stt_audio_seconds,
-        server_config.inference_queue_timeout,
-        buffer_budget=stt_buffer_budget,
-        event_timeout=server_config.event_timeout,
-        write_timeout=server_config.write_timeout,
-        inference_executor=inference_executor,
-    )
-    tts_handler_factory: HandlerFactory = partial(
-        TTSEventHandler,
+        stt_buffer_budget,
         tts_engine,
-        tts_info_event,
+        tts_info.event(),
         tts_lock,
         tts_result_cache,
-        server_config.max_tts_text_chars,
-        server_config.inference_queue_timeout,
-        event_timeout=server_config.event_timeout,
-        write_timeout=server_config.write_timeout,
-        sentence_silence_ms=server_config.tts_sentence_silence_ms,
-        clause_silence_ms=server_config.tts_clause_silence_ms,
-        paragraph_silence_ms=server_config.tts_paragraph_silence_ms,
-        inference_executor=inference_executor,
-        voice_usage_store=voice_usage_store,
-        cache_namespace=tts_namespace,
+        tts_namespace,
+        voice_usage_store,
+        inference_executor,
+        connection_limiter,
+        combine_service_info(stt_info, tts_info).event(),
     )
 
     uri = f"tcp://0.0.0.0:{server_config.port}"
     server = AsyncServer.from_uri(uri)
-    handler_factory: HandlerFactory = partial(
-        CombinedEventHandler,
-        stt_handler_factory,
-        tts_handler_factory,
-        combined_info_event,
-        connection_limiter=connection_limiter,
-        event_timeout=server_config.event_timeout,
-        write_timeout=server_config.write_timeout,
-    )
-
     shutdown_event = stop_event or asyncio.Event()
-    registered_signals: list[signal.Signals] = []
     loop = asyncio.get_running_loop()
-    if stop_event is None:
-        for signum in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(signum, shutdown_event.set)
-            except NotImplementedError:
-                break
-            registered_signals.append(signum)
+    registered_signals = (
+        _register_shutdown_signals(loop, shutdown_event) if stop_event is None else []
+    )
 
     server_started = False
     try:
@@ -513,37 +683,17 @@ async def run_server(
         _LOGGER.info("Wyoming STT/TTS service is ready at %s", uri)
         await shutdown_event.wait()
     finally:
-        _LOGGER.info("Stopping Wyoming services")
-        for signum in registered_signals:
-            loop.remove_signal_handler(signum)
-        if server_started:
-            # Reject new handlers before observing the locks so a newly admitted
-            # connection cannot start inference after a service has been drained.
-            # Existing clients retain their writers until both independent model calls
-            # have completed or timed out.
-            connection_limiter.stop_accepting()
-            await asyncio.gather(
-                _drain_inference(stt_lock, "STT"),
-                _drain_inference(tts_lock, "TTS"),
-            )
-            try:
-                await server.stop()
-            except Exception as err:
-                _LOGGER.exception("Server shutdown failed: %s", err)
-            if not await connection_limiter.wait_idle(Timeout.SHUTDOWN_DRAIN):
-                _LOGGER.warning(
-                    "Releasing models while %d client handler(s) are still active",
-                    connection_limiter.active,
-                )
-        tts_entries, tts_bytes = tts_result_cache.clear()
-        _LOGGER.debug(
-            "Cleared TTS RAM cache: entries=%d bytes=%d; persistent disk entries retained",
-            tts_entries,
-            tts_bytes,
+        await _shutdown_server(
+            server,
+            connection_limiter,
+            stt_lock,
+            tts_lock,
+            tts_result_cache,
+            inference_executor,
+            tts_engine,
+            registered_signals,
+            server_started,
         )
-        await asyncio.to_thread(inference_executor.shutdown)
-        await asyncio.to_thread(tts_engine.close)
-        _LOGGER.info("Wyoming services stopped")
 
 
 def main() -> None:
