@@ -33,6 +33,7 @@ from wyoming_vietnamese.const import (
     PROGRAM_NAME,
     TTS_DIR,
     VIETNAMESE_LANGUAGE,
+    ZEROTTS_GGUF_MODEL,
     NghiTtsAudio,
     NghiTtsFile,
     TtsAudio,
@@ -41,6 +42,7 @@ from wyoming_vietnamese.const import (
     ZeroTtsAudio,
     ZeroTtsDirectory,
     ZeroTtsFile,
+    ZeroTtsVariant,
 )
 from wyoming_vietnamese.tts import (
     _PREFIX_ABBR,
@@ -1134,6 +1136,9 @@ def test_initialize_zerotts_initializes_engine(
     fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
     engine_cls = Mock(return_value=fake_engine)
     monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
+    monkeypatch.setattr(
+        "wyoming_vietnamese.tts_model.detect_cpu_variant", lambda: ZeroTtsVariant.AVX2
+    )
 
     engine = initialize_zerotts(tmp_path, (DEFAULT_ZEROTTS_VOICE,), num_threads=3)
     assert engine is fake_engine
@@ -1144,6 +1149,298 @@ def test_initialize_zerotts_initializes_engine(
         num_threads=3,
         custom_lib_path=None,
     )
+
+
+def test_initialize_zerotts_env_model_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test initialize_zerotts respects ZEROTTS_GGUF_MODEL with absolute path."""
+    fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
+    engine_cls = Mock(return_value=fake_engine)
+    monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
+    custom_path = tmp_path / "custom-model.gguf"
+    monkeypatch.setenv(ZEROTTS_GGUF_MODEL, str(custom_path))
+
+    initialize_zerotts(tmp_path, (DEFAULT_ZEROTTS_VOICE,), num_threads=2)
+    engine_cls.assert_called_once_with(
+        model_dir=tmp_path,
+        gguf_path=custom_path,
+        voices=(DEFAULT_ZEROTTS_VOICE,),
+        num_threads=2,
+        custom_lib_path=None,
+    )
+
+
+def test_initialize_zerotts_missing_custom_gguf_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test initialize_zerotts raises FileNotFoundError when custom GGUF path does not exist."""
+    custom_path = tmp_path / "nonexistent-model.gguf"
+    monkeypatch.setenv(ZEROTTS_GGUF_MODEL, str(custom_path))
+    received_paths: list[Path] = []
+
+    def validating_engine(*args: Any, gguf_path: Path, **kwargs: Any) -> Any:
+        received_paths.append(gguf_path)
+        if not gguf_path.is_file():
+            raise FileNotFoundError(f"Missing ZeroTTS GGUF model weights: {gguf_path}")
+        return FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
+
+    monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", validating_engine)
+    with pytest.raises(FileNotFoundError, match="Missing ZeroTTS GGUF model weights"):
+        initialize_zerotts(tmp_path, (DEFAULT_ZEROTTS_VOICE,), num_threads=1)
+
+    assert received_paths == [custom_path]
+
+
+def test_initialize_zerotts_env_model_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test initialize_zerotts normalizes aliases such as q4 and q4_hybrid."""
+    fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
+    engine_cls = Mock(return_value=fake_engine)
+    monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
+    monkeypatch.setenv(ZEROTTS_GGUF_MODEL, "q4_hybrid")
+
+    initialize_zerotts(tmp_path, (DEFAULT_ZEROTTS_VOICE,), num_threads=2)
+    engine_cls.assert_called_once_with(
+        model_dir=tmp_path,
+        gguf_path=tmp_path / ZeroTtsDirectory.GGUF / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL,
+        voices=(DEFAULT_ZEROTTS_VOICE,),
+        num_threads=2,
+        custom_lib_path=None,
+    )
+
+
+def test_initialize_zerotts_env_model_invalid_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test initialize_zerotts raises ValueError for unsupported model names."""
+    monkeypatch.setenv(ZEROTTS_GGUF_MODEL, "missing.gguf")
+    with pytest.raises(ValueError, match=r"ZEROTTS_GGUF_MODEL is invalid: 'missing\.gguf'"):
+        initialize_zerotts(tmp_path, (DEFAULT_ZEROTTS_VOICE,), num_threads=2)
+
+
+def test_initialize_zerotts_q4_fallback_when_q8_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test initialize_zerotts falls back to Q4 GGUF when Q8 model is missing but Q4 is present."""
+    fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
+    engine_cls = Mock(return_value=fake_engine)
+    monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
+    monkeypatch.delenv(ZEROTTS_GGUF_MODEL, raising=False)
+
+    gguf_dir = tmp_path / ZeroTtsDirectory.GGUF
+    gguf_dir.mkdir(parents=True, exist_ok=True)
+    hybrid_file = gguf_dir / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+    hybrid_file.write_bytes(b"mock_hybrid")
+
+    initialize_zerotts(tmp_path, (DEFAULT_ZEROTTS_VOICE,), num_threads=1)
+    engine_cls.assert_called_once_with(
+        model_dir=tmp_path,
+        gguf_path=hybrid_file,
+        voices=(DEFAULT_ZEROTTS_VOICE,),
+        num_threads=1,
+        custom_lib_path=None,
+    )
+
+
+def test_initialize_zerotts_auto_edge_processor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test initialize_zerotts auto selects Q4-Hybrid model on edge CPU variants."""
+    fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
+    engine_cls = Mock(return_value=fake_engine)
+    monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
+    monkeypatch.setenv(ZEROTTS_GGUF_MODEL, "auto")
+    monkeypatch.setattr(
+        "wyoming_vietnamese.tts_model.detect_cpu_variant", lambda: ZeroTtsVariant.SSE4
+    )
+
+    initialize_zerotts(tmp_path, (DEFAULT_ZEROTTS_VOICE,), num_threads=1)
+    engine_cls.assert_called_once_with(
+        model_dir=tmp_path,
+        gguf_path=tmp_path / ZeroTtsDirectory.GGUF / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL,
+        voices=(DEFAULT_ZEROTTS_VOICE,),
+        num_threads=1,
+        custom_lib_path=None,
+    )
+
+
+def test_initialize_zerotts_auto_compat_edge_processor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test initialize_zerotts auto selects Q4-Hybrid model on COMPAT edge variant."""
+    fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
+    engine_cls = Mock(return_value=fake_engine)
+    monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
+    monkeypatch.setenv(ZEROTTS_GGUF_MODEL, "auto")
+    monkeypatch.setattr(
+        "wyoming_vietnamese.tts_model.detect_cpu_variant", lambda: ZeroTtsVariant.COMPAT
+    )
+
+    initialize_zerotts(tmp_path, (DEFAULT_ZEROTTS_VOICE,), num_threads=1)
+    engine_cls.assert_called_once_with(
+        model_dir=tmp_path,
+        gguf_path=tmp_path / ZeroTtsDirectory.GGUF / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL,
+        voices=(DEFAULT_ZEROTTS_VOICE,),
+        num_threads=1,
+        custom_lib_path=None,
+    )
+
+
+def test_initialize_zerotts_auto_avx_edge_processor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test initialize_zerotts auto selects Q4-Hybrid model on AVX edge variant."""
+    fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
+    engine_cls = Mock(return_value=fake_engine)
+    monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
+    monkeypatch.setenv(ZEROTTS_GGUF_MODEL, "auto")
+    monkeypatch.setattr(
+        "wyoming_vietnamese.tts_model.detect_cpu_variant", lambda: ZeroTtsVariant.AVX
+    )
+
+    initialize_zerotts(tmp_path, (DEFAULT_ZEROTTS_VOICE,), num_threads=1)
+    engine_cls.assert_called_once_with(
+        model_dir=tmp_path,
+        gguf_path=tmp_path / ZeroTtsDirectory.GGUF / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL,
+        voices=(DEFAULT_ZEROTTS_VOICE,),
+        num_threads=1,
+        custom_lib_path=None,
+    )
+
+
+def test_initialize_zerotts_auto_arm_dotprod_processor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test initialize_zerotts auto selects Q8 model on ARM DotProd CPU variant."""
+    fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
+    engine_cls = Mock(return_value=fake_engine)
+    monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
+    monkeypatch.setenv(ZEROTTS_GGUF_MODEL, "auto")
+    monkeypatch.setattr(
+        "wyoming_vietnamese.tts_model.detect_cpu_variant", lambda: ZeroTtsVariant.ARM_DOTPROD
+    )
+
+    initialize_zerotts(tmp_path, (DEFAULT_ZEROTTS_VOICE,), num_threads=1)
+    engine_cls.assert_called_once_with(
+        model_dir=tmp_path,
+        gguf_path=tmp_path / ZeroTtsDirectory.GGUF / ZeroTtsFile.DEFAULT_GGUF_MODEL,
+        voices=(DEFAULT_ZEROTTS_VOICE,),
+        num_threads=1,
+        custom_lib_path=None,
+    )
+
+
+def test_initialize_zerotts_memoizes_cpu_detection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test initialize_zerotts delegates to centralized memoized CPU detection."""
+    from wyoming_vietnamese.tts_model import reset_zerotts_cpu_variant
+
+    reset_zerotts_cpu_variant()
+    detect_calls = 0
+
+    def mock_detect() -> str:
+        nonlocal detect_calls
+        detect_calls += 1
+        return ZeroTtsVariant.AVX2
+
+    fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
+    engine_cls = Mock(return_value=fake_engine)
+    monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
+    monkeypatch.setattr("wyoming_vietnamese.tts_model.detect_cpu_variant", mock_detect)
+
+    initialize_zerotts(tmp_path, (DEFAULT_ZEROTTS_VOICE,), num_threads=1)
+    assert detect_calls == 1
+
+    initialize_zerotts(tmp_path, (DEFAULT_ZEROTTS_VOICE,), num_threads=1)
+    assert detect_calls == 1
+    reset_zerotts_cpu_variant()
+
+
+def test_initialize_zerotts_explicit_gguf_path_overrides_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test explicit gguf_path takes precedence over ZEROTTS_GGUF_MODEL environment variable."""
+    fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
+    engine_cls = Mock(return_value=fake_engine)
+    monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
+
+    custom_explicit_path = tmp_path / "explicit-model.gguf"
+    env_path = tmp_path / "env-model.gguf"
+    monkeypatch.setenv(ZEROTTS_GGUF_MODEL, str(env_path))
+
+    initialize_zerotts(
+        tmp_path,
+        (DEFAULT_ZEROTTS_VOICE,),
+        num_threads=2,
+        gguf_path=custom_explicit_path,
+    )
+    engine_cls.assert_called_once_with(
+        model_dir=tmp_path,
+        gguf_path=custom_explicit_path,
+        voices=(DEFAULT_ZEROTTS_VOICE,),
+        num_threads=2,
+        custom_lib_path=None,
+    )
+
+
+def test_initialize_zerotts_q8_fallback_when_q4_missing_on_edge_processor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test initialize_zerotts falls back to Q8 on edge CPU when Q4 is missing."""
+    fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
+    engine_cls = Mock(return_value=fake_engine)
+    monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
+    monkeypatch.delenv(ZEROTTS_GGUF_MODEL, raising=False)
+    monkeypatch.setattr(
+        "wyoming_vietnamese.tts_model.detect_cpu_variant", lambda: ZeroTtsVariant.SSE4
+    )
+
+    gguf_dir = tmp_path / ZeroTtsDirectory.GGUF
+    gguf_dir.mkdir(parents=True, exist_ok=True)
+    default_file = gguf_dir / ZeroTtsFile.DEFAULT_GGUF_MODEL
+    default_file.write_bytes(b"mock_default_q8")
+
+    initialize_zerotts(tmp_path, (DEFAULT_ZEROTTS_VOICE,), num_threads=1)
+    engine_cls.assert_called_once_with(
+        model_dir=tmp_path,
+        gguf_path=default_file,
+        voices=(DEFAULT_ZEROTTS_VOICE,),
+        num_threads=1,
+        custom_lib_path=None,
+    )
+
+
+def test_initialize_zerotts_neither_model_exists_path_and_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test initialize_zerotts candidate path when neither model exists, raising on load."""
+    fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
+    engine_cls = Mock(return_value=fake_engine)
+    monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
+    monkeypatch.delenv(ZEROTTS_GGUF_MODEL, raising=False)
+    monkeypatch.setattr(
+        "wyoming_vietnamese.tts_model.detect_cpu_variant", lambda: ZeroTtsVariant.AVX2
+    )
+
+    expected_path = tmp_path / ZeroTtsDirectory.GGUF / ZeroTtsFile.DEFAULT_GGUF_MODEL
+    initialize_zerotts(tmp_path, (DEFAULT_ZEROTTS_VOICE,), num_threads=1)
+    engine_cls.assert_called_once_with(
+        model_dir=tmp_path,
+        gguf_path=expected_path,
+        voices=(DEFAULT_ZEROTTS_VOICE,),
+        num_threads=1,
+        custom_lib_path=None,
+    )
+
+    def validating_engine(*args: Any, gguf_path: Path, **kwargs: Any) -> Any:
+        if not gguf_path.is_file():
+            raise FileNotFoundError(f"Missing ZeroTTS GGUF model weights: {gguf_path}")
+        return fake_engine
+
+    monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", validating_engine)
+    with pytest.raises(FileNotFoundError, match="Missing ZeroTTS GGUF model weights"):
+        initialize_zerotts(tmp_path, (DEFAULT_ZEROTTS_VOICE,), num_threads=1)
 
 
 async def test_resolve_voice_name_supports_zerotts_id() -> None:
@@ -2021,15 +2318,14 @@ def test_stream_clause_detector_keeps_dotted_abbreviations_intact() -> None:
     assert not list(detector.add_chunk(" HCM)"))
     assert detector.finish() == wikipedia_text
 
-    detector2 = StreamClauseDetector()
-    assert not list(detector2.add_chunk("Tôi ở TP."))
-    assert list(detector2.add_chunk("HCM hôm nay. Rồi tiếp")) == ["Tôi ở TP.HCM hôm nay."]
-    assert detector2.finish() == "Rồi tiếp"
+    def check_split_chunk(first: str, second: str, expected: str) -> None:
+        det = StreamClauseDetector()
+        assert not list(det.add_chunk(first))
+        assert list(det.add_chunk(second)) == [expected]
+        assert det.finish() == "Rồi tiếp"
 
-    detector3 = StreamClauseDetector()
-    assert not list(detector3.add_chunk("Tôi ở TP."))
-    assert list(detector3.add_chunk(" HCM hôm nay. Rồi tiếp")) == ["Tôi ở TP. HCM hôm nay."]
-    assert detector3.finish() == "Rồi tiếp"
+    check_split_chunk("Tôi ở TP.", "HCM hôm nay. Rồi tiếp", "Tôi ở TP.HCM hôm nay.")
+    check_split_chunk("Tôi ở TP.", " HCM hôm nay. Rồi tiếp", "Tôi ở TP. HCM hôm nay.")
 
 
 def test_stream_clause_detector_splits_adjacent_letters_without_abbreviation() -> None:

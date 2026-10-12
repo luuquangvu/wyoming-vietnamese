@@ -79,7 +79,13 @@ class ZeroTtsFile(StrEnum):
     TOKENIZER = "tokenizer.json"
     NULL_VOICE_EMB = "null_voice_emb.npy"
     DEFAULT_GGUF_MODEL = "zerotts-q8_0.gguf"
+    Q4_HYBRID_GGUF_MODEL = "zerotts-q4-hybrid.gguf"
+    Q8_0_GGUF_MODEL = "zerotts-q8_0.gguf"
     LIBZEROTTS_SO = "libzerotts.so"
+
+
+ZEROTTS_GGUF_MODEL = "ZEROTTS_GGUF_MODEL"
+DEFAULT_ZEROTTS_GGUF_MODEL = "auto"
 
 
 class ZeroTtsDirectory(StrEnum):

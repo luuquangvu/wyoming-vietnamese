@@ -16,17 +16,33 @@ from typing import Final
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
+from . import tts_model
 from .config import get_env_bool
 from .const import (
     DEFAULT_STT_ENGINE,
     DEFAULT_TTS_ENGINE,
+    DEFAULT_ZEROTTS_GGUF_MODEL,
     NGHITTS_MODEL_BASE_URL,
     STT_DIR,
     TTS_DIR,
+    ZEROTTS_GGUF_MODEL,
     NghiTtsAudio,
     NghiTtsFile,
     TtsEngine,
     ZeroTtsDirectory,
+    ZeroTtsFile,
+    ZeroTtsVariant,
+)
+from .gguf_converter import (
+    GGML_TYPE_F16,
+    GGML_TYPE_F32,
+    GGML_TYPE_Q4_0,
+    GGML_TYPE_Q8_0,
+    GGUF_MAGIC,
+    GGUF_VERSION,
+    convert_zerotts_q8_to_q4_hybrid,
+    is_ffn_tensor,
+    quantize_row_q8_0_to_q4_0,
 )
 from .stt_model import DEFAULT_STT_MODEL, SttArtifact, SttModelSpec, get_stt_model
 from .tts import validate_tts_voices_for_engine
@@ -35,8 +51,61 @@ from .tts_model import (
     ZEROTTS_VOICES,
     NghiTtsVoiceSpec,
     ZeroTtsArtifact,
+    ZeroTtsModelResolution,
+    ZeroTtsModelSpec,
     ZeroTtsVoiceSpec,
+    call_spec_resolver,
+    normalize_zerotts_gguf_model,
+    resolve_zerotts_model,
+    resolve_zerotts_model_spec,
 )
+
+__all__ = [
+    "GGML_TYPE_F16",
+    "GGML_TYPE_F32",
+    "GGML_TYPE_Q4_0",
+    "GGML_TYPE_Q8_0",
+    "GGUF_MAGIC",
+    "GGUF_VERSION",
+    "ModelDownloadResult",
+    "convert_zerotts_q8_to_q4_hybrid",
+    "download_models",
+    "is_ffn_tensor",
+    "quantize_row_q8_0_to_q4_0",
+    "setup_hf_environment",
+]
+
+
+class ModelDownloadResult(dict[str, Path]):
+    """Result of model synchronization containing structured paths and ZeroTTS resolution."""
+
+    def __init__(
+        self,
+        stt_dir: Path,
+        tts_dir: Path,
+        *,
+        zerotts_resolution: ZeroTtsModelResolution | None = None,
+    ) -> None:
+        """Initialize model download result mapping STT and TTS directory keys.
+
+        Args:
+            stt_dir: Destination path for speech-to-text models.
+            tts_dir: Destination path for text-to-speech models.
+            zerotts_resolution: Optional ZeroTTS model resolution containing spec and GGUF path.
+        """
+        super().__init__({STT_DIR: stt_dir, TTS_DIR: tts_dir})
+        self.zerotts_resolution = zerotts_resolution
+
+    @property
+    def stt_dir(self) -> Path:
+        """Stable STT model directory."""
+        return self[STT_DIR]
+
+    @property
+    def tts_dir(self) -> Path:
+        """Stable TTS model directory."""
+        return self[TTS_DIR]
+
 
 AnyVoiceSpec = NghiTtsVoiceSpec | ZeroTtsVoiceSpec
 
@@ -61,7 +130,8 @@ def download_models(
     offline: bool = False,
     tts_engine: str = DEFAULT_TTS_ENGINE,
     stt_engine: str = DEFAULT_STT_ENGINE,
-) -> dict[str, Path]:
+    zerotts_quant: str | None = None,
+) -> ModelDownloadResult:
     """Synchronize and verify the selected engine's assets under stable local paths.
 
     Args:
@@ -71,6 +141,7 @@ def download_models(
         offline: Require every model artifact to be available from local caches.
         tts_engine: Select the NghiTTS or ZeroTTS model source and layout.
         stt_engine: Select the Zipformer or Gipformer speech-to-text model.
+        zerotts_quant: Optional quantization type or GGUF filename override for ZeroTTS.
 
     Returns:
         Stable ``stt`` and ``tts`` model directory paths.
@@ -111,24 +182,62 @@ def download_models(
 
     stt_dest = download_dir / STT_DIR / stt_engine_name
     tts_dest = download_dir / TTS_DIR / tts_engine_name
+    zerotts_resolution: ZeroTtsModelResolution | None = None
 
     if tts_engine_name == TtsEngine.ZEROTTS:
+        effective_quant = zerotts_quant or os.environ.get(ZEROTTS_GGUF_MODEL, "").strip() or None
+        normalized_quant = normalize_zerotts_gguf_model(
+            effective_quant or DEFAULT_ZEROTTS_GGUF_MODEL
+        )
+
+        def _download_spec_resolver(
+            model_name: str | None = None,
+            *,
+            cpu_variant: str | ZeroTtsVariant | None = None,
+        ) -> ZeroTtsModelSpec:
+            """Resolve ZeroTTS model spec for download, honoring monkeypatched module constants."""
+            is_default_target = (
+                model_name is None
+                or model_name == ZeroTtsFile.DEFAULT_GGUF_MODEL
+                or (
+                    ZEROTTS_MODEL.gguf_model is not None
+                    and model_name == ZEROTTS_MODEL.gguf_model.remote_name
+                )
+            )
+            if is_default_target and ZEROTTS_MODEL is not tts_model.ZEROTTS_MODEL:
+                return ZEROTTS_MODEL
+            return call_spec_resolver(
+                resolve_zerotts_model_spec, model_name, cpu_variant=cpu_variant
+            )
+
+        zerotts_resolution = resolve_zerotts_model(
+            tts_dest,
+            normalized_quant,
+            spec_resolver=_download_spec_resolver,
+        )
+        zerotts_spec, resolved_gguf_path = zerotts_resolution.spec, zerotts_resolution.gguf_path
+        gguf_label = (
+            zerotts_spec.gguf_model.local_name
+            if zerotts_spec.gguf_model is not None
+            else str(resolved_gguf_path)
+        )
         _LOGGER.info(
-            "ZeroTTS model: repo=%s revision=%s files=%d",
-            ZEROTTS_MODEL.repo,
-            ZEROTTS_MODEL.revision,
-            len(ZEROTTS_MODEL.artifacts),
+            "ZeroTTS model: repo=%s revision=%s files=%d gguf=%s",
+            zerotts_spec.repo,
+            zerotts_spec.revision,
+            len(zerotts_spec.artifacts),
+            gguf_label,
         )
         zerotts_snapshot = _sync_repo(
-            ZEROTTS_MODEL.repo,
+            zerotts_spec.repo,
             offline,
-            revision=ZEROTTS_MODEL.revision,
-            allow_patterns=ZEROTTS_MODEL.allow_patterns,
+            revision=zerotts_spec.revision,
+            allow_patterns=zerotts_spec.allow_patterns,
         )
         with _model_structure_lock(download_dir):
             stt_dest.mkdir(parents=True, exist_ok=True)
             _structure_stt_files(stt_snapshot, stt_dest, stt_model)
-            _structure_zerotts_files(zerotts_snapshot, tts_dest, tts_voices)
+            _structure_zerotts_files(zerotts_snapshot, tts_dest, tts_voices, zerotts_spec)
     elif tts_engine_name == TtsEngine.NGHITTS:
         nghitts_voices = tuple(voice for voice in tts_voices if isinstance(voice, NghiTtsVoiceSpec))
         tts_snapshots = {
@@ -145,7 +254,11 @@ def download_models(
         raise ValueError(f"Unknown TTS engine: {tts_engine}")
 
     _LOGGER.info("Model verification and structure synchronization completed")
-    return {STT_DIR: stt_dest, TTS_DIR: tts_dest}
+    return ModelDownloadResult(
+        stt_dest,
+        tts_dest,
+        zerotts_resolution=zerotts_resolution if tts_engine_name == TtsEngine.ZEROTTS else None,
+    )
 
 
 def _sync_repo(
@@ -710,6 +823,7 @@ def _structure_zerotts_files(
     snapshot_path: Path,
     dest_dir: Path,
     voices: Sequence[AnyVoiceSpec] | None = None,
+    zerotts_model: ZeroTtsModelSpec | None = None,
 ) -> list[Path]:
     """Verify pinned ZeroTTS assets and expose them under a stable local layout.
 
@@ -718,10 +832,38 @@ def _structure_zerotts_files(
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     copied_paths: list[Path] = []
+    target_model = ZEROTTS_MODEL if zerotts_model is None else zerotts_model
 
-    for artifact in ZEROTTS_MODEL.artifacts:
-        source = _verified_zerotts_source(snapshot_path, artifact)
+    for artifact in target_model.artifacts:
         dst = dest_dir / artifact.local_name
+        if artifact.local_name == f"gguf/{ZeroTtsFile.Q4_HYBRID_GGUF_MODEL}":
+            if _is_verified_file(dst, artifact.sha256):
+                copied_paths.append(dst)
+                continue
+            hybrid_source = snapshot_path / artifact.local_name
+            if not hybrid_source.is_file():
+                alt_hybrid = snapshot_path / Path(artifact.local_name).name
+                if alt_hybrid.is_file():
+                    hybrid_source = alt_hybrid
+            if hybrid_source.is_file() and _is_verified_file(hybrid_source, artifact.sha256):
+                _copy_or_link(hybrid_source, dst)
+                copied_paths.append(dst)
+                continue
+            q8_artifact = ZEROTTS_MODEL.gguf_model
+            if q8_artifact is None:
+                raise RuntimeError("Base ZeroTTS Q8 GGUF artifact is missing")
+            q8_source = _verified_zerotts_source(snapshot_path, q8_artifact)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            convert_zerotts_q8_to_q4_hybrid(q8_source, dst)
+            if not _is_verified_file(dst, artifact.sha256):
+                raise RuntimeError(
+                    f"Generated ZeroTTS hybrid model {dst!s} does not match its "
+                    f"recorded SHA-256 digest"
+                )
+            copied_paths.append(dst)
+            continue
+
+        source = _verified_zerotts_source(snapshot_path, artifact)
         _copy_or_link(source, dst)
         if not _is_verified_file(dst, artifact.sha256):
             raise RuntimeError(

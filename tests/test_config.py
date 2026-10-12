@@ -13,9 +13,11 @@ from wyoming_vietnamese.const import (
     DEFAULT_PORT,
     DEFAULT_STT_ENGINE,
     DEFAULT_TTS_ENGINE,
+    ZEROTTS_GGUF_MODEL,
     SttEngine,
     TtsEngine,
     TtsSilenceMs,
+    ZeroTtsFile,
 )
 from wyoming_vietnamese.tts_model import DEFAULT_NGHITTS_VOICE_ID
 
@@ -262,3 +264,48 @@ def test_server_config_stt_engine_gipformer() -> None:
     """Test server config parses Gipformer STT engine explicitly."""
     config = ServerConfig.from_env({"STT_ENGINE": SttEngine.GIPFORMER})
     assert config.stt_engine == SttEngine.GIPFORMER
+
+
+def test_server_config_zerotts_gguf_model_default() -> None:
+    """Test server config leaves zerotts_gguf_model as None by default."""
+    config = ServerConfig.from_env({})
+    assert config.zerotts_gguf_model is None
+
+
+def test_server_config_zerotts_gguf_model_explicit() -> None:
+    """Test server config parses explicit ZEROTTS_GGUF_MODEL filename."""
+    config = ServerConfig.from_env({ZEROTTS_GGUF_MODEL: ZeroTtsFile.Q4_HYBRID_GGUF_MODEL})
+    assert config.zerotts_gguf_model == ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+
+
+def test_server_config_zerotts_gguf_model_auto_preserved() -> None:
+    """Test server config preserves auto and default selectors without early resolution."""
+    config_auto = ServerConfig.from_env({ZEROTTS_GGUF_MODEL: "auto"})
+    assert config_auto.zerotts_gguf_model == "auto"
+
+    config_default = ServerConfig.from_env({ZEROTTS_GGUF_MODEL: "default"})
+    assert config_default.zerotts_gguf_model == "auto"
+
+
+def test_server_config_zerotts_gguf_model_shorthands() -> None:
+    """Test server config normalizes shorthand names for hybrid, q4, and q8 models."""
+    config_hybrid = ServerConfig.from_env({ZEROTTS_GGUF_MODEL: "q4_hybrid"})
+    assert config_hybrid.zerotts_gguf_model == ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+
+    config_q4 = ServerConfig.from_env({ZEROTTS_GGUF_MODEL: "q4"})
+    assert config_q4.zerotts_gguf_model == ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+
+    config_q8 = ServerConfig.from_env({ZEROTTS_GGUF_MODEL: "q8"})
+    assert config_q8.zerotts_gguf_model == ZeroTtsFile.Q8_0_GGUF_MODEL
+
+
+def test_server_config_zerotts_gguf_model_invalid() -> None:
+    """Test server config rejects unsupported ZeroTTS GGUF model names."""
+    with pytest.raises(ValueError, match=r"ZEROTTS_GGUF_MODEL is invalid: 'missing\.gguf'"):
+        ServerConfig.from_env({ZEROTTS_GGUF_MODEL: "missing.gguf"})
+
+
+def test_server_config_zerotts_gguf_model_absolute_path() -> None:
+    """Test server config accepts valid absolute path for custom model."""
+    config = ServerConfig.from_env({ZEROTTS_GGUF_MODEL: "/models/custom.gguf"})
+    assert config.zerotts_gguf_model == "/models/custom.gguf"

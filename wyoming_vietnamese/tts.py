@@ -40,6 +40,7 @@ from .const import (
     NGHITTS_REPO_URL,
     PROGRAM_NAME,
     VIETNAMESE_LANGUAGE,
+    ZEROTTS_GGUF_MODEL,
     ZEROTTS_REPO_URL,
     NghiTtsAudio,
     NghiTtsFile,
@@ -48,8 +49,8 @@ from .const import (
     TtsEngine,
     TtsProvider,
     TtsSilenceMs,
-    ZeroTtsDirectory,
     ZeroTtsFile,
+    ZeroTtsVariant,
 )
 from .cpu import resolve_cpu_threads
 from .inference import run_inference
@@ -57,9 +58,13 @@ from .protocol import ProtocolWriteError, SafeAsyncEventHandler, is_vietnamese_l
 from .tts_model import (
     DEFAULT_NGHITTS_VOICE,
     NGHITTS_VOICES_BY_ID,
+    ZEROTTS_EDGE_VARIANTS,
     ZEROTTS_VOICES_BY_ID,
     NghiTtsVoiceSpec,
+    ZeroTtsModelResolution,
     ZeroTtsVoiceSpec,
+    resolve_zerotts_cpu_variant,
+    resolve_zerotts_model,
 )
 from .voice_usage import RecentVoiceStore
 
@@ -2008,16 +2013,50 @@ def initialize_zerotts(
     num_threads: int = 0,
     custom_lib_path: Path | None = None,
     gguf_path: Path | None = None,
+    *,
+    cpu_variant: str | ZeroTtsVariant | None = None,
+    resolution: ZeroTtsModelResolution | None = None,
 ) -> ZeroTtsGgmlEngine:
-    """Initialize ZeroTTS using default GGUF and runtime paths unless overridden."""
+    """Initialize ZeroTTS using default GGUF and runtime paths unless overridden.
+
+    Args:
+        model_dir: Directory where ZeroTTS models and subdirectories reside.
+        voices: Pinned voice configurations to prepare.
+        num_threads: Concurrency limit for native inference (0 for auto-tuning).
+        custom_lib_path: Optional override for the ZeroTTS native library.
+        gguf_path: Optional explicit path to the target GGUF model file.
+        cpu_variant: Optional explicit CPU variant for model selection.
+        resolution: Optional pre-resolved ZeroTTS model resolution carrying spec and path.
+
+    Returns:
+        Configured ZeroTtsGgmlEngine instance.
+    """
     from .zerotts_engine import ZeroTtsGgmlEngine
 
     threads = resolve_cpu_threads(num_threads)
-    actual_gguf_path = (
-        gguf_path
-        if gguf_path is not None
-        else model_dir / ZeroTtsDirectory.GGUF / ZeroTtsFile.DEFAULT_GGUF_MODEL
-    )
+    variant = resolve_zerotts_cpu_variant(cpu_variant)
+    if resolution is not None:
+        actual_gguf_path = resolution.gguf_path
+    elif gguf_path is not None:
+        actual_gguf_path = Path(gguf_path)
+    else:
+        env_model = os.environ.get(ZEROTTS_GGUF_MODEL, "").strip() or None
+        _, actual_gguf_path = resolve_zerotts_model(model_dir, env_model, cpu_variant=variant)
+    if variant in ZEROTTS_EDGE_VARIANTS:
+        if any(m in actual_gguf_path.name for m in ("q4", "hybrid")):
+            _LOGGER.info(
+                "Using optimized Q4-Hybrid model on edge processor (%s): %s",
+                variant,
+                actual_gguf_path.name,
+            )
+        else:
+            _LOGGER.info(
+                "Running Q8 model on edge processor (%s). Tip: set %s=%s for ~2x faster inference.",
+                variant,
+                ZEROTTS_GGUF_MODEL,
+                ZeroTtsFile.Q4_HYBRID_GGUF_MODEL,
+            )
+
     _LOGGER.info(
         "Initializing ZeroTTS GGML: voices=%s threads=%d gguf=%s",
         ", ".join(v.name for v in voices),

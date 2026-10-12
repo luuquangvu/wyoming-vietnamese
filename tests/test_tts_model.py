@@ -1,10 +1,15 @@
 """Checksum-pinned NghiTTS and ZeroTTS voice catalogue tests."""
 
+from pathlib import Path
+
 import pytest
 
 from wyoming_vietnamese.const import (
     NghiTtsFile,
     TtsEngine,
+    ZeroTtsDirectory,
+    ZeroTtsFile,
+    ZeroTtsVariant,
 )
 from wyoming_vietnamese.tts_model import (
     DEFAULT_NGHITTS_VOICE,
@@ -13,12 +18,42 @@ from wyoming_vietnamese.tts_model import (
     DEFAULT_ZEROTTS_VOICE_ID,
     NGHITTS_VOICES,
     NGHITTS_VOICES_BY_ID,
+    ZEROTTS_BASE_MODEL,
+    ZEROTTS_EDGE_VARIANTS,
     ZEROTTS_MODEL,
+    ZEROTTS_Q4_GGUF_ARTIFACT,
+    ZEROTTS_Q4_MODEL,
     ZEROTTS_VOICES,
     ZEROTTS_VOICES_BY_ID,
+    ZeroTtsModelSpec,
+    ZeroTtsVoiceSpec,
     get_voice,
     get_zerotts_voice,
+    normalize_zerotts_gguf_model,
+    reset_zerotts_cpu_variant,
+    resolve_zerotts_cpu_variant,
+    resolve_zerotts_model,
+    resolve_zerotts_model_spec,
 )
+
+
+def _assert_valid_sha256(digest: str) -> None:
+    """Assert that a string is a valid lowercase 64-character SHA-256 hex digest."""
+    assert len(digest) == 64
+    assert digest == digest.lower()
+    assert int(digest, 16) >= 0
+
+
+def _assert_valid_zerotts_voice(voice: ZeroTtsVoiceSpec) -> None:
+    """Assert basic validity invariants for a ZeroTTS voice specification."""
+    assert voice.id in ZEROTTS_VOICES_BY_ID
+    assert voice.name
+    assert voice.gender in {"nữ", "nam"}
+    assert voice.description
+    assert voice.artifacts == (voice.artifact,)
+    assert voice.artifact.remote_name == f"voices/{voice.id}/voice.npz"
+    assert voice.artifact.local_name == "voice.npz"
+    _assert_valid_sha256(voice.artifact.sha256)
 
 
 def test_voice_catalog_has_unique_valid_entries() -> None:
@@ -38,9 +73,7 @@ def test_voice_artifacts_are_fully_pinned() -> None:
         assert voice.model.remote_name == f"{voice.name}.onnx"
         assert voice.config.remote_name == f"{voice.name}.onnx.json"
         for artifact in voice.artifacts:
-            assert len(artifact.sha256) == 64
-            assert artifact.sha256 == artifact.sha256.lower()
-            assert int(artifact.sha256, 16) >= 0
+            _assert_valid_sha256(artifact.sha256)
 
 
 def test_get_voice_resolves_default_and_rejects_unknown_id() -> None:
@@ -59,16 +92,7 @@ def test_zerotts_voice_catalog() -> None:
     assert DEFAULT_NGHITTS_VOICE_ID == "ngoc-huyen-moi"
 
     for voice in ZEROTTS_VOICES:
-        assert voice.id in ZEROTTS_VOICES_BY_ID
-        assert voice.name
-        assert voice.gender in {"nữ", "nam"}
-        assert voice.description
-        assert voice.artifacts == (voice.artifact,)
-        assert voice.artifact.remote_name == f"voices/{voice.id}/voice.npz"
-        assert voice.artifact.local_name == "voice.npz"
-        assert len(voice.artifact.sha256) == 64
-        assert voice.artifact.sha256 == voice.artifact.sha256.lower()
-        assert int(voice.artifact.sha256, 16) >= 0
+        _assert_valid_zerotts_voice(voice)
 
     mai_chi = get_zerotts_voice("maichi")
     assert mai_chi.name == "Mai Chi"
@@ -102,6 +126,173 @@ def test_zerotts_model_specification_is_fully_pinned() -> None:
     for artifact in ZEROTTS_MODEL.artifacts:
         assert artifact.remote_name
         assert artifact.local_name
-        assert len(artifact.sha256) == 64
-        assert artifact.sha256 == artifact.sha256.lower()
-        assert int(artifact.sha256, 16) >= 0
+        _assert_valid_sha256(artifact.sha256)
+
+
+def test_zerotts_q4_model_spec_and_resolution() -> None:
+    """Test the Q4 ZeroTTS model spec artifact and resolver."""
+    assert ZEROTTS_Q4_MODEL.repo == "zeroweight-ai/ZeroTTS-GGUF"
+    assert ZEROTTS_Q4_GGUF_ARTIFACT.remote_name == f"gguf/{ZeroTtsFile.DEFAULT_GGUF_MODEL}"
+    assert ZEROTTS_Q4_GGUF_ARTIFACT.local_name == f"gguf/{ZeroTtsFile.Q4_HYBRID_GGUF_MODEL}"
+    _assert_valid_sha256(ZEROTTS_Q4_GGUF_ARTIFACT.sha256)
+
+    assert resolve_zerotts_model_spec("q8_0") is ZEROTTS_MODEL
+    assert resolve_zerotts_model_spec("zerotts-q8_0.gguf") is ZEROTTS_MODEL
+    assert resolve_zerotts_model_spec("q4_hybrid") is ZEROTTS_Q4_MODEL
+    assert resolve_zerotts_model_spec("zerotts-q4-hybrid.gguf") is ZEROTTS_Q4_MODEL
+    assert resolve_zerotts_model_spec("q4") is ZEROTTS_Q4_MODEL
+    assert resolve_zerotts_model_spec(None, cpu_variant=ZeroTtsVariant.AVX2) is ZEROTTS_MODEL
+    assert resolve_zerotts_model_spec(None, cpu_variant=ZeroTtsVariant.COMPAT) is ZEROTTS_Q4_MODEL
+    assert resolve_zerotts_model_spec("auto", cpu_variant=ZeroTtsVariant.AVX2) is ZEROTTS_MODEL
+    assert resolve_zerotts_model_spec("auto", cpu_variant=ZeroTtsVariant.AVX) is ZEROTTS_Q4_MODEL
+    assert resolve_zerotts_model_spec("auto", cpu_variant=ZeroTtsVariant.COMPAT) is ZEROTTS_Q4_MODEL
+    assert (
+        frozenset({ZeroTtsVariant.AVX, ZeroTtsVariant.SSE4, ZeroTtsVariant.COMPAT})
+        == ZEROTTS_EDGE_VARIANTS
+    )
+    assert resolve_zerotts_model_spec("/custom/path.gguf") is ZEROTTS_BASE_MODEL
+    assert ZEROTTS_BASE_MODEL.gguf_model is None
+    assert all("gguf" not in p for p in ZEROTTS_BASE_MODEL.allow_patterns)
+
+
+def test_resolve_zerotts_model_centralized(tmp_path: Path) -> None:
+    """Test resolve_zerotts_model resolves spec and local GGUF path across edge and desktop CPUs."""
+    gguf_dir = tmp_path / ZeroTtsDirectory.GGUF
+    gguf_dir.mkdir(parents=True, exist_ok=True)
+    q8_path = gguf_dir / ZeroTtsFile.DEFAULT_GGUF_MODEL
+    q4_path = gguf_dir / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+
+    # Explicit custom absolute path
+    custom_path = tmp_path / "custom.gguf"
+    res_custom = resolve_zerotts_model(tmp_path, custom_path)
+    assert res_custom.spec is ZEROTTS_BASE_MODEL
+    assert res_custom.gguf_path == custom_path
+
+    # Explicit aliases
+    res_q4 = resolve_zerotts_model(tmp_path, "q4_hybrid")
+    assert res_q4.spec is ZEROTTS_Q4_MODEL
+    assert res_q4.gguf_path == q4_path
+
+    res_q8 = resolve_zerotts_model(tmp_path, "q8_0")
+    assert res_q8.spec is ZEROTTS_MODEL
+    assert res_q8.gguf_path == q8_path
+
+    # Auto on edge CPU (SSE4 and AVX)
+    res_auto_edge = resolve_zerotts_model(tmp_path, "auto", cpu_variant=ZeroTtsVariant.SSE4)
+    assert res_auto_edge.spec is ZEROTTS_Q4_MODEL
+    assert res_auto_edge.gguf_path == q4_path
+
+    res_auto_avx = resolve_zerotts_model(tmp_path, "auto", cpu_variant=ZeroTtsVariant.AVX)
+    assert res_auto_avx.spec is ZEROTTS_Q4_MODEL
+    assert res_auto_avx.gguf_path == q4_path
+
+    # Auto on AVX2 CPU
+    res_auto_avx2 = resolve_zerotts_model(tmp_path, "auto", cpu_variant=ZeroTtsVariant.AVX2)
+    assert res_auto_avx2.spec is ZEROTTS_MODEL
+    assert res_auto_avx2.gguf_path == q8_path
+
+    # Auto edge CPU with fallback when Q4 missing and Q8 present
+    q8_path.write_bytes(b"q8_data")
+    res_fallback_edge = resolve_zerotts_model(tmp_path, "auto", cpu_variant=ZeroTtsVariant.SSE4)
+    assert res_fallback_edge.spec is ZEROTTS_MODEL
+    assert res_fallback_edge.gguf_path == q8_path
+
+    # Auto AVX2 CPU with fallback when Q8 missing and Q4 present
+    q8_path.unlink()
+    q4_path.write_bytes(b"q4_data")
+    res_fallback_avx2 = resolve_zerotts_model(tmp_path, "auto", cpu_variant=ZeroTtsVariant.AVX2)
+    assert res_fallback_avx2.spec is ZEROTTS_Q4_MODEL
+    assert res_fallback_avx2.gguf_path == q4_path
+
+    # Explicit selection does not fall back even if the chosen model file is missing
+    res_explicit_q8_missing = resolve_zerotts_model(tmp_path, "q8_0")
+    assert res_explicit_q8_missing.spec is ZEROTTS_MODEL
+    assert res_explicit_q8_missing.gguf_path == q8_path
+
+    q8_path.write_bytes(b"q8_data")
+    q4_path.unlink()
+    res_explicit_q4_missing = resolve_zerotts_model(tmp_path, "q4_hybrid")
+    assert res_explicit_q4_missing.spec is ZEROTTS_Q4_MODEL
+    assert res_explicit_q4_missing.gguf_path == q4_path
+
+
+def test_normalize_zerotts_gguf_model_path_validation(tmp_path: Path) -> None:
+    """Test normalize_zerotts_gguf_model validates absolute path extension and type."""
+    from wyoming_vietnamese.tts_model import normalize_zerotts_gguf_model
+
+    nonexistent_path = tmp_path / "nonexistent.gguf"
+    assert normalize_zerotts_gguf_model(str(nonexistent_path)) == str(nonexistent_path)
+
+    existing_path = tmp_path / "existing.gguf"
+    existing_path.write_bytes(b"GGUF_TEST_DATA")
+    assert normalize_zerotts_gguf_model(str(existing_path)) == str(existing_path)
+
+    with pytest.raises(ValueError, match=r"must have a '\.gguf' file extension"):
+        normalize_zerotts_gguf_model(str(tmp_path / "model.bin"))
+
+    with pytest.raises(ValueError, match=r"must have a '\.gguf' file extension"):
+        normalize_zerotts_gguf_model(str(tmp_path / "model"))
+
+    dir_path = tmp_path / "model_dir.gguf"
+    dir_path.mkdir()
+    with pytest.raises(ValueError, match="cannot be a directory"):
+        normalize_zerotts_gguf_model(str(dir_path))
+
+
+def test_call_spec_resolver_does_not_swallow_internal_type_error() -> None:
+    """Test call_spec_resolver propagates TypeError raised from within the resolver itself."""
+    from wyoming_vietnamese.tts_model import call_spec_resolver
+
+    def faulty_resolver(model_name: str | None, *, cpu_variant: object = None) -> ZeroTtsModelSpec:
+        raise TypeError("internal type error within resolver body")
+
+    with pytest.raises(TypeError, match="internal type error within resolver body"):
+        call_spec_resolver(faulty_resolver, "test")
+
+
+def test_resolve_zerotts_cpu_variant_memoization(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test resolve_zerotts_cpu_variant centralizes CPU detection and memoizes result."""
+    reset_zerotts_cpu_variant()
+    call_count = 0
+
+    def mock_detect() -> str:
+        nonlocal call_count
+        call_count += 1
+        return ZeroTtsVariant.AVX2
+
+    monkeypatch.setattr("wyoming_vietnamese.tts_model.detect_cpu_variant", mock_detect)
+
+    # First call detects host variant
+    var1 = resolve_zerotts_cpu_variant()
+    assert var1 == ZeroTtsVariant.AVX2
+    assert call_count == 1
+
+    # Second call returns memoized result without calling detect_cpu_variant again
+    var2 = resolve_zerotts_cpu_variant()
+    assert var2 == ZeroTtsVariant.AVX2
+    assert call_count == 1
+
+    # Explicit override uses provided variant without modifying memoized value
+    override = resolve_zerotts_cpu_variant(ZeroTtsVariant.SSE4)
+    assert override == ZeroTtsVariant.SSE4
+    assert call_count == 1
+
+    # Reset allows re-detection
+    reset_zerotts_cpu_variant()
+    var3 = resolve_zerotts_cpu_variant()
+    assert var3 == ZeroTtsVariant.AVX2
+    assert call_count == 2
+    reset_zerotts_cpu_variant()
+
+
+def test_normalize_zerotts_gguf_model_preserve_auto() -> None:
+    """Test normalize_zerotts_gguf_model preserves auto and default when preserve_auto is True."""
+    assert normalize_zerotts_gguf_model("auto", preserve_auto=True) == "auto"
+    assert normalize_zerotts_gguf_model("default", preserve_auto=True) == "auto"
+    assert normalize_zerotts_gguf_model("  AUTO  ", preserve_auto=True) == "auto"
+    assert (
+        normalize_zerotts_gguf_model("q4_hybrid", preserve_auto=True)
+        == ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+    )
+    assert normalize_zerotts_gguf_model("q8_0", preserve_auto=True) == ZeroTtsFile.Q8_0_GGUF_MODEL
+    assert normalize_zerotts_gguf_model(None, preserve_auto=True) is None

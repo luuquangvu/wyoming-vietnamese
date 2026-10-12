@@ -5,11 +5,13 @@ from __future__ import annotations
 import errno
 import json
 import os
+import struct
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 
 from wyoming_vietnamese import download as download_module
@@ -24,8 +26,16 @@ from wyoming_vietnamese.const import (
     TtsEngine,
     ZeroTtsDirectory,
     ZeroTtsFile,
+    ZeroTtsVariant,
 )
 from wyoming_vietnamese.download import (
+    GGML_TYPE_F16,
+    GGML_TYPE_F32,
+    GGML_TYPE_Q4_0,
+    GGML_TYPE_Q8_0,
+    GGUF_MAGIC,
+    GGUF_VERSION,
+    ModelDownloadResult,
     _copy_or_link,
     _download_verified_file,
     _encode_onnx_metadata,
@@ -40,7 +50,10 @@ from wyoming_vietnamese.download import (
     _structure_zerotts_files,
     _sync_nghitts_model,
     _sync_repo,
+    convert_zerotts_q8_to_q4_hybrid,
     download_models,
+    is_ffn_tensor,
+    quantize_row_q8_0_to_q4_0,
     setup_hf_environment,
 )
 from wyoming_vietnamese.stt_model import (
@@ -59,6 +72,7 @@ from wyoming_vietnamese.tts_model import (
     ZeroTtsModelSpec,
     ZeroTtsVoiceSpec,
     get_voice,
+    resolve_zerotts_model,
 )
 
 
@@ -761,6 +775,10 @@ def test_download_models_structures_zerotts_quality_mode(
     sync = Mock(side_effect=[stt, tts_snapshot])
     monkeypatch.setattr("wyoming_vietnamese.download._sync_repo", sync)
     monkeypatch.setattr("wyoming_vietnamese.download.setup_hf_environment", Mock())
+    monkeypatch.setattr(
+        "wyoming_vietnamese.tts_model.detect_cpu_variant",
+        lambda: ZeroTtsVariant.AVX2,
+    )
 
     paths = download_models(
         tmp_path / "cache",
@@ -782,6 +800,269 @@ def test_download_models_structures_zerotts_quality_mode(
     assert sync.call_args_list[1].args[0] == ZEROTTS_REPO_ID
     assert sync.call_args_list[1].kwargs["revision"] == tts_spec.revision
     assert sync.call_args_list[1].kwargs["allow_patterns"] == tts_spec.allow_patterns
+
+
+def _make_hybrid_model_spec(base_spec: ZeroTtsModelSpec, sha256_digest: str) -> ZeroTtsModelSpec:
+    """Create a hybrid ZeroTtsModelSpec from a base spec and custom sha256."""
+    return ZeroTtsModelSpec(
+        repo=base_spec.repo,
+        revision=base_spec.revision,
+        config=base_spec.config,
+        tokenizer=base_spec.tokenizer,
+        null_voice_emb=base_spec.null_voice_emb,
+        gguf_model=ZeroTtsArtifact(
+            f"gguf/{ZeroTtsFile.Q4_HYBRID_GGUF_MODEL}",
+            f"gguf/{ZeroTtsFile.Q4_HYBRID_GGUF_MODEL}",
+            sha256_digest,
+        ),
+        codec_files=base_spec.codec_files,
+    )
+
+
+def _make_spec_without_gguf(base_spec: ZeroTtsModelSpec) -> ZeroTtsModelSpec:
+    """Create a ZeroTtsModelSpec without a gguf_model artifact."""
+    return ZeroTtsModelSpec(
+        repo=base_spec.repo,
+        revision=base_spec.revision,
+        config=base_spec.config,
+        tokenizer=base_spec.tokenizer,
+        null_voice_emb=base_spec.null_voice_emb,
+        gguf_model=None,
+        codec_files=base_spec.codec_files,
+    )
+
+
+def _setup_zerotts_download_test(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path, ZeroTtsModelSpec, ZeroTtsVoiceSpec]:
+    """Prepare STT and ZeroTTS snapshot directories and pinned models."""
+    stt = tmp_path / "stt-snapshot"
+    spec = _make_stt_snapshot(stt)
+    _pin_stt_model(monkeypatch, spec)
+    tts_snapshot = tmp_path / "zerotts-snapshot"
+    tts_spec, test_voice = _make_zerotts_snapshot(tts_snapshot)
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_VOICES", (test_voice,))
+    return stt, tts_snapshot, tts_spec, test_voice
+
+
+def _write_q4_hybrid_snapshot_artifact(
+    tts_snapshot: Path, tts_spec: ZeroTtsModelSpec, content: bytes = b"GGUF_Q4_TEST_BYTES"
+) -> ZeroTtsModelSpec:
+    """Write Q4-Hybrid model to snapshot and return the corresponding spec."""
+    gguf_dir = tts_snapshot / ZeroTtsDirectory.GGUF
+    (gguf_dir / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL).write_bytes(content)
+    return _make_hybrid_model_spec(tts_spec, sha256(content).hexdigest())
+
+
+def _execute_zerotts_download(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stt: Path,
+    tts_snapshot: Path,
+    test_voice: ZeroTtsVoiceSpec,
+    *,
+    zerotts_quant: str = "auto",
+) -> tuple[ModelDownloadResult, Mock]:
+    """Execute download_models for ZeroTTS and return result paths and sync mock."""
+    sync = Mock(side_effect=[stt, tts_snapshot])
+    monkeypatch.setattr("wyoming_vietnamese.download._sync_repo", sync)
+    monkeypatch.setattr("wyoming_vietnamese.download.setup_hf_environment", Mock())
+    paths = download_models(
+        tmp_path / "cache",
+        tmp_path / "models",
+        (test_voice,),
+        tts_engine=TtsEngine.ZEROTTS,
+        zerotts_quant=zerotts_quant,
+    )
+    return paths, sync
+
+
+def test_download_models_structures_zerotts_q4_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test download structures ZeroTTS Q4 quantized GGUF weights when requested."""
+    stt, tts_snapshot, tts_spec, test_voice = _setup_zerotts_download_test(tmp_path, monkeypatch)
+    q4_spec = _write_q4_hybrid_snapshot_artifact(tts_snapshot, tts_spec)
+    monkeypatch.setattr(
+        "wyoming_vietnamese.download.resolve_zerotts_model_spec",
+        lambda quant: q4_spec if quant and ("q4" in quant or "hybrid" in quant) else tts_spec,
+    )
+    paths, sync = _execute_zerotts_download(
+        tmp_path, monkeypatch, stt, tts_snapshot, test_voice, zerotts_quant="q4_hybrid"
+    )
+
+    assert paths[TTS_DIR] == tmp_path / "models" / TTS_DIR / TtsEngine.ZEROTTS
+    assert (paths[TTS_DIR] / ZeroTtsDirectory.GGUF / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL).is_file()
+    assert sync.call_count == 2
+    assert sync.call_args_list[1].kwargs["allow_patterns"] == q4_spec.allow_patterns
+    assert paths.zerotts_resolution is not None
+    assert paths.zerotts_resolution.spec == q4_spec
+    assert (
+        paths.zerotts_resolution.gguf_path
+        == paths[TTS_DIR] / ZeroTtsDirectory.GGUF / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+    )
+
+
+def test_download_models_structures_zerotts_q8_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test download structures ZeroTTS Q8 GGUF weights when explicitly requested."""
+    stt, tts_snapshot, tts_spec, test_voice = _setup_zerotts_download_test(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "wyoming_vietnamese.download.resolve_zerotts_model_spec",
+        lambda quant, **kw: tts_spec,
+    )
+    paths, sync = _execute_zerotts_download(
+        tmp_path, monkeypatch, stt, tts_snapshot, test_voice, zerotts_quant="q8_0"
+    )
+
+    assert paths[TTS_DIR] == tmp_path / "models" / TTS_DIR / TtsEngine.ZEROTTS
+    assert (paths[TTS_DIR] / ZeroTtsDirectory.GGUF / ZeroTtsFile.DEFAULT_GGUF_MODEL).is_file()
+    assert sync.call_count == 2
+    assert sync.call_args_list[1].kwargs["allow_patterns"] == tts_spec.allow_patterns
+    assert paths.zerotts_resolution is not None
+    assert paths.zerotts_resolution.spec == tts_spec
+    assert (
+        paths.zerotts_resolution.gguf_path
+        == paths[TTS_DIR] / ZeroTtsDirectory.GGUF / ZeroTtsFile.DEFAULT_GGUF_MODEL
+    )
+
+
+def test_download_models_structures_zerotts_auto_edge_processor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test download structures Q4-Hybrid model when auto is selected on edge CPU variants."""
+    stt, tts_snapshot, tts_spec, test_voice = _setup_zerotts_download_test(tmp_path, monkeypatch)
+    q4_spec = _write_q4_hybrid_snapshot_artifact(tts_snapshot, tts_spec)
+    monkeypatch.setattr(
+        "wyoming_vietnamese.download.resolve_zerotts_model_spec",
+        lambda quant, **kw: q4_spec if quant and ("q4" in quant or "hybrid" in quant) else tts_spec,
+    )
+    monkeypatch.setattr(
+        "wyoming_vietnamese.tts_model.detect_cpu_variant",
+        lambda: ZeroTtsVariant.SSE4,
+    )
+    paths, sync = _execute_zerotts_download(
+        tmp_path, monkeypatch, stt, tts_snapshot, test_voice, zerotts_quant="auto"
+    )
+
+    assert paths[TTS_DIR] == tmp_path / "models" / TTS_DIR / TtsEngine.ZEROTTS
+    assert (paths[TTS_DIR] / ZeroTtsDirectory.GGUF / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL).is_file()
+    assert sync.call_count == 2
+    assert sync.call_args_list[1].kwargs["allow_patterns"] == q4_spec.allow_patterns
+
+
+def test_download_models_structures_zerotts_auto_avx_ignores_existing_local_q8(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test download on AVX edge variant structures Q4-Hybrid ignoring existing local Q8 file."""
+    stt, tts_snapshot, tts_spec, test_voice = _setup_zerotts_download_test(tmp_path, monkeypatch)
+    q4_spec = _write_q4_hybrid_snapshot_artifact(tts_snapshot, tts_spec, b"GGUF_Q4_AVX_TEST_BYTES")
+    monkeypatch.setattr(
+        "wyoming_vietnamese.download.resolve_zerotts_model_spec",
+        lambda quant, **kw: q4_spec if quant and ("q4" in quant or "hybrid" in quant) else tts_spec,
+    )
+    monkeypatch.setattr(
+        "wyoming_vietnamese.tts_model.detect_cpu_variant",
+        lambda: ZeroTtsVariant.AVX,
+    )
+
+    dest_gguf_dir = tmp_path / "models" / TTS_DIR / TtsEngine.ZEROTTS / ZeroTtsDirectory.GGUF
+    dest_gguf_dir.mkdir(parents=True, exist_ok=True)
+    existing_q8 = dest_gguf_dir / ZeroTtsFile.DEFAULT_GGUF_MODEL
+    existing_q8.write_bytes(b"EXISTING_LOCAL_Q8_MODEL")
+
+    paths, sync = _execute_zerotts_download(
+        tmp_path, monkeypatch, stt, tts_snapshot, test_voice, zerotts_quant="auto"
+    )
+
+    assert paths[TTS_DIR] == tmp_path / "models" / TTS_DIR / TtsEngine.ZEROTTS
+    assert (paths[TTS_DIR] / ZeroTtsDirectory.GGUF / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL).is_file()
+    assert sync.call_count == 2
+    assert sync.call_args_list[1].kwargs["allow_patterns"] == q4_spec.allow_patterns
+
+
+def test_download_models_structures_zerotts_q4_converts_from_q8_when_hybrid_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test download converts Q8 weights to Q4-Hybrid when hybrid model is absent from snapshot."""
+    stt, tts_snapshot, tts_spec, test_voice = _setup_zerotts_download_test(tmp_path, monkeypatch)
+    converted_content = b"GGUF_CONVERTED_Q4_HYBRID_BYTES"
+    q4_spec = _make_hybrid_model_spec(tts_spec, sha256(converted_content).hexdigest())
+
+    monkeypatch.setattr(
+        "wyoming_vietnamese.download.resolve_zerotts_model_spec",
+        lambda quant, **kw: q4_spec,
+    )
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec)
+
+    def fake_convert(src: Path, dst: Path) -> Path:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(converted_content)
+        return dst
+
+    monkeypatch.setattr("wyoming_vietnamese.download.convert_zerotts_q8_to_q4_hybrid", fake_convert)
+
+    paths, _sync = _execute_zerotts_download(
+        tmp_path, monkeypatch, stt, tts_snapshot, test_voice, zerotts_quant="q4_hybrid"
+    )
+
+    dst_hybrid = paths[TTS_DIR] / ZeroTtsDirectory.GGUF / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+    assert dst_hybrid.is_file()
+    assert dst_hybrid.read_bytes() == converted_content
+
+
+def test_download_models_structures_zerotts_auto_higher_capability_processor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test download structures Q8 model when auto is selected on higher capability CPUs."""
+    stt, tts_snapshot, tts_spec, test_voice = _setup_zerotts_download_test(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "wyoming_vietnamese.download.resolve_zerotts_model_spec",
+        lambda quant, **kw: tts_spec,
+    )
+    monkeypatch.setattr(
+        "wyoming_vietnamese.tts_model.detect_cpu_variant",
+        lambda: ZeroTtsVariant.AVX2,
+    )
+    paths, sync = _execute_zerotts_download(
+        tmp_path, monkeypatch, stt, tts_snapshot, test_voice, zerotts_quant="auto"
+    )
+
+    assert paths[TTS_DIR] == tmp_path / "models" / TTS_DIR / TtsEngine.ZEROTTS
+    assert (paths[TTS_DIR] / ZeroTtsDirectory.GGUF / ZeroTtsFile.DEFAULT_GGUF_MODEL).is_file()
+    assert sync.call_count == 2
+    assert sync.call_args_list[1].kwargs["allow_patterns"] == tts_spec.allow_patterns
+
+
+def test_download_models_zerotts_custom_absolute_path_skips_gguf_sync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test download_models with an absolute custom GGUF model skips downloading GGUF from HF."""
+    stt, tts_snapshot, tts_spec, test_voice = _setup_zerotts_download_test(tmp_path, monkeypatch)
+    custom_gguf = tmp_path / "external-custom.gguf"
+    custom_gguf.write_bytes(b"CUSTOM_GGUF_DATA")
+
+    base_spec = _make_spec_without_gguf(tts_spec)
+    monkeypatch.setattr(
+        "wyoming_vietnamese.download.resolve_zerotts_model_spec",
+        lambda quant, **kw: base_spec,
+    )
+    paths, sync = _execute_zerotts_download(
+        tmp_path, monkeypatch, stt, tts_snapshot, test_voice, zerotts_quant=str(custom_gguf)
+    )
+
+    assert paths[TTS_DIR] == tmp_path / "models" / TTS_DIR / TtsEngine.ZEROTTS
+    allow_patterns = sync.call_args_list[1].kwargs["allow_patterns"]
+    assert all("gguf" not in p for p in allow_patterns)
+    assert not (paths[TTS_DIR] / ZeroTtsDirectory.GGUF).exists()
+    assert not list(paths[TTS_DIR].rglob("*.gguf"))
+
+    resolution = resolve_zerotts_model(paths[TTS_DIR], str(custom_gguf))
+    assert resolution.gguf_path == custom_gguf
+    assert resolution.spec.gguf_model is None
+    assert custom_gguf.is_file()
+    assert custom_gguf.read_bytes() == b"CUSTOM_GGUF_DATA"
 
 
 def test_structure_zerotts_files_corrupted_destination_voice(
@@ -1075,3 +1356,532 @@ def test_download_models_structures_different_tts_engines_in_separate_directorie
     assert zerotts_paths[TTS_DIR] == models_dir / TTS_DIR / TtsEngine.ZEROTTS
     assert (nghitts_paths[TTS_DIR] / DEFAULT_NGHITTS_VOICE.id / NghiTtsFile.MODEL).is_file()
     assert (zerotts_paths[TTS_DIR] / "config.json").is_file()
+
+
+@pytest.mark.parametrize(
+    ("tensor_name", "expected"),
+    [
+        ("model.layers.0.mlp.down_proj.weight", True),
+        ("model.layers.0.ffn.up_proj.weight", True),
+        ("model.layers.0.ffn_up.weight", True),
+        ("model.layers.0.ffn_down.weight", True),
+        ("model.layers.0.ffn_gate.weight", True),
+        ("model.layers.0.fc1.weight", True),
+        ("model.layers.0.fc2.weight", True),
+        ("model.layers.0.w1.weight", True),
+        ("model.layers.0.w2.weight", True),
+        ("model.layers.0.w3.weight", True),
+        ("model.layers.0.mlp.norm.weight", False),
+        ("model.layers.0.mlp.bias", False),
+        ("model.embed_tokens.weight", False),
+        ("lm_head.weight", False),
+        ("model.text_encoder.ffn.weight", False),
+        ("model.layers.0.self_attn.q_proj.weight", False),
+        ("codebook.w1.weight", False),
+        ("flow.speaker_embed.w10.weight", False),
+        ("raw1_weight", False),
+        ("sw2_weight", False),
+        ("flow1_weight", False),
+    ],
+)
+def test_is_ffn_tensor_patterns(tensor_name: str, expected: bool) -> None:
+    """Test is_ffn_tensor correctly classifies weight tensors."""
+    assert is_ffn_tensor(tensor_name) is expected
+
+
+@pytest.mark.parametrize(
+    ("qs_values", "expected_scale_val", "expected_payload"),
+    [
+        (np.arange(1, 33, dtype=np.int8), None, None),
+        (np.zeros(32, dtype=np.int8), 0.0, b"\x88" * 16),
+        (np.array([8] * 16 + [-8] * 16, dtype=np.int8), -1.0, b"\xf0" * 16),
+    ],
+)
+def test_quantize_row_q8_0_to_q4_0_cases(
+    qs_values: np.ndarray,
+    expected_scale_val: float | None,
+    expected_payload: bytes | None,
+) -> None:
+    """Test quantize_row_q8_0_to_q4_0 produces expected bytes and scale payload."""
+    delta = np.float16(1.0).tobytes()
+    q8_bytes = delta + qs_values.tobytes()
+    q4_bytes = quantize_row_q8_0_to_q4_0(q8_bytes, 32)
+    assert len(q4_bytes) == 18
+    if expected_scale_val is not None and expected_payload is not None:
+        assert q4_bytes == np.float16(expected_scale_val).tobytes() + expected_payload
+
+
+def test_quantize_row_q8_0_to_q4_0_size_mismatch() -> None:
+    """Test quantize_row_q8_0_to_q4_0 raises ValueError on invalid elements or payloads."""
+    with pytest.raises(ValueError, match="Invalid n_elements: 0"):
+        quantize_row_q8_0_to_q4_0(b"\x00" * 34, 0)
+
+    with pytest.raises(ValueError, match="Invalid n_elements: -32"):
+        quantize_row_q8_0_to_q4_0(b"\x00" * 34, -32)
+
+    with pytest.raises(ValueError, match="Invalid n_elements: 33"):
+        quantize_row_q8_0_to_q4_0(b"\x00" * 34, 33)
+
+    with pytest.raises(ValueError, match="Unexpected Q8_0 size"):
+        quantize_row_q8_0_to_q4_0(b"\x00" * 20, 32)
+
+    with pytest.raises(ValueError, match="Unexpected Q8_0 size"):
+        quantize_row_q8_0_to_q4_0(b"\x00" * 50, 32)
+
+
+def _pack_tensor_meta(name: bytes, dims: tuple[int, ...], ttype: int, offset: int = 0) -> bytes:
+    """Pack GGUF tensor header metadata into bytes."""
+    header = struct.pack("<Q", len(name)) + name + struct.pack("<I", len(dims))
+    for d in dims:
+        header += struct.pack("<Q", d)
+    return header + struct.pack("<IQ", ttype, offset)
+
+
+def _write_synthetic_gguf(path: Path) -> None:
+    """Write a synthetic GGUF model exercising all KV and tensor parsing branches."""
+    with path.open("wb") as fout:
+        fout.write(struct.pack("<IIQQ", GGUF_MAGIC, GGUF_VERSION, 5, 8))
+
+        def write_kv(key: bytes, vtype: int, raw_bytes: bytes) -> None:
+            fout.write(struct.pack("<Q", len(key)) + key + struct.pack("<I", vtype) + raw_bytes)
+
+        write_kv(b"k0", 0, b"\x01")
+        write_kv(b"k1", 1, b"\x01")
+        write_kv(b"k2", 2, b"\x01\x00")
+        write_kv(b"k4", 4, b"\x01\x00\x00\x00")
+        write_kv(b"k10", 10, b"\x01\x00\x00\x00\x00\x00\x00\x00")
+        write_kv(b"k7", 7, b"\x01")
+        write_kv(b"k8", 8, struct.pack("<Q", 4) + b"test")
+        write_kv(b"k9", 9, struct.pack("<IQ", 4, 2) + b"\x01\x00\x00\x00\x02\x00\x00\x00")
+
+        tensors = (
+            (b"model.layers.0.mlp.weight", (32, 1), GGML_TYPE_Q8_0, 0),
+            (b"model.layers.0.self_attn.weight", (32, 1), GGML_TYPE_Q8_0, 64),
+            (b"model.layers.0.norm.weight", (32,), GGML_TYPE_F32, 128),
+            (b"model.layers.0.bias", (32,), GGML_TYPE_F16, 256),
+            (b"model.layers.0.existing_q4", (32,), GGML_TYPE_Q4_0, 320),
+        )
+        for name, dims, ttype, offset in tensors:
+            fout.write(_pack_tensor_meta(name, dims, ttype, offset))
+
+        header_len = fout.tell()
+        pad = (32 - (header_len % 32)) % 32
+        fout.write(b"\x00" * pad)
+
+        t0_data = np.float16(1.0).tobytes() + (b"\x01" * 32)
+        fout.write(t0_data + (b"\x00" * 30))
+
+        t1_data = np.float16(1.0).tobytes() + (b"\x02" * 32)
+        fout.write(t1_data + (b"\x00" * 30))
+
+        fout.write(b"\x00" * 128)
+        fout.write(b"\x00" * 64)
+        fout.write(b"\x00" * 18 + (b"\x00" * 14))
+
+
+def _inspect_gguf_tensors(
+    path: Path,
+) -> tuple[dict[str, tuple[int, int]], bytes, int]:
+    """Parse GGUF tensors and return metadata, mlp Q4 payload, and data start offset."""
+    with path.open("rb") as fin:
+        magic, version, n_tensors, n_kv = struct.unpack("<IIQQ", fin.read(24))
+        if magic != GGUF_MAGIC or version != GGUF_VERSION:
+            raise ValueError("Corrupt test GGUF file")
+
+        alignment = 32
+        for _ in range(n_kv):
+            k_len = struct.unpack("<Q", fin.read(8))[0]
+            k_name = fin.read(k_len).decode("utf-8", errors="replace")
+            vt = struct.unpack("<I", fin.read(4))[0]
+            if k_name == "general.alignment":
+                if vt in {4, 5}:
+                    fmt = "<I" if vt == 4 else "<i"
+                    alignment = struct.unpack(fmt, fin.read(4))[0]
+                elif vt == 10:
+                    alignment = struct.unpack("<Q", fin.read(8))[0]
+                else:
+                    fin.seek(4, 1)
+            elif vt in {0, 1, 7}:
+                fin.seek(1, 1)
+            elif vt in {2, 3}:
+                fin.seek(2, 1)
+            elif vt in {4, 5, 6}:
+                fin.seek(4, 1)
+            elif vt in {10, 11, 12}:
+                fin.seek(8, 1)
+            elif vt == 8:
+                s_len = struct.unpack("<Q", fin.read(8))[0]
+                fin.seek(s_len, 1)
+            elif vt == 9:
+                ayt, cnt = struct.unpack("<IQ", fin.read(12))
+                step = 4 if ayt in {4, 5, 6} else 8
+                fin.seek(step * cnt, 1)
+
+        tensors: dict[str, tuple[int, int]] = {}
+        for _ in range(n_tensors):
+            n_len = struct.unpack("<Q", fin.read(8))[0]
+            name = fin.read(n_len).decode("utf-8")
+            n_dims = struct.unpack("<I", fin.read(4))[0]
+            fin.seek(n_dims * 8, 1)
+            ttype, offset = struct.unpack("<IQ", fin.read(12))
+            tensors[name] = (ttype, offset)
+
+        header_end = fin.tell()
+        pad = (alignment - (header_end % alignment)) % alignment
+        data_start = header_end + pad
+
+        q4_payload = b""
+        if "model.layers.0.mlp.weight" in tensors:
+            mlp_offset = tensors["model.layers.0.mlp.weight"][1]
+            fin.seek(data_start + mlp_offset)
+            q4_payload = fin.read(18)
+        return tensors, q4_payload, data_start
+
+
+def test_convert_zerotts_q8_to_q4_hybrid_success(tmp_path: Path) -> None:
+    """Test convert_zerotts_q8_to_q4_hybrid converts GGUF tensors correctly."""
+    src = tmp_path / "model-q8_0.gguf"
+    dst = tmp_path / "model-q4-hybrid.gguf"
+    _write_synthetic_gguf(src)
+
+    result = convert_zerotts_q8_to_q4_hybrid(src, dst)
+    assert result == dst
+    assert dst.is_file()
+
+    tensors, q4_payload, data_start = _inspect_gguf_tensors(dst)
+    assert data_start % 32 == 0
+    assert len(tensors) == 5
+    assert tensors["model.layers.0.mlp.weight"][0] == GGML_TYPE_Q4_0
+    assert tensors["model.layers.0.self_attn.weight"][0] == GGML_TYPE_Q8_0
+    assert tensors["model.layers.0.norm.weight"][0] == GGML_TYPE_F32
+    assert tensors["model.layers.0.bias"][0] == GGML_TYPE_F16
+    assert tensors["model.layers.0.existing_q4"][0] == GGML_TYPE_Q4_0
+
+    assert len(q4_payload) == 18
+    expected_q4 = quantize_row_q8_0_to_q4_0(np.float16(1.0).tobytes() + (b"\x01" * 32), 32)
+    assert q4_payload == expected_q4
+
+
+def _write_gguf_with_alignment(path: Path, alignment_val: int, *, n_tensors: int = 0) -> None:
+    """Write a minimal GGUF model file with general.alignment metadata."""
+    with path.open("wb") as fout:
+        fout.write(struct.pack("<IIQQ", GGUF_MAGIC, GGUF_VERSION, n_tensors, 1))
+        align_key = b"general.alignment"
+        fout.write(
+            struct.pack("<Q", len(align_key))
+            + align_key
+            + struct.pack("<I", 4)
+            + struct.pack("<I", alignment_val)
+        )
+        if n_tensors > 0:
+            fout.write(_pack_tensor_meta(b"model.layers.0.mlp.weight", (32,), GGML_TYPE_Q8_0, 0))
+
+            header_len = fout.tell()
+            pad = (alignment_val - (header_len % alignment_val)) % alignment_val
+            fout.write(b"\x00" * pad)
+            fout.write(np.float16(1.0).tobytes() + (b"\x01" * 32) + (b"\x00" * 30))
+
+
+def test_convert_zerotts_q8_to_q4_hybrid_custom_alignment(tmp_path: Path) -> None:
+    """Test convert_zerotts_q8_to_q4_hybrid honors general.alignment metadata."""
+    src = tmp_path / "aligned-q8_0.gguf"
+    dst = tmp_path / "aligned-q4-hybrid.gguf"
+    _write_gguf_with_alignment(src, 64, n_tensors=1)
+
+    result = convert_zerotts_q8_to_q4_hybrid(src, dst)
+    assert result == dst
+    assert dst.is_file()
+
+    tensors, q4_payload, data_start = _inspect_gguf_tensors(dst)
+    assert data_start % 64 == 0
+    assert "model.layers.0.mlp.weight" in tensors
+    ttype, offset = tensors["model.layers.0.mlp.weight"]
+    assert ttype == GGML_TYPE_Q4_0
+    assert offset % 64 == 0
+    assert (data_start + offset) % 64 == 0
+
+    assert len(q4_payload) == 18
+    expected_q4 = quantize_row_q8_0_to_q4_0(np.float16(1.0).tobytes() + (b"\x01" * 32), 32)
+    assert q4_payload == expected_q4
+
+
+def _assert_convert_raises(tmp_path: Path, filename: str, content: bytes, error_match: str) -> None:
+    """Write invalid GGUF model content and assert convert raises matching ValueError."""
+    src = tmp_path / filename
+    src.write_bytes(content)
+    with pytest.raises(ValueError, match=error_match):
+        convert_zerotts_q8_to_q4_hybrid(src, tmp_path / "out.gguf")
+
+
+def test_convert_zerotts_q8_to_q4_hybrid_invalid_alignment(tmp_path: Path) -> None:
+    """Test convert_zerotts_q8_to_q4_hybrid rejects invalid alignment metadata."""
+    src = tmp_path / "bad-align.gguf"
+    _write_gguf_with_alignment(src, 33, n_tensors=0)
+    with pytest.raises(ValueError, match="Invalid GGUF alignment: 33"):
+        convert_zerotts_q8_to_q4_hybrid(src, tmp_path / "out.gguf")
+
+
+def test_convert_zerotts_q8_to_q4_hybrid_invalid_tensor_dims(tmp_path: Path) -> None:
+    """Test convert_zerotts_q8_to_q4_hybrid rejects invalid tensor dimensions."""
+    content = struct.pack("<IIQQ", GGUF_MAGIC, GGUF_VERSION, 1, 0) + _pack_tensor_meta(
+        b"bad_dim_tensor", (33,), GGML_TYPE_Q8_0, 0
+    )
+    _assert_convert_raises(tmp_path, "bad-dims.gguf", content, "must be a positive multiple of 32")
+
+
+def test_convert_zerotts_q8_to_q4_hybrid_invalid_magic(tmp_path: Path) -> None:
+    """Test convert_zerotts_q8_to_q4_hybrid rejects files with invalid magic."""
+    _assert_convert_raises(
+        tmp_path, "invalid.gguf", b"BAD_MAGIC_HEADER_1234567890123456", "Not a valid GGUF file"
+    )
+
+
+def test_convert_zerotts_q8_to_q4_hybrid_unknown_kv_type(tmp_path: Path) -> None:
+    """Test convert_zerotts_q8_to_q4_hybrid rejects unknown KV types."""
+    key = b"bad_key"
+    content = (
+        struct.pack("<IIQQ", GGUF_MAGIC, GGUF_VERSION, 0, 1)
+        + struct.pack("<Q", len(key))
+        + key
+        + struct.pack("<I", 999)
+    )
+    _assert_convert_raises(tmp_path, "bad_kv.gguf", content, "Unknown GGUF KV type 999")
+
+
+def test_convert_zerotts_q8_to_q4_hybrid_unsupported_tensor_type(tmp_path: Path) -> None:
+    """Test convert_zerotts_q8_to_q4_hybrid rejects unsupported tensor types."""
+    content = struct.pack("<IIQQ", GGUF_MAGIC, GGUF_VERSION, 1, 0) + _pack_tensor_meta(
+        b"bad_tensor", (32,), 999, 0
+    )
+    _assert_convert_raises(tmp_path, "bad_ttype.gguf", content, "Unsupported tensor type 999")
+
+
+def test_convert_zerotts_q8_to_q4_hybrid_file_not_found(tmp_path: Path) -> None:
+    """Test convert_zerotts_q8_to_q4_hybrid raises FileNotFoundError for missing input."""
+    src = tmp_path / "nonexistent.gguf"
+    dst = tmp_path / "out.gguf"
+    with pytest.raises(FileNotFoundError, match="Source GGUF model file not found"):
+        convert_zerotts_q8_to_q4_hybrid(src, dst)
+
+
+def test_convert_zerotts_q8_to_q4_hybrid_file_too_small(tmp_path: Path) -> None:
+    """Test convert_zerotts_q8_to_q4_hybrid rejects files smaller than GGUF header."""
+    _assert_convert_raises(
+        tmp_path, "tiny.gguf", b"short", "File too small to be a valid GGUF file"
+    )
+
+
+def test_convert_zerotts_q8_to_q4_hybrid_invalid_version(tmp_path: Path) -> None:
+    """Test convert_zerotts_q8_to_q4_hybrid rejects unsupported GGUF versions."""
+    content = struct.pack("<IIQQ", GGUF_MAGIC, 99, 0, 0)
+    _assert_convert_raises(tmp_path, "bad_ver.gguf", content, "Unsupported GGUF version: 99")
+
+
+def test_convert_zerotts_q8_to_q4_hybrid_excessive_dimensions(tmp_path: Path) -> None:
+    """Test convert_zerotts_q8_to_q4_hybrid rejects tensor dimension count > 8."""
+    t_name = b"high_dims"
+    content = (
+        struct.pack("<IIQQ", GGUF_MAGIC, GGUF_VERSION, 1, 0)
+        + struct.pack("<Q", len(t_name))
+        + t_name
+        + struct.pack("<I", 9)
+    )
+    _assert_convert_raises(
+        tmp_path, "bad_dims.gguf", content, "Invalid GGUF tensor dimension count: 9"
+    )
+
+
+def test_convert_zerotts_q8_to_q4_hybrid_payload_out_of_bounds(tmp_path: Path) -> None:
+    """Test convert_zerotts_q8_to_q4_hybrid rejects tensor payload extending past EOF."""
+    content = struct.pack("<IIQQ", GGUF_MAGIC, GGUF_VERSION, 1, 0) + _pack_tensor_meta(
+        b"model.layers.0.mlp.weight", (32,), GGML_TYPE_Q8_0, 0
+    )
+    _assert_convert_raises(tmp_path, "truncated.gguf", content, "payload extends beyond EOF")
+
+
+@pytest.mark.parametrize("scalar_type", [0, 2, 4, 10])
+def test_convert_zerotts_q8_to_q4_hybrid_truncated_kv_scalar(
+    tmp_path: Path, scalar_type: int
+) -> None:
+    """Test convert_zerotts_q8_to_q4_hybrid rejects truncated KV scalar values."""
+    key = b"dummy_key"
+    content = (
+        struct.pack("<IIQQ", GGUF_MAGIC, GGUF_VERSION, 0, 1)
+        + struct.pack("<Q", len(key))
+        + key
+        + struct.pack("<I", scalar_type)
+    )
+    _assert_convert_raises(
+        tmp_path,
+        f"truncated_scalar_{scalar_type}.gguf",
+        content,
+        "Truncated GGUF file reading scalar value",
+    )
+
+
+def test_convert_zerotts_q8_to_q4_hybrid_truncated_alignment(tmp_path: Path) -> None:
+    """Test convert_zerotts_q8_to_q4_hybrid rejects truncated alignment value."""
+    key = b"general.alignment"
+    content = (
+        struct.pack("<IIQQ", GGUF_MAGIC, GGUF_VERSION, 0, 1)
+        + struct.pack("<Q", len(key))
+        + key
+        + struct.pack("<I", 4)
+    )
+    _assert_convert_raises(
+        tmp_path, "truncated_align.gguf", content, "Truncated GGUF file reading alignment value"
+    )
+
+
+def test_convert_zerotts_q8_to_q4_hybrid_unsupported_alignment_type(tmp_path: Path) -> None:
+    """Test convert_zerotts_q8_to_q4_hybrid rejects unsupported alignment type."""
+    key = b"general.alignment"
+    content = (
+        struct.pack("<IIQQ", GGUF_MAGIC, GGUF_VERSION, 0, 1)
+        + struct.pack("<Q", len(key))
+        + key
+        + struct.pack("<I", 8)
+    )
+    _assert_convert_raises(
+        tmp_path, "bad_align_type.gguf", content, r"Unsupported type for general\.alignment"
+    )
+
+
+def test_convert_zerotts_q8_to_q4_hybrid_uint64_alignment(tmp_path: Path) -> None:
+    """Test convert_zerotts_q8_to_q4_hybrid supports uint64 general.alignment metadata."""
+    src = tmp_path / "u64_align.gguf"
+    with src.open("wb") as fout:
+        fout.write(struct.pack("<IIQQ", GGUF_MAGIC, GGUF_VERSION, 0, 1))
+        key = b"general.alignment"
+        fout.write(
+            struct.pack("<Q", len(key)) + key + struct.pack("<I", 10) + struct.pack("<Q", 64)
+        )
+    dst = tmp_path / "out.gguf"
+    convert_zerotts_q8_to_q4_hybrid(src, dst)
+    assert dst.is_file()
+
+
+def test_model_download_result_properties(tmp_path: Path) -> None:
+    """Test ModelDownloadResult exposes stt_dir, tts_dir, and zerotts_resolution."""
+    stt_dir = tmp_path / "stt"
+    tts_dir = tmp_path / "tts"
+    res = ModelDownloadResult(stt_dir, tts_dir, zerotts_resolution=None)
+    assert res.stt_dir == stt_dir
+    assert res.tts_dir == tts_dir
+    assert res.zerotts_resolution is None
+    assert res["stt"] == stt_dir
+    assert res["tts"] == tts_dir
+
+
+def _setup_structure_test_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path, ZeroTtsModelSpec, ZeroTtsVoiceSpec]:
+    """Prepare snapshot and destination directories for structure verification tests."""
+    snapshot_dir = tmp_path / "snapshot"
+    tts_spec, test_voice = _make_zerotts_snapshot(snapshot_dir)
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_VOICES", (test_voice,))
+    dest_dir = tmp_path / TTS_DIR
+    return snapshot_dir, dest_dir, tts_spec, test_voice
+
+
+def test_structure_zerotts_files_hybrid_already_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test _structure_zerotts_files reuses already verified hybrid GGUF file."""
+    snapshot_dir, dest_dir, tts_spec, test_voice = _setup_structure_test_dirs(tmp_path, monkeypatch)
+
+    hybrid_content = b"PRE_EXISTING_VERIFIED_HYBRID"
+    hybrid_dst = dest_dir / ZeroTtsDirectory.GGUF / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+    hybrid_dst.parent.mkdir(parents=True, exist_ok=True)
+    hybrid_dst.write_bytes(hybrid_content)
+
+    hybrid_model_spec = _make_hybrid_model_spec(tts_spec, sha256(hybrid_content).hexdigest())
+
+    copied = _structure_zerotts_files(
+        snapshot_dir,
+        dest_dir,
+        voices=(test_voice,),
+        zerotts_model=hybrid_model_spec,
+    )
+    assert hybrid_dst in copied
+
+
+def test_structure_zerotts_files_hybrid_converts_and_fails_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test _structure_zerotts_files raises RuntimeError if converted hybrid fails checksum."""
+    snapshot_dir, dest_dir, tts_spec, test_voice = _setup_structure_test_dirs(tmp_path, monkeypatch)
+
+    hybrid_model_spec = _make_hybrid_model_spec(tts_spec, "expected_sha256_that_will_not_match")
+
+    def dummy_convert(src: Path, dst: Path) -> Path:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(b"WRONG_CHECKSUM_DATA")
+        return dst
+
+    monkeypatch.setattr(
+        "wyoming_vietnamese.download.convert_zerotts_q8_to_q4_hybrid",
+        dummy_convert,
+    )
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec)
+
+    with pytest.raises(RuntimeError, match="does not match its recorded SHA-256 digest"):
+        _structure_zerotts_files(
+            snapshot_dir,
+            dest_dir,
+            voices=(test_voice,),
+            zerotts_model=hybrid_model_spec,
+        )
+
+
+def test_structure_zerotts_files_hybrid_missing_base_q8(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test _structure_zerotts_files raises RuntimeError when base Q8 artifact is missing."""
+    snapshot_dir, dest_dir, tts_spec, test_voice = _setup_structure_test_dirs(tmp_path, monkeypatch)
+
+    hybrid_model_spec = _make_hybrid_model_spec(tts_spec, "dummy_hash")
+    base_spec_without_gguf = _make_spec_without_gguf(tts_spec)
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", base_spec_without_gguf)
+
+    with pytest.raises(RuntimeError, match="Base ZeroTTS Q8 GGUF artifact is missing"):
+        _structure_zerotts_files(
+            snapshot_dir,
+            dest_dir,
+            voices=(test_voice,),
+            zerotts_model=hybrid_model_spec,
+        )
+
+
+def test_create_q4_hybrid_cli_tool(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test tools/create_q4_hybrid.py CLI commands."""
+    import importlib.util
+    import sys
+
+    tool_path = Path(__file__).resolve().parent.parent / "tools" / "create_q4_hybrid.py"
+    spec = importlib.util.spec_from_file_location("create_q4_hybrid", tool_path)
+    assert spec is not None
+    assert spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    src = tmp_path / "model-q8_0.gguf"
+    dst = tmp_path / "model-q4-hybrid.gguf"
+    _write_synthetic_gguf(src)
+
+    mod.print_q4_hybrid_summary(src, dst)
+
+    monkeypatch.setattr(
+        sys, "argv", ["create_q4_hybrid.py", "--input", str(tmp_path / "missing.gguf")]
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        mod.main()
+    assert exc_info.value.code == 1
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["create_q4_hybrid.py", "--input", str(src), "--output", str(dst)],
+    )
+    mod.main()
+    assert dst.is_file()
