@@ -838,6 +838,45 @@ def test_zerotts_engine_generation_stops_at_maximum_frames(tmp_path: Path) -> No
     assert fake_stream_decoder.close.called
 
 
+@pytest.mark.parametrize("num_codebooks", [1, 8])
+def test_zerotts_engine_queued_chunks_survive_buffer_reuse(
+    tmp_path: Path, num_codebooks: int
+) -> None:
+    """Test slow decoding preserves full and residual chunks after producer buffer reuse."""
+    engine, _, decoder, _ = _setup_engine_fixture(tmp_path)
+    engine.num_codebooks = num_codebooks
+    producer_finished = threading.Event()
+
+    def generate_frames(*, stop_event: threading.Event) -> Generator[np.ndarray]:
+        for frame_index in range(47):
+            if stop_event.is_set():
+                return
+            yield np.full(num_codebooks, frame_index, dtype=np.int32)
+        producer_finished.set()
+
+    def decode_chunk(codes: np.ndarray) -> np.ndarray:
+        # Hold the consumer until the producer has overwritten both full-size chunks.
+        assert producer_finished.wait(timeout=5)
+        assert codes.flags.c_contiguous
+        assert codes.flags.owndata
+        return np.zeros(960, dtype=np.float32)
+
+    decoder.decode_chunk.side_effect = decode_chunk
+    with patch.object(engine, "_generate_code_frames", side_effect=generate_frames):
+        list(engine.infer_stream("Xin chào Việt Nam", voice="Mai Chi"))
+
+    offset = 0
+    for decode_call, chunk_size in zip(
+        decoder.decode_chunk.call_args_list, (2, 4, 8, 16, 16, 1), strict=True
+    ):
+        expected = np.broadcast_to(
+            np.arange(offset, offset + chunk_size, dtype=np.int32), (1, num_codebooks, chunk_size)
+        )
+        np.testing.assert_array_equal(decode_call.args[0], expected)
+        offset += chunk_size
+    assert decoder.close.called
+
+
 def test_zerotts_engine_begin_failure(tmp_path: Path) -> None:
     """Test zerotts_begin non-zero return raises RuntimeError."""
     engine, fake_cdll, fake_stream_decoder, _ = _setup_engine_fixture(tmp_path)

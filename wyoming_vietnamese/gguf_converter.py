@@ -171,8 +171,9 @@ def quantize_row_q8_0_to_q5_0(q8_bytes: bytes, n_elements: int) -> bytes:
     qs = q8_arr[:, 2:].copy().view(dtype=np.int8)
 
     weights_f32 = qs.astype(np.float32) * deltas.astype(np.float32)
-    max_abs = np.max(np.abs(weights_f32), axis=1, keepdims=True)
-    d_q5 = np.where(max_abs > 0, max_abs / 16.0, 0.0).astype(np.float16)
+    max_indices = np.argmax(np.abs(weights_f32), axis=1, keepdims=True)
+    max_weights = np.take_along_axis(weights_f32, max_indices, axis=1)
+    d_q5 = np.where(max_weights != 0, max_weights / -16.0, 0.0).astype(np.float16)
     d_q5_f32 = d_q5.astype(np.float32)
     safe_d_q5 = np.where(d_q5_f32 != 0, d_q5_f32, 1.0)
     id_q5 = np.where(d_q5_f32 != 0, 1.0 / safe_d_q5, 0.0)

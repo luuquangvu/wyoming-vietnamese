@@ -1535,6 +1535,26 @@ def test_quantize_row_q8_0_to_q5_0_cases() -> None:
     assert 0 < qh < 0xFFFFFFFF
 
 
+@pytest.mark.parametrize("delta", [0.5, -0.5])
+def test_quantize_row_q8_0_to_q5_0_signed_extremes(delta: float) -> None:
+    """Test each block's dominant signed weight maps to code zero without clipping."""
+    weights = np.zeros((2, 32), dtype=np.int8)
+    weights[0, 0], weights[0, 31] = 16, -8
+    weights[1, 0], weights[1, 31] = 8, -16
+    q8_bytes = b"".join(np.float16(delta).tobytes() + block.tobytes() for block in weights)
+
+    packed = np.frombuffer(quantize_row_q8_0_to_q5_0(q8_bytes, 64), dtype=np.uint8).reshape(2, 22)
+    scales = packed[:, :2].copy().view(np.float16).ravel()
+    high_bits = np.unpackbits(packed[:, 2:6], axis=1, bitorder="little")
+    low_bits = np.concatenate((packed[:, 6:] & 0x0F, packed[:, 6:] >> 4), axis=1)
+    codes = low_bits | (high_bits << 4)
+    decoded = (codes.astype(np.float32) - 16) * scales[:, None]
+
+    np.testing.assert_array_equal(scales, [-delta, delta])
+    np.testing.assert_array_equal(codes[[0, 1], [0, 31]], [0, 0])
+    np.testing.assert_array_equal(decoded, weights.astype(np.float32) * delta)
+
+
 def test_quantize_row_q8_0_to_q5_0_size_mismatch() -> None:
     """Test quantize_row_q8_0_to_q5_0 raises ValueError on invalid elements or payloads."""
     with pytest.raises(ValueError, match="Invalid n_elements: 0"):

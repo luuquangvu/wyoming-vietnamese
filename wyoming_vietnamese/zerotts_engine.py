@@ -1121,14 +1121,14 @@ class ZeroTtsGgmlEngine:
                         chunk_buf[0, :, count] = frame
                         count += 1
                         if count >= target_chunk:
-                            chunk_slice = np.ascontiguousarray(chunk_buf[:, :, :count])
+                            chunk_slice = chunk_buf[:, :, :count].copy(order="C")
                             if not _enqueue(chunk_slice):
                                 return
                             count = 0
                             target_chunk = min(cap_chunk_target, target_chunk * 2)
 
                     if count > 0:
-                        chunk_slice = np.ascontiguousarray(chunk_buf[:, :, :count])
+                        chunk_slice = chunk_buf[:, :, :count].copy(order="C")
                         if not _enqueue(chunk_slice):
                             return
                     if not stop_event.is_set():
