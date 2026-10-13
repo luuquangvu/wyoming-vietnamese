@@ -133,8 +133,8 @@ def _log_startup_configuration(
         tts_provider_name.lower(),
         ", ".join(voice.name for voice in server_config.tts_voices),
     )
-    if server_config.tts_engine == TtsEngine.ZEROTTS and server_config.zerotts_gguf_model:
-        _LOGGER.info("ZeroTTS model selection: %s", server_config.zerotts_gguf_model)
+    if server_config.tts_engine == TtsEngine.ZEROTTS:
+        _LOGGER.info("ZeroTTS model: %s", server_config.zerotts_model)
     _LOGGER.info(
         "Transport limits: active_connections=%d event_timeout=%.1fs write_timeout=%.1fs "
         "stt_buffer_mb=%.1f",
@@ -166,25 +166,16 @@ def _initialize_configured_tts(
                 zerotts_voices,
                 cpu_threads,
                 resolution=zerotts_resolution,
-                pipelined=server_config.zerotts_pipelined,
             )
-        if server_config.zerotts_gguf_model is not None:
-            _, zerotts_gguf = resolve_zerotts_model(
-                tts_path,
-                server_config.zerotts_gguf_model,
-            )
-            return initialize_zerotts(
-                tts_path,
-                zerotts_voices,
-                cpu_threads,
-                gguf_path=zerotts_gguf,
-                pipelined=server_config.zerotts_pipelined,
-            )
+        _, zerotts_gguf = resolve_zerotts_model(
+            tts_path,
+            server_config.zerotts_model,
+        )
         return initialize_zerotts(
             tts_path,
             zerotts_voices,
             cpu_threads,
-            pipelined=server_config.zerotts_pipelined,
+            gguf_path=zerotts_gguf,
         )
     nghitts_voices = tuple(v for v in selected_voices if isinstance(v, NghiTtsVoiceSpec))
     configured_nghitts = (
@@ -375,7 +366,7 @@ def _download_configured_models(server_config: ServerConfig) -> ModelDownloadRes
         Structured mapping of downloaded model asset directories.
     """
     validate_tts_voices_for_engine(server_config.tts_voices, server_config.tts_engine)
-    if server_config.zerotts_gguf_model is not None:
+    if server_config.tts_engine == TtsEngine.ZEROTTS:
         return download_models(
             cache_dir=server_config.cache_dir,
             download_dir=server_config.download_dir,
@@ -383,7 +374,7 @@ def _download_configured_models(server_config: ServerConfig) -> ModelDownloadRes
             offline=server_config.offline,
             tts_engine=server_config.tts_engine,
             stt_engine=server_config.stt_engine,
-            zerotts_quant=server_config.zerotts_gguf_model,
+            zerotts_quant=server_config.zerotts_model,
         )
     return download_models(
         cache_dir=server_config.cache_dir,

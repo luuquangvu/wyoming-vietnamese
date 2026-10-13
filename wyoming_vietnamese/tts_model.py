@@ -17,7 +17,7 @@ from typing import Literal, NamedTuple, overload
 
 from .const import (
     DEFAULT_TTS_ENGINE,
-    DEFAULT_ZEROTTS_GGUF_MODEL,
+    DEFAULT_ZEROTTS_AUTO,
     ZEROTTS_REPO_ID,
     NghiTtsFile,
     TtsEngine,
@@ -246,6 +246,13 @@ class ZeroTtsModelSpec:
         return tuple(patterns)
 
 
+ZEROTTS_CODEC_INT8_SHA256 = "ffbe005ba6be6a96c3d2f0f4d372ab2c02ef409f38a27bf3f0ab7a3f4ee77103"
+ZEROTTS_CODEC_INT8_ARTIFACT = ZeroTtsArtifact(
+    f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}",
+    f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}",
+    ZEROTTS_CODEC_INT8_SHA256,
+)
+
 # Verified against the repository at the pinned commit on 2026-09-17.
 ZEROTTS_MODEL = ZeroTtsModelSpec(
     repo=ZEROTTS_REPO_ID,
@@ -291,6 +298,7 @@ ZEROTTS_MODEL = ZeroTtsModelSpec(
             "onnx/codec/moss_audio_tokenizer_decode_step.onnx",
             "9527c86a29e1837edec1f74db57d5eeaadb3a715af3382703566460afed25855",
         ),
+        ZEROTTS_CODEC_INT8_ARTIFACT,
     ),
 )
 
@@ -349,13 +357,65 @@ def reset_zerotts_cpu_variant() -> None:
     _ZEROTTS_CPU_CACHE = None
 
 
-def normalize_zerotts_gguf_model(
+def is_zerotts_edge_variant(cpu_variant: str | ZeroTtsVariant | None = None) -> bool:
+    """Return whether the resolved CPU variant is an edge processor class."""
+    return resolve_zerotts_cpu_variant(cpu_variant) in ZEROTTS_EDGE_VARIANTS
+
+
+def resolve_zerotts_codec_int8(
+    raw_value: str | bool | None = None,
+    *,
+    cpu_variant: str | ZeroTtsVariant | None = None,
+    model_name: str | None = None,
+) -> bool:
+    """Resolve whether ZeroTTS MOSS neural codec INT8 precision is enabled.
+
+    Args:
+        raw_value: Boolean override, string environment variable value, or None.
+        cpu_variant: Optional explicit CPU variant (e.g. 'sse4', 'avx2'). If None,
+            the host architecture is detected automatically.
+        model_name: Optional GGUF model identifier or filename hint. When raw_value
+            is unset or 'auto', Q4-Hybrid model targets automatically activate INT8
+            codec precision, while Q8_0 targets retain FP32 precision.
+
+    Returns:
+        True if INT8 codec precision should be used; False for FP32.
+
+    Raises:
+        ValueError: If raw_value is a string that cannot be parsed as a boolean or 'auto'.
+    """
+    if isinstance(raw_value, bool):
+        return raw_value
+    if raw_value is not None:
+        val = raw_value.strip().lower()
+        if val in {"true", "1", "yes", "on"}:
+            return True
+        if val in {"false", "0", "no", "off"}:
+            return False
+        if val not in {"auto", "default", ""}:
+            raise ValueError("codec_int8 must be one of true/false, 1/0, yes/no, on/off, or auto")
+    if model_name is not None:
+        name_lower = model_name.strip().lower()
+        if name_lower in (
+            "q4",
+            "q4_hybrid",
+            "q4-hybrid",
+            "hybrid",
+            ZeroTtsFile.Q4_HYBRID_GGUF_MODEL.lower(),
+        ):
+            return True
+        if name_lower in ("q8", "q8_0", ZeroTtsFile.Q8_0_GGUF_MODEL.lower()):
+            return False
+    return is_zerotts_edge_variant(cpu_variant)
+
+
+def normalize_zerotts_model(
     raw_value: str | None,
     *,
     cpu_variant: str | ZeroTtsVariant | None = None,
     preserve_auto: bool = False,
 ) -> str | None:
-    """Normalize and validate a ZeroTTS GGUF model identifier, alias, or path.
+    """Normalize and validate a ZeroTTS model identifier, alias, or path.
 
     Args:
         raw_value: Model name, alias ('q4', 'q4_hybrid', 'q8', 'q8_0'), 'auto',
@@ -380,8 +440,7 @@ def normalize_zerotts_gguf_model(
     if val_lower in ("auto", "default"):
         if preserve_auto:
             return "auto"
-        resolved_variant = resolve_zerotts_cpu_variant(cpu_variant)
-        is_edge = resolved_variant in ZEROTTS_EDGE_VARIANTS
+        is_edge = is_zerotts_edge_variant(cpu_variant)
         return ZeroTtsFile.Q4_HYBRID_GGUF_MODEL if is_edge else ZeroTtsFile.DEFAULT_GGUF_MODEL
     if val_lower in (
         "q4",
@@ -401,13 +460,13 @@ def normalize_zerotts_gguf_model(
     if path.is_absolute():
         if path.suffix.lower() != ".gguf":
             raise ValueError(
-                f"ZEROTTS_GGUF_MODEL absolute path must have a '.gguf' file extension: {val!r}"
+                f"ZEROTTS_MODEL absolute path must have a '.gguf' file extension: {val!r}"
             )
         if path.is_dir():
-            raise ValueError(f"ZEROTTS_GGUF_MODEL absolute path cannot be a directory: {val!r}")
+            raise ValueError(f"ZEROTTS_MODEL absolute path cannot be a directory: {val!r}")
         return str(path)
     raise ValueError(
-        f"ZEROTTS_GGUF_MODEL is invalid: {val!r}. "
+        f"ZEROTTS_MODEL is invalid: {val!r}. "
         f"Expected 'auto', 'q4_hybrid', 'q8_0', or a supported GGUF model filename."
     )
 
@@ -428,8 +487,8 @@ def resolve_zerotts_model_spec(
         ZeroTtsModelSpec matching the requested quantization, or ZEROTTS_BASE_MODEL
         for external custom model paths.
     """
-    effective_name = quant_type_or_filename or DEFAULT_ZEROTTS_GGUF_MODEL
-    normalized = normalize_zerotts_gguf_model(effective_name, cpu_variant=cpu_variant)
+    effective_name = quant_type_or_filename or DEFAULT_ZEROTTS_AUTO
+    normalized = normalize_zerotts_model(effective_name, cpu_variant=cpu_variant)
     if normalized is not None and Path(normalized).is_absolute():
         return ZEROTTS_BASE_MODEL
     return ZEROTTS_Q4_MODEL if normalized == ZeroTtsFile.Q4_HYBRID_GGUF_MODEL else ZEROTTS_MODEL

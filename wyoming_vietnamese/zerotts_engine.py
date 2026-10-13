@@ -23,13 +23,12 @@ from typing import TYPE_CHECKING, Final
 import numpy as np
 
 if TYPE_CHECKING:
+    import onnxruntime as ort
     from zerotts.codec import MossCodecDecoder, MossStreamingDecoder
 
-from .config import get_env_bool
 from .const import (
     ZEROTTS_CODEC_THREADS,
     ZEROTTS_GGML_THREADS,
-    ZEROTTS_PIPELINED,
     ZEROTTS_REPO_URL,
     ZEROTTS_SOURCE_COMMIT,
     ZeroTtsAudio,
@@ -40,7 +39,11 @@ from .cpu import (
     detect_cpu_variant,
     resolve_cpu_threads,
 )
-from .tts_model import ZEROTTS_VOICES_BY_ID, ZeroTtsVoiceSpec
+from .tts_model import (
+    ZEROTTS_VOICES_BY_ID,
+    ZeroTtsVoiceSpec,
+    resolve_zerotts_codec_int8,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -818,7 +821,7 @@ def _resolve_engine_options(
         Tuple of (total_threads, pipelined, ggml_threads, codec_threads).
     """
     total_threads = resolve_cpu_threads(num_threads)
-    effective_pipelined = get_env_bool(ZEROTTS_PIPELINED, True) if pipelined is None else pipelined
+    effective_pipelined = True if pipelined is None else pipelined
     is_pipelined = effective_pipelined and total_threads > 1
 
     ggml_thr, codec_thr = resolve_zerotts_thread_budget(
@@ -868,6 +871,7 @@ class ZeroTtsGgmlEngine:
         seed: int = 1234,
         codec_threads: int | None = None,
         pipelined: bool | None = None,
+        codec_int8: bool | None = None,
     ) -> None:
         """Initialize the ZeroTTS GGML engine from local weights and configurations.
 
@@ -880,6 +884,7 @@ class ZeroTtsGgmlEngine:
             seed: Default random generator seed for deterministic frame sampling.
             codec_threads: Optional CPU thread count for MOSS ONNX decoder.
             pipelined: Whether to overlap GGML frame synthesis and ONNX codec decoding.
+            codec_int8: Optional override for MOSS neural codec INT8 precision.
 
         Raises:
             ValueError: If no voice is configured.
@@ -902,6 +907,10 @@ class ZeroTtsGgmlEngine:
             num_threads=num_threads,
             pipelined=pipelined,
             codec_threads=codec_threads,
+        )
+        self.codec_int8: bool = resolve_zerotts_codec_int8(
+            codec_int8,
+            model_name=gguf_path.name,
         )
 
         self.model_dir: Path = model_dir
@@ -961,9 +970,58 @@ class ZeroTtsGgmlEngine:
         from zerotts.codec import MossCodecDecoder
 
         codec_dir = model_dir / "onnx" / "codec"
-        return MossCodecDecoder(
+        decoder = MossCodecDecoder(
             codec_dir,
             intra_op_num_threads=self.codec_threads,
+        )
+        if self.codec_int8:
+            int8_step_path = codec_dir / ZeroTtsFile.DECODE_STEP_INT8_ONNX
+            if int8_step_path.is_file():
+                if not hasattr(decoder, "_decode_step_sess"):
+                    _LOGGER.warning(
+                        "ZeroTTS INT8 codec binding unavailable; decoder missing _decode_step_sess",
+                    )
+                else:
+                    try:
+                        int8_sess = self._create_int8_decode_session(int8_step_path)
+                    except Exception as err:
+                        _LOGGER.warning(
+                            "Failed to create ZeroTTS INT8 decode session (%s); "
+                            "retaining FP32 decoding",
+                            err,
+                        )
+                    else:
+                        decoder._decode_step_sess = int8_sess
+                        _LOGGER.info(
+                            "ZeroTTS bound optimized INT8 neural codec: %s",
+                            int8_step_path.name,
+                        )
+            else:
+                _LOGGER.debug(
+                    "ZeroTTS INT8 codec enabled but %s not found; using FP32 baseline",
+                    int8_step_path,
+                )
+        return decoder
+
+    def _create_int8_decode_session(self, int8_step_path: Path) -> ort.InferenceSession:
+        """Create an ONNX Runtime inference session configured for INT8 decode step.
+
+        Args:
+            int8_step_path: Path to the quantized INT8 decode step ONNX model.
+
+        Returns:
+            Configured onnxruntime InferenceSession instance.
+        """
+        import onnxruntime as ort
+
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess_options.intra_op_num_threads = self.codec_threads
+        sess_options.inter_op_num_threads = 1
+        return ort.InferenceSession(
+            str(int8_step_path),
+            sess_options=sess_options,
+            providers=["CPUExecutionProvider"],
         )
 
     def _init_voices(self, voices: Sequence[ZeroTtsVoiceSpec]) -> None:
@@ -1096,7 +1154,7 @@ class ZeroTtsGgmlEngine:
 
     @staticmethod
     def _advance_tail_countdown(
-        tail_left: int, is_eoa: bool, extra_frames: int
+        tail_left: int, is_eoa: bool, extra_frames: int = 1
     ) -> tuple[int, bool]:
         """Advance the end-of-audio frame countdown.
 

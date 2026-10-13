@@ -20,7 +20,6 @@ import pytest
 from wyoming_vietnamese.const import (
     ZEROTTS_CODEC_THREADS,
     ZEROTTS_GGML_THREADS,
-    ZEROTTS_PIPELINED,
     ZEROTTS_SOURCE_COMMIT,
     TtsEngine,
     ZeroTtsAudio,
@@ -55,7 +54,6 @@ from wyoming_vietnamese.zerotts_engine import (
 @pytest.fixture(autouse=True)
 def _clear_zerotts_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Clear ambient ZeroTTS environment variables before test execution."""
-    monkeypatch.delenv(ZEROTTS_PIPELINED, raising=False)
     monkeypatch.delenv(ZEROTTS_CODEC_THREADS, raising=False)
     monkeypatch.delenv(ZEROTTS_GGML_THREADS, raising=False)
 
@@ -725,6 +723,7 @@ def _setup_engine_fixture(
     num_threads: int = 2,
     *,
     pipelined: bool | None = None,
+    codec_int8: bool | None = None,
 ) -> tuple[ZeroTtsGgmlEngine, MagicMock, MagicMock, Mock]:
     """Helper creating a test ZeroTtsGgmlEngine with mocked dependencies."""
     model_dir, gguf_path = _setup_mock_zerotts_assets(tmp_path)
@@ -765,6 +764,7 @@ def _setup_engine_fixture(
             voices=voices,
             num_threads=num_threads,
             pipelined=pipelined,
+            codec_int8=codec_int8,
         )
 
     return engine, fake_cdll, fake_stream_decoder, fake_tokenizer
@@ -2668,8 +2668,12 @@ def test_get_variant_build_flags_definitions_and_compiler_options() -> None:
     assert "-DGGML_AVX=OFF" in sse4_cmake
     assert "-DGGML_AVX2=OFF" in sse4_cmake
     assert "-DGGML_AVX512=OFF" in sse4_cmake
+    assert "-DGGML_OPENMP=ON" in sse4_cmake
+    assert any(flag.startswith("-DCMAKE_C_FLAGS=") for flag in sse4_cmake)
+    assert any(flag.startswith("-DCMAKE_CXX_FLAGS=") for flag in sse4_cmake)
     assert "-msse4.2" in sse4_gxx
     assert "-mpopcnt" in sse4_gxx
+    assert any("-O3" in flag for flag in sse4_cmake)
 
     # AVX
     avx_cmake, avx_gxx = _get_variant_build_flags(ZeroTtsVariant.AVX)
@@ -3463,36 +3467,28 @@ def test_zerotts_engine_dynamic_thread_allocation(tmp_path: Path) -> None:
         _setup_engine_fixture(tmp_path, num_threads=-1)
 
 
-def test_zerotts_engine_pipelining_env_and_explicit_override(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Test ZeroTtsGgmlEngine respects explicit pipelined argument and ZEROTTS_PIPELINED env var."""
+def test_zerotts_engine_pipelining_explicit_override(tmp_path: Path) -> None:
+    """Test ZeroTtsGgmlEngine respects explicit pipelined argument."""
 
     def _create_engine(*, pipelined: bool | None = None) -> ZeroTtsGgmlEngine:
         engine, _, _, _ = _setup_engine_fixture(tmp_path, num_threads=4, pipelined=pipelined)
         return engine
 
-    # Default is pipelined
+    # Default is pipelined (when total_threads > 1)
     engine_default = _create_engine()
     assert engine_default.pipelined is True
     assert engine_default.threads == 3
     assert engine_default.codec_threads == 1
 
-    # Override via env var ZEROTTS_PIPELINED=0
-    monkeypatch.setenv("ZEROTTS_PIPELINED", "0")
-    engine_env_off = _create_engine()
-    assert engine_env_off.pipelined is False
-    assert engine_env_off.threads == 4  # All 4 threads dedicated to GGML
-    assert engine_env_off.codec_threads == 2
+    # Explicit pipelined=False dedicates all threads to GGML
+    engine_off = _create_engine(pipelined=False)
+    assert engine_off.pipelined is False
+    assert engine_off.threads == 4
+    assert engine_off.codec_threads == 2
 
-    # Explicit pipelined=True overrides env var
-    engine_explicit_on = _create_engine(pipelined=True)
-    assert engine_explicit_on.pipelined is True
-
-    # Invalid ZEROTTS_PIPELINED raises ValueError
-    monkeypatch.setenv("ZEROTTS_PIPELINED", "invalid")
-    with pytest.raises(ValueError, match="ZEROTTS_PIPELINED must be one of"):
-        _create_engine()
+    # Explicit pipelined=True enables pipelining
+    engine_on = _create_engine(pipelined=True)
+    assert engine_on.pipelined is True
 
 
 def test_zerotts_engine_inplace_tensor_reuse_and_zero_copy_buffers(tmp_path: Path) -> None:
@@ -3602,3 +3598,317 @@ def test_resolve_zerotts_thread_budget_ggml_and_env(monkeypatch: pytest.MonkeyPa
         monkeypatch.setenv(ZEROTTS_GGML_THREADS, ggml_env)
         monkeypatch.setenv(ZEROTTS_CODEC_THREADS, codec_env)
         assert resolve_zerotts_thread_budget(4, pipelined=True) == (3, 1)
+
+
+def test_zerotts_engine_codec_int8_binding_and_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test _init_neural_codec binds INT8 ONNX session when present and falls back gracefully."""
+    model_dir, gguf_path = _setup_mock_zerotts_assets(tmp_path)
+    voices = (ZEROTTS_VOICES[0],)
+    fake_cdll = MagicMock()
+    fake_cdll.zerotts_init_from_file.return_value = 123456
+    dummy_hp = _ZeroTtsHParams(d_model=64, n_voice_queries=32, num_codebooks=8)
+    fake_cdll.zerotts_hparams_of.return_value = ctypes.pointer(dummy_hp)
+
+    fake_tokenizer = Mock(return_value=[1, 2, 3])
+    fake_decoder = MagicMock()
+    fake_decoder._decode_step_sess = "FP32_SESSION"
+    fake_codec_cls = Mock(return_value=fake_decoder)
+
+    # 1. codec_int8=False (default) leaves FP32 session alone
+    with (
+        patch("wyoming_vietnamese.zerotts_engine.resolve_zerotts_ggml_lib", return_value=fake_cdll),
+        patch("zerotts.tokenizer.load_tokenizer", return_value=fake_tokenizer),
+        patch("zerotts.codec.MossCodecDecoder", fake_codec_cls),
+    ):
+        engine_fp32 = ZeroTtsGgmlEngine(
+            model_dir=model_dir,
+            gguf_path=gguf_path,
+            voices=voices,
+            codec_int8=False,
+        )
+        assert engine_fp32._codec._decode_step_sess == "FP32_SESSION"
+
+    # 2. codec_int8=True when INT8 asset file exists replaces session
+    int8_path = model_dir / "onnx" / "codec" / ZeroTtsFile.DECODE_STEP_INT8_ONNX
+    int8_path.parent.mkdir(parents=True, exist_ok=True)
+    int8_path.write_bytes(b"INT8_DUMMY_ONNX")
+    fake_ort_session = MagicMock()
+
+    with (
+        patch("wyoming_vietnamese.zerotts_engine.resolve_zerotts_ggml_lib", return_value=fake_cdll),
+        patch("zerotts.tokenizer.load_tokenizer", return_value=fake_tokenizer),
+        patch("zerotts.codec.MossCodecDecoder", fake_codec_cls),
+        patch("onnxruntime.InferenceSession", return_value=fake_ort_session) as mock_ort,
+    ):
+        engine_int8 = ZeroTtsGgmlEngine(
+            model_dir=model_dir,
+            gguf_path=gguf_path,
+            voices=voices,
+            codec_int8=True,
+        )
+        assert engine_int8._codec._decode_step_sess is fake_ort_session
+        mock_ort.assert_called_once()
+        assert mock_ort.call_args[0][0] == str(int8_path)
+        assert mock_ort.call_args.kwargs["providers"] == ["CPUExecutionProvider"]
+        assert mock_ort.call_args.kwargs["sess_options"] is not None
+
+    # 3. codec_int8=True when INT8 asset is missing gracefully falls back to FP32
+    int8_path.unlink()
+    with (
+        patch("wyoming_vietnamese.zerotts_engine.resolve_zerotts_ggml_lib", return_value=fake_cdll),
+        patch("zerotts.tokenizer.load_tokenizer", return_value=fake_tokenizer),
+        patch("zerotts.codec.MossCodecDecoder", fake_codec_cls),
+    ):
+        fake_decoder._decode_step_sess = "FP32_FALLBACK_SESSION"
+        engine_missing = ZeroTtsGgmlEngine(
+            model_dir=model_dir,
+            gguf_path=gguf_path,
+            voices=voices,
+            codec_int8=True,
+        )
+        assert engine_missing._codec._decode_step_sess == "FP32_FALLBACK_SESSION"
+
+    # 4. codec_int8=True when session creation raises exception retains FP32 session
+    int8_path.write_bytes(b"INT8_CORRUPT_ONNX")
+    with (
+        patch("wyoming_vietnamese.zerotts_engine.resolve_zerotts_ggml_lib", return_value=fake_cdll),
+        patch("zerotts.tokenizer.load_tokenizer", return_value=fake_tokenizer),
+        patch("zerotts.codec.MossCodecDecoder", fake_codec_cls),
+        patch("onnxruntime.InferenceSession", side_effect=RuntimeError("Corrupt INT8 file")),
+    ):
+        fake_decoder._decode_step_sess = "FP32_RETAINED_ON_ERROR"
+        engine_fail = ZeroTtsGgmlEngine(
+            model_dir=model_dir,
+            gguf_path=gguf_path,
+            voices=voices,
+            codec_int8=True,
+        )
+        assert engine_fail._codec._decode_step_sess == "FP32_RETAINED_ON_ERROR"
+
+    # 5. codec_int8=True when decoder lacks _decode_step_sess attribute
+    fake_decoder_no_attr = MagicMock(spec=[])
+    fake_codec_cls_no_attr = Mock(return_value=fake_decoder_no_attr)
+    with (
+        patch("wyoming_vietnamese.zerotts_engine.resolve_zerotts_ggml_lib", return_value=fake_cdll),
+        patch("zerotts.tokenizer.load_tokenizer", return_value=fake_tokenizer),
+        patch("zerotts.codec.MossCodecDecoder", fake_codec_cls_no_attr),
+    ):
+        engine_no_attr = ZeroTtsGgmlEngine(
+            model_dir=model_dir,
+            gguf_path=gguf_path,
+            voices=voices,
+            codec_int8=True,
+        )
+        assert not hasattr(engine_no_attr._codec, "_decode_step_sess")
+
+
+def test_zerotts_engine_edge_env_variables(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test ZeroTtsGgmlEngine resolves codec_int8 via argument, model hint, and edge host CPU."""
+    model_dir, gguf_path = _setup_mock_zerotts_assets(tmp_path)
+    q4_path = model_dir / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+    q4_path.write_bytes(b"GGUF_Q4")
+    generic_path = model_dir / "custom.gguf"
+    generic_path.write_bytes(b"GGUF_CUSTOM")
+
+    voices = (ZEROTTS_VOICES[0],)
+    fake_cdll = MagicMock()
+    fake_cdll.zerotts_init_from_file.return_value = 123456
+    dummy_hp = _ZeroTtsHParams(d_model=64, n_voice_queries=32, num_codebooks=8)
+    fake_cdll.zerotts_hparams_of.return_value = ctypes.pointer(dummy_hp)
+
+    fake_tokenizer = Mock(return_value=[1, 2, 3])
+    fake_decoder = MagicMock()
+    fake_codec_cls = Mock(return_value=fake_decoder)
+
+    # 1. Explicit codec_int8=True argument
+    with (
+        patch("wyoming_vietnamese.zerotts_engine.resolve_zerotts_ggml_lib", return_value=fake_cdll),
+        patch("zerotts.tokenizer.load_tokenizer", return_value=fake_tokenizer),
+        patch("zerotts.codec.MossCodecDecoder", fake_codec_cls),
+    ):
+        engine_true = ZeroTtsGgmlEngine(
+            model_dir=model_dir,
+            gguf_path=gguf_path,
+            voices=voices,
+            codec_int8=True,
+        )
+        assert engine_true.codec_int8 is True
+
+    # 2. Explicit codec_int8=False argument
+    with (
+        patch("wyoming_vietnamese.zerotts_engine.resolve_zerotts_ggml_lib", return_value=fake_cdll),
+        patch("zerotts.tokenizer.load_tokenizer", return_value=fake_tokenizer),
+        patch("zerotts.codec.MossCodecDecoder", fake_codec_cls),
+    ):
+        engine_false = ZeroTtsGgmlEngine(
+            model_dir=model_dir,
+            gguf_path=q4_path,
+            voices=voices,
+            codec_int8=False,
+        )
+        assert engine_false.codec_int8 is False
+
+    # 3. Model hint auto-detection: Q4 activates INT8, Q8 retains FP32
+    with (
+        patch("wyoming_vietnamese.zerotts_engine.resolve_zerotts_ggml_lib", return_value=fake_cdll),
+        patch("zerotts.tokenizer.load_tokenizer", return_value=fake_tokenizer),
+        patch("zerotts.codec.MossCodecDecoder", fake_codec_cls),
+    ):
+        engine_q4 = ZeroTtsGgmlEngine(
+            model_dir=model_dir,
+            gguf_path=q4_path,
+            voices=voices,
+        )
+        assert engine_q4.codec_int8 is True
+
+        engine_q8 = ZeroTtsGgmlEngine(
+            model_dir=model_dir,
+            gguf_path=gguf_path,
+            voices=voices,
+        )
+        assert engine_q8.codec_int8 is False
+
+    # 4. Unset on edge CPU (SSE4) auto-enables INT8 for generic models
+    monkeypatch.setattr(
+        "wyoming_vietnamese.tts_model.detect_cpu_variant", lambda: ZeroTtsVariant.SSE4
+    )
+    with (
+        patch("wyoming_vietnamese.zerotts_engine.resolve_zerotts_ggml_lib", return_value=fake_cdll),
+        patch("zerotts.tokenizer.load_tokenizer", return_value=fake_tokenizer),
+        patch("zerotts.codec.MossCodecDecoder", fake_codec_cls),
+    ):
+        engine_edge = ZeroTtsGgmlEngine(
+            model_dir=model_dir,
+            gguf_path=generic_path,
+            voices=voices,
+        )
+        assert engine_edge.codec_int8 is True
+
+    # 5. Unset on desktop CPU (AVX2) leaves INT8 disabled for generic models
+    monkeypatch.setattr(
+        "wyoming_vietnamese.tts_model.detect_cpu_variant", lambda: ZeroTtsVariant.AVX2
+    )
+    with (
+        patch("wyoming_vietnamese.zerotts_engine.resolve_zerotts_ggml_lib", return_value=fake_cdll),
+        patch("zerotts.tokenizer.load_tokenizer", return_value=fake_tokenizer),
+        patch("zerotts.codec.MossCodecDecoder", fake_codec_cls),
+    ):
+        engine_desktop = ZeroTtsGgmlEngine(
+            model_dir=model_dir,
+            gguf_path=generic_path,
+            voices=voices,
+        )
+        assert engine_desktop.codec_int8 is False
+
+
+def test_quantize_codec_math_helpers() -> None:
+    """Test fidelity verification metric calculations in tools.quantize_codec."""
+    from tools.quantize_codec import (
+        compute_cosine_similarity,
+        compute_nmse,
+        compute_spectral_l1,
+    )
+
+    # Identical arrays
+    x = np.array([1.0, 2.0, 3.0, 4.0])
+    assert abs(compute_cosine_similarity(x, x) - 1.0) < 1e-6
+    assert abs(compute_nmse(x, x)) < 1e-6
+    assert abs(compute_spectral_l1(x, x)) < 1e-6
+
+    # Orthogonal arrays
+    y = np.array([2.0, -1.0, 4.0, -3.0])
+    assert abs(compute_cosine_similarity(x, y)) < 1e-6
+
+    # Zero arrays
+    zeros = np.zeros(4)
+    assert compute_cosine_similarity(zeros, zeros) == 1.0
+    assert compute_cosine_similarity(x, zeros) == 0.0
+    assert compute_nmse(zeros, zeros) == 0.0
+    assert compute_spectral_l1(zeros, zeros) == 0.0
+
+
+def test_quantize_codec_pipeline_helpers(tmp_path: Path) -> None:
+    """Test quantization pipeline helpers including sha256 and state builder."""
+    import hashlib
+
+    from tools.quantize_codec import (
+        _build_synthetic_streaming_state,
+        _file_sha256,
+        quantize_moss_codec_step,
+    )
+
+    # File sha256
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"hello_world")
+    digest = hashlib.sha256(b"hello_world").hexdigest()
+    assert _file_sha256(sample) == digest
+
+    # Synthetic streaming state
+    meta = {
+        "streaming_decode": {
+            "transformer_offsets": [{"input_name": "in_off", "shape": [1, 1]}],
+            "attention_caches": [
+                {
+                    "offset_input_name": "att_off",
+                    "offset_shape": [1],
+                    "cached_keys_input_name": "keys",
+                    "cache_shape": [1, 2, 3],
+                    "cached_values_input_name": "vals",
+                    "cached_positions_input_name": "pos",
+                    "positions_shape": [1, 4],
+                }
+            ],
+        }
+    }
+    state = _build_synthetic_streaming_state(meta)
+    assert "in_off" in state
+    assert "att_off" in state
+    assert "keys" in state
+    assert "vals" in state
+    assert "pos" in state
+    assert state["pos"][0, 0] == -1
+
+    # Missing source file
+    empty_dir = tmp_path / "empty_codec"
+    empty_dir.mkdir()
+    assert quantize_moss_codec_step(empty_dir) is None
+
+    # Missing meta_path without skip_verify returns None
+    src_dir = tmp_path / "codec_missing_meta"
+    src_dir.mkdir()
+    (src_dir / ZeroTtsFile.DECODE_STEP_ONNX).write_bytes(b"dummy_src")
+    fake_ort_quant = MagicMock()
+    fake_ort_quant.quantize_dynamic.side_effect = lambda **kwargs: Path(
+        kwargs["model_output"]
+    ).write_bytes(b"dummy_int8")
+    with patch(
+        "importlib.import_module",
+        side_effect=lambda name: fake_ort_quant if "onnx" in name else MagicMock(),
+    ):
+        assert quantize_moss_codec_step(src_dir, skip_verify=False) is None
+        # With skip_verify=True, missing meta_path allows quantization to proceed
+        int8_res = quantize_moss_codec_step(src_dir, skip_verify=True)
+        assert int8_res is not None
+        assert int8_res.is_file()
+
+
+def test_zerotts_advance_tail_countdown() -> None:
+    """Test tail countdown advance logic for post-EOA frame flushing."""
+    from wyoming_vietnamese.zerotts_engine import ZeroTtsGgmlEngine
+
+    # Before EOA
+    tail, should_stop = ZeroTtsGgmlEngine._advance_tail_countdown(-1, is_eoa=False)
+    assert tail == -1
+    assert should_stop is False
+
+    # EOA triggered with extra_frames=1
+    tail, should_stop = ZeroTtsGgmlEngine._advance_tail_countdown(-1, is_eoa=True, extra_frames=1)
+    assert tail == 1
+    assert should_stop is False
+
+    # First tail frame consumed
+    tail, should_stop = ZeroTtsGgmlEngine._advance_tail_countdown(1, is_eoa=False, extra_frames=1)
+    assert tail == 0
+    assert should_stop is True

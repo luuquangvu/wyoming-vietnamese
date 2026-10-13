@@ -69,6 +69,7 @@ from wyoming_vietnamese.stt_model import (
 from wyoming_vietnamese.tts_model import (
     DEFAULT_NGHITTS_VOICE,
     DEFAULT_ZEROTTS_VOICE,
+    ZEROTTS_CODEC_INT8_ARTIFACT,
     NghiTtsArtifact,
     NghiTtsVoiceSpec,
     ZeroTtsArtifact,
@@ -760,6 +761,98 @@ def test_structure_zerotts_files_corrupted_digest(
     target_dir = tmp_path / TTS_DIR
     with pytest.raises(RuntimeError, match="does not match its recorded SHA-256 digest"):
         _structure_zerotts_files(snapshot_dir, target_dir)
+
+
+def test_structure_zerotts_files_with_int8_codec_artifact_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test _structure_zerotts_files verifies and copies INT8 codec when present in snapshot."""
+    snapshot_dir = tmp_path / "snapshot"
+    tts_spec, test_voice = _make_zerotts_snapshot(snapshot_dir)
+    int8_content = b"INT8_CODEC_ONNX_BYTES"
+    int8_file = snapshot_dir / "onnx" / "codec" / ZeroTtsFile.DECODE_STEP_INT8_ONNX
+    int8_file.write_bytes(int8_content)
+
+    int8_artifact = ZeroTtsArtifact(
+        f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}",
+        f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}",
+        sha256(int8_content).hexdigest(),
+    )
+    tts_spec_with_int8 = ZeroTtsModelSpec(
+        repo=tts_spec.repo,
+        revision=tts_spec.revision,
+        config=tts_spec.config,
+        tokenizer=tts_spec.tokenizer,
+        null_voice_emb=tts_spec.null_voice_emb,
+        gguf_model=tts_spec.gguf_model,
+        codec_files=(*tts_spec.codec_files, int8_artifact),
+    )
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec_with_int8)
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_VOICES", (test_voice,))
+
+    target_dir = tmp_path / TTS_DIR
+    copied = _structure_zerotts_files(snapshot_dir, target_dir, voices=(test_voice,))
+    dest_int8 = target_dir / "onnx" / "codec" / ZeroTtsFile.DECODE_STEP_INT8_ONNX
+    assert dest_int8.is_file()
+    assert dest_int8.read_bytes() == int8_content
+    assert dest_int8 in copied
+
+
+def test_structure_zerotts_files_int8_codec_graceful_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test _structure_zerotts_files gracefully falls back to FP32 if INT8 codec is missing."""
+    snapshot_dir = tmp_path / "snapshot"
+    tts_spec, test_voice = _make_zerotts_snapshot(snapshot_dir)
+    int8_artifact = ZEROTTS_CODEC_INT8_ARTIFACT
+    tts_spec_with_int8 = ZeroTtsModelSpec(
+        repo=tts_spec.repo,
+        revision=tts_spec.revision,
+        config=tts_spec.config,
+        tokenizer=tts_spec.tokenizer,
+        null_voice_emb=tts_spec.null_voice_emb,
+        gguf_model=tts_spec.gguf_model,
+        codec_files=(*tts_spec.codec_files, int8_artifact),
+    )
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec_with_int8)
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_VOICES", (test_voice,))
+
+    target_dir = tmp_path / TTS_DIR
+    copied = _structure_zerotts_files(snapshot_dir, target_dir, voices=(test_voice,))
+    dest_int8 = target_dir / "onnx" / "codec" / ZeroTtsFile.DECODE_STEP_INT8_ONNX
+    assert not dest_int8.exists()
+    assert dest_int8 not in copied
+
+
+def test_structure_zerotts_files_int8_codec_corrupted_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test _structure_zerotts_files raises RuntimeError when INT8 digest is invalid."""
+    snapshot_dir = tmp_path / "snapshot"
+    tts_spec, test_voice = _make_zerotts_snapshot(snapshot_dir)
+    int8_file = snapshot_dir / "onnx" / "codec" / ZeroTtsFile.DECODE_STEP_INT8_ONNX
+    int8_file.write_bytes(b"CORRUPTED_INT8_BYTES")
+
+    int8_artifact = ZeroTtsArtifact(
+        f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}",
+        f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+    )
+    tts_spec_with_int8 = ZeroTtsModelSpec(
+        repo=tts_spec.repo,
+        revision=tts_spec.revision,
+        config=tts_spec.config,
+        tokenizer=tts_spec.tokenizer,
+        null_voice_emb=tts_spec.null_voice_emb,
+        gguf_model=tts_spec.gguf_model,
+        codec_files=(*tts_spec.codec_files, int8_artifact),
+    )
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec_with_int8)
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_VOICES", (test_voice,))
+
+    target_dir = tmp_path / TTS_DIR
+    with pytest.raises(RuntimeError, match="does not match its recorded SHA-256 digest"):
+        _structure_zerotts_files(snapshot_dir, target_dir, voices=(test_voice,))
 
 
 def test_download_models_structures_zerotts_quality_mode(
@@ -2246,28 +2339,19 @@ def test_create_q4_hybrid_cli_tool(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         mod.main()
     assert exc_info.value.code == 1
 
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["create_q4_hybrid.py", "--input", str(src), "--output", str(dst)],
-    )
-    mod.main()
-    assert dst.is_file()
+    def _assert_hybrid_tensors(target: Path) -> None:
+        """Verify that quantized hybrid tensors match expected quantization types."""
+        assert target.is_file()
+        tensors, _, _ = _inspect_gguf_tensors(target)
+        assert tensors["model.layers.0.self_attn.weight"][0] == GGML_TYPE_Q8_0
+        assert tensors["model.layers.0.mlp.weight"][0] == GGML_TYPE_Q4_0
+        assert tensors["audio_head.weight"][0] == GGML_TYPE_Q8_0
 
-    tensors_default, _, _ = _inspect_gguf_tensors(dst)
-    assert tensors_default["model.layers.0.self_attn.weight"][0] == GGML_TYPE_Q8_0
-    assert tensors_default["model.layers.0.mlp.weight"][0] == GGML_TYPE_Q4_0
-    assert tensors_default["audio_head.weight"][0] == GGML_TYPE_Q8_0
+    def run_hybrid_cli(args: list[str], target: Path) -> None:
+        """Execute create_q4_hybrid CLI and verify resulting tensor types."""
+        monkeypatch.setattr(sys, "argv", ["create_q4_hybrid.py", *args])
+        mod.main()
+        _assert_hybrid_tensors(target)
 
-    default_out = src.parent / "zerotts-q4-hybrid.gguf"
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["create_q4_hybrid.py", "--input", str(src)],
-    )
-    mod.main()
-    assert default_out.is_file()
-    tensors_q8, _, _ = _inspect_gguf_tensors(default_out)
-    assert tensors_q8["model.layers.0.self_attn.weight"][0] == GGML_TYPE_Q8_0
-    assert tensors_q8["model.layers.0.mlp.weight"][0] == GGML_TYPE_Q4_0
-    assert tensors_q8["audio_head.weight"][0] == GGML_TYPE_Q8_0
+    run_hybrid_cli(["--input", str(src), "--output", str(dst)], dst)
+    run_hybrid_cli(["--input", str(src)], src.parent / "zerotts-q4-hybrid.gguf")

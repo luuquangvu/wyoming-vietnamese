@@ -21,17 +21,19 @@ from .config import get_env_bool
 from .const import (
     DEFAULT_STT_ENGINE,
     DEFAULT_TTS_ENGINE,
-    DEFAULT_ZEROTTS_GGUF_MODEL,
+    DEFAULT_ZEROTTS_AUTO,
     NGHITTS_MODEL_BASE_URL,
     STT_DIR,
     TTS_DIR,
-    ZEROTTS_GGUF_MODEL,
     NghiTtsAudio,
     NghiTtsFile,
     TtsEngine,
     ZeroTtsDirectory,
     ZeroTtsFile,
     ZeroTtsVariant,
+)
+from .const import (
+    ZEROTTS_MODEL as ENV_ZEROTTS_MODEL,
 )
 from .gguf_converter import (
     GGML_TYPE_F16,
@@ -59,7 +61,7 @@ from .tts_model import (
     ZeroTtsModelSpec,
     ZeroTtsVoiceSpec,
     call_spec_resolver,
-    normalize_zerotts_gguf_model,
+    normalize_zerotts_model,
     resolve_zerotts_model,
     resolve_zerotts_model_spec,
 )
@@ -193,10 +195,8 @@ def download_models(
     zerotts_resolution: ZeroTtsModelResolution | None = None
 
     if tts_engine_name == TtsEngine.ZEROTTS:
-        effective_quant = zerotts_quant or os.environ.get(ZEROTTS_GGUF_MODEL, "").strip() or None
-        normalized_quant = normalize_zerotts_gguf_model(
-            effective_quant or DEFAULT_ZEROTTS_GGUF_MODEL
-        )
+        effective_quant = zerotts_quant or os.environ.get(ENV_ZEROTTS_MODEL, "").strip() or None
+        normalized_quant = normalize_zerotts_model(effective_quant or DEFAULT_ZEROTTS_AUTO)
 
         def _download_spec_resolver(
             model_name: str | None = None,
@@ -883,11 +883,37 @@ def _structure_zerotts_artifact(
     snapshot_path: Path,
     dest_dir: Path,
     artifact: ZeroTtsArtifact,
-) -> Path:
+) -> Path | None:
     """Structure a single ZeroTTS model artifact into destination directory."""
     dst = dest_dir / artifact.local_name
     if artifact.local_name == f"gguf/{ZeroTtsFile.Q4_HYBRID_GGUF_MODEL}":
         return _structure_zerotts_hybrid_artifact(snapshot_path, dst, artifact)
+
+    if artifact.local_name == f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}":
+        source = snapshot_path / artifact.remote_name
+        if not source.is_file():
+            alt_source = snapshot_path / artifact.local_name
+            if alt_source.is_file():
+                source = alt_source
+            else:
+                _LOGGER.debug(
+                    "Optional ZeroTTS INT8 codec asset not found in snapshot %s; "
+                    "falling back to FP32",
+                    snapshot_path,
+                )
+                return None
+        if not _is_verified_file(source, artifact.sha256):
+            raise RuntimeError(
+                f"Pinned ZeroTTS artifact {artifact.remote_name!r} does not match its recorded "
+                f"SHA-256 digest"
+            )
+        _copy_or_link(source, dst)
+        if not _is_verified_file(dst, artifact.sha256):
+            raise RuntimeError(
+                f"Structured ZeroTTS artifact {artifact.local_name!r} does not match its "
+                f"recorded SHA-256 digest"
+            )
+        return dst
 
     source = _verified_zerotts_source(snapshot_path, artifact)
     _copy_or_link(source, dst)
@@ -953,10 +979,11 @@ def _structure_zerotts_files(
     dest_dir.mkdir(parents=True, exist_ok=True)
     target_model = ZEROTTS_MODEL if zerotts_model is None else zerotts_model
 
-    copied_paths: list[Path] = [
-        _structure_zerotts_artifact(snapshot_path, dest_dir, artifact)
-        for artifact in target_model.artifacts
-    ]
+    copied_paths: list[Path] = []
+    for artifact in target_model.artifacts:
+        path = _structure_zerotts_artifact(snapshot_path, dest_dir, artifact)
+        if path is not None:
+            copied_paths.append(path)
     copied_paths.extend(_structure_zerotts_voice_files(snapshot_path, dest_dir))
     if voices:
         _verify_configured_zerotts_voices(snapshot_path, dest_dir, voices)

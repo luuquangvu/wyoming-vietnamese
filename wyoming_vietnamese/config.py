@@ -19,8 +19,8 @@ from .const import (
     DEFAULT_PORT,
     DEFAULT_STT_ENGINE,
     DEFAULT_TTS_ENGINE,
-    ZEROTTS_GGUF_MODEL,
-    ZEROTTS_PIPELINED,
+    DEFAULT_ZEROTTS_AUTO,
+    ZEROTTS_MODEL,
     ConnectionLimit,
     SttEngine,
     Timeout,
@@ -33,7 +33,7 @@ from .tts_model import (
     NghiTtsVoiceSpec,
     ZeroTtsVoiceSpec,
     get_voice,
-    normalize_zerotts_gguf_model,
+    normalize_zerotts_model,
 )
 
 AnyVoiceSpec = NghiTtsVoiceSpec | ZeroTtsVoiceSpec
@@ -177,11 +177,11 @@ def _get_tts_voices(
     return tuple(get_voice(voice_id, engine=tts_engine) for voice_id in voice_ids)
 
 
-def _get_zerotts_gguf_model(environ: Mapping[str, str]) -> str | None:
-    """Read and validate the optional ZeroTTS GGUF model filename or auto-selector."""
-    if raw_value := environ.get(ZEROTTS_GGUF_MODEL, "").strip():
-        return normalize_zerotts_gguf_model(raw_value, preserve_auto=True)
-    return None
+def _get_zerotts_model(environ: Mapping[str, str]) -> str:
+    """Read and validate the ZeroTTS model filename or auto-selector (always 'auto' if unset)."""
+    raw_value = environ.get(ZEROTTS_MODEL, "").strip() or DEFAULT_ZEROTTS_AUTO
+    normalized = normalize_zerotts_model(raw_value, preserve_auto=True)
+    return normalized or DEFAULT_ZEROTTS_AUTO
 
 
 def _get_log_level(environ: Mapping[str, str]) -> str:
@@ -216,8 +216,7 @@ class ServerConfig:
     max_stt_buffer_bytes: int
     tts_cache_enabled: bool = True
     stt_engine: str = DEFAULT_STT_ENGINE
-    zerotts_gguf_model: str | None = None
-    zerotts_pipelined: bool = True
+    zerotts_model: str = DEFAULT_ZEROTTS_AUTO
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> ServerConfig:
@@ -238,6 +237,7 @@ class ServerConfig:
 
         tts_engine = _get_tts_engine(env)
         stt_engine = _get_stt_engine(env)
+        zerotts_model = _get_zerotts_model(env)
         return cls(
             port=_get_int(env, "WYOMING_PORT", DEFAULT_PORT, minimum=1, maximum=65535),
             stt_engine=stt_engine,
@@ -318,6 +318,5 @@ class ServerConfig:
                 * 1024
             ),
             tts_cache_enabled=get_env_bool("TTS_CACHE_ENABLED", True, env),
-            zerotts_gguf_model=_get_zerotts_gguf_model(env),
-            zerotts_pipelined=get_env_bool(ZEROTTS_PIPELINED, True, env),
+            zerotts_model=zerotts_model,
         )
