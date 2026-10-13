@@ -33,8 +33,6 @@ from wyoming_vietnamese.download import (
     GGML_TYPE_F16,
     GGML_TYPE_F32,
     GGML_TYPE_Q4_0,
-    GGML_TYPE_Q4_1,
-    GGML_TYPE_Q5_0,
     GGML_TYPE_Q8_0,
     GGUF_MAGIC,
     GGUF_VERSION,
@@ -54,14 +52,11 @@ from wyoming_vietnamese.download import (
     _sync_nghitts_model,
     _sync_repo,
     convert_zerotts_q8_to_q4_hybrid,
-    convert_zerotts_second_order_hybrid,
     download_models,
     is_attention_tensor,
     is_ffn_tensor,
     is_pinned_q8_tensor,
     quantize_row_q8_0_to_q4_0,
-    quantize_row_q8_0_to_q4_1,
-    quantize_row_q8_0_to_q5_0,
     setup_hf_environment,
 )
 from wyoming_vietnamese.stt_model import (
@@ -1741,118 +1736,6 @@ def test_is_pinned_q8_tensor_patterns(tensor_name: str, expected: bool) -> None:
     assert is_pinned_q8_tensor(tensor_name) is expected
 
 
-def test_quantize_row_q8_0_to_q5_0_cases() -> None:
-    """Test quantize_row_q8_0_to_q5_0 produces 22 bytes per block with expected layout."""
-    delta = np.float16(1.0).tobytes()
-    q8_zeros = delta + (b"\x00" * 32)
-    q5_bytes = quantize_row_q8_0_to_q5_0(q8_zeros, 32)
-    assert len(q5_bytes) == 22
-    assert q5_bytes[:2] == np.float16(0.0).tobytes()
-    assert q5_bytes[2:6] == b"\xff" * 4
-    assert q5_bytes[6:22] == b"\x00" * 16
-
-    # Non-zero gradient exercising both 0 and 1 high-bit flags and nibble packing
-    w = np.linspace(-15.0, 15.0, 32, dtype=np.float32)
-    q8_d = np.float32(np.float16(np.max(np.abs(w)) / 127.0))
-    q8_qs = np.round(w / q8_d).astype(np.int8)
-    q8_bytes = np.float16(q8_d).tobytes() + q8_qs.tobytes()
-
-    q5_bytes_grad = quantize_row_q8_0_to_q5_0(q8_bytes, 32)
-    assert len(q5_bytes_grad) == 22
-    d = np.frombuffer(q5_bytes_grad[:2], dtype=np.float16)[0]
-    qh = int.from_bytes(q5_bytes_grad[2:6], "little")
-    qs = np.frombuffer(q5_bytes_grad[6:22], dtype=np.uint8)
-
-    deq = np.empty(32, dtype=np.float32)
-    for j in range(16):
-        x0 = int(qs[j] & 0x0F)
-        x1 = int(qs[j] >> 4)
-        xh0 = ((qh >> j) & 1) << 4
-        xh1 = ((qh >> (j + 16)) & 1) << 4
-        deq[j] = ((x0 | xh0) - 16) * float(d)
-        deq[j + 16] = ((x1 | xh1) - 16) * float(d)
-
-    assert float(d) > 0
-    assert np.max(np.abs(w - deq)) <= float(d) + 0.1
-    assert 0 < qh < 0xFFFFFFFF
-
-
-@pytest.mark.parametrize("delta", [0.5, -0.5])
-def test_quantize_row_q8_0_to_q5_0_signed_extremes(delta: float) -> None:
-    """Test each block's dominant signed weight maps to code zero without clipping."""
-    weights = np.zeros((2, 32), dtype=np.int8)
-    weights[0, 0], weights[0, 31] = 16, -8
-    weights[1, 0], weights[1, 31] = 8, -16
-    q8_bytes = b"".join(np.float16(delta).tobytes() + block.tobytes() for block in weights)
-
-    packed = np.frombuffer(quantize_row_q8_0_to_q5_0(q8_bytes, 64), dtype=np.uint8).reshape(2, 22)
-    scales = packed[:, :2].copy().view(np.float16).ravel()
-    high_bits = np.unpackbits(packed[:, 2:6], axis=1, bitorder="little")
-    low_bits = np.concatenate((packed[:, 6:] & 0x0F, packed[:, 6:] >> 4), axis=1)
-    codes = low_bits | (high_bits << 4)
-    decoded = (codes.astype(np.float32) - 16) * scales[:, None]
-
-    np.testing.assert_array_equal(scales, [-delta, delta])
-    np.testing.assert_array_equal(codes[[0, 1], [0, 31]], [0, 0])
-    np.testing.assert_array_equal(decoded, weights.astype(np.float32) * delta)
-
-
-def test_quantize_row_q8_0_to_q5_0_size_mismatch() -> None:
-    """Test quantize_row_q8_0_to_q5_0 raises ValueError on invalid elements or payloads."""
-    with pytest.raises(ValueError, match="Invalid n_elements: 0"):
-        quantize_row_q8_0_to_q5_0(b"\x00" * 34, 0)
-
-    with pytest.raises(ValueError, match="Invalid n_elements: -32"):
-        quantize_row_q8_0_to_q5_0(b"\x00" * 34, -32)
-
-    with pytest.raises(ValueError, match="Invalid n_elements: 33"):
-        quantize_row_q8_0_to_q5_0(b"\x00" * 34, 33)
-
-    with pytest.raises(ValueError, match="Unexpected Q8_0 size"):
-        quantize_row_q8_0_to_q5_0(b"\x00" * 20, 32)
-
-
-def _assert_quantize_q4_1_block(
-    qs: np.ndarray | bytes,
-    expected_d: float,
-    expected_m: float,
-    expected_qs: bytes,
-) -> None:
-    """Validate that Q8_0 payload quantizes to Q4_1 with expected scale, min, and nibbles."""
-    delta = np.float16(1.0).tobytes()
-    qs_bytes = qs.tobytes() if isinstance(qs, np.ndarray) else qs
-    q8_bytes = delta + qs_bytes
-    q4_1_bytes = quantize_row_q8_0_to_q4_1(q8_bytes, 32)
-    assert len(q4_1_bytes) == 20
-    assert q4_1_bytes[:2] == np.float16(expected_d).tobytes()
-    assert q4_1_bytes[2:4] == np.float16(expected_m).tobytes()
-    assert q4_1_bytes[4:20] == expected_qs
-
-
-def test_quantize_row_q8_0_to_q4_1_cases() -> None:
-    """Test quantize_row_q8_0_to_q4_1 produces 20 bytes per block with expected layout."""
-    _assert_quantize_q4_1_block(b"\x00" * 32, 0.0, 0.0, b"\x00" * 16)
-    _assert_quantize_q4_1_block(
-        np.array([-15] * 16 + [15] * 16, dtype=np.int8), 2.0, -15.0, b"\xf0" * 16
-    )
-    _assert_quantize_q4_1_block(np.array([5] * 32, dtype=np.int8), 0.0, 5.0, b"\x00" * 16)
-
-
-def test_quantize_row_q8_0_to_q4_1_size_mismatch() -> None:
-    """Test quantize_row_q8_0_to_q4_1 raises ValueError on invalid elements or payloads."""
-    with pytest.raises(ValueError, match="Invalid n_elements: 0"):
-        quantize_row_q8_0_to_q4_1(b"\x00" * 34, 0)
-
-    with pytest.raises(ValueError, match="Invalid n_elements: -32"):
-        quantize_row_q8_0_to_q4_1(b"\x00" * 34, -32)
-
-    with pytest.raises(ValueError, match="Invalid n_elements: 33"):
-        quantize_row_q8_0_to_q4_1(b"\x00" * 34, 33)
-
-    with pytest.raises(ValueError, match="Unexpected Q8_0 size"):
-        quantize_row_q8_0_to_q4_1(b"\x00" * 20, 32)
-
-
 def _pack_tensor_meta(name: bytes, dims: tuple[int, ...], ttype: int, offset: int = 0) -> bytes:
     """Pack GGUF tensor header metadata into bytes."""
     header = struct.pack("<Q", len(name)) + name + struct.pack("<I", len(dims))
@@ -2045,73 +1928,6 @@ def test_convert_zerotts_q8_to_q4_hybrid_success(tmp_path: Path) -> None:
 
     expected_q8 = np.float16(1.0).tobytes() + (b"\x02" * 32)
     _assert_hybrid_attention_and_head_payloads(dst, tensors, data_start, expected_q8)
-
-    dst_q5_attn = tmp_path / "model-q4-hybrid-q5-attn.gguf"
-    convert_zerotts_q8_to_q4_hybrid(src, dst_q5_attn, attention_type=GGML_TYPE_Q5_0)
-    tensors_q5, _, _ = _inspect_gguf_tensors(dst_q5_attn)
-    assert tensors_q5["model.layers.0.self_attn.weight"][0] == GGML_TYPE_Q5_0
-
-
-def test_convert_zerotts_second_order_hybrid_success(tmp_path: Path) -> None:
-    """Test convert_zerotts_second_order_hybrid quantizes FFN to Q4_0 and Attention to Q5_0."""
-    src = tmp_path / "model-q8_0.gguf"
-    dst = tmp_path / "model-second-order.gguf"
-    _write_synthetic_gguf(src)
-
-    result = convert_zerotts_second_order_hybrid(src, dst)
-    assert result == dst
-    assert dst.is_file()
-
-    tensors, _, data_start = _inspect_gguf_tensors(dst)
-    assert data_start % 32 == 0
-    _assert_synthetic_hybrid_tensors(tensors, GGML_TYPE_Q5_0)
-
-    expected_q5 = quantize_row_q8_0_to_q5_0(np.float16(1.0).tobytes() + (b"\x02" * 32), 32)
-    _assert_hybrid_attention_and_head_payloads(dst, tensors, data_start, expected_q5)
-
-
-def test_convert_zerotts_second_order_hybrid_q4_1(tmp_path: Path) -> None:
-    """Test convert_zerotts_second_order_hybrid supports Q4_1 attention precision."""
-    src = tmp_path / "model-q8_0.gguf"
-    dst = tmp_path / "model-second-order-q4_1.gguf"
-    _write_synthetic_gguf(src)
-
-    result = convert_zerotts_second_order_hybrid(src, dst, attention_type=GGML_TYPE_Q4_1)
-    assert result == dst
-    assert dst.is_file()
-
-    tensors, _, data_start = _inspect_gguf_tensors(dst)
-    assert tensors["model.layers.0.self_attn.weight"][0] == GGML_TYPE_Q4_1
-    assert tensors["audio_head.weight"][0] == GGML_TYPE_Q8_0
-
-    expected_q4_1 = quantize_row_q8_0_to_q4_1(np.float16(1.0).tobytes() + (b"\x02" * 32), 32)
-    _assert_hybrid_attention_and_head_payloads(dst, tensors, data_start, expected_q4_1)
-
-
-def test_convert_zerotts_q8_to_q4_hybrid_invalid_attention_type(tmp_path: Path) -> None:
-    """Test convert_zerotts_q8_to_q4_hybrid rejects unsupported attention quantization type."""
-    src = tmp_path / "model-q8_0.gguf"
-    dst = tmp_path / "model-out.gguf"
-    _write_synthetic_gguf(src)
-
-    with pytest.raises(ValueError, match="Unsupported attention quantization type: 99"):
-        convert_zerotts_q8_to_q4_hybrid(src, dst, attention_type=99)
-
-    assert not dst.exists()
-    assert not dst.with_suffix(".tmp").exists()
-
-
-def test_convert_zerotts_second_order_hybrid_invalid_attention_type(tmp_path: Path) -> None:
-    """Test convert_zerotts_second_order_hybrid rejects unsupported attention quantization type."""
-    src = tmp_path / "model-q8_0.gguf"
-    dst = tmp_path / "model-second-order-invalid.gguf"
-    _write_synthetic_gguf(src)
-
-    with pytest.raises(ValueError, match="Unsupported attention quantization type: 99"):
-        convert_zerotts_second_order_hybrid(src, dst, attention_type=99)
-
-    assert not dst.exists()
-    assert not dst.with_suffix(".tmp").exists()
 
 
 def _write_gguf_with_alignment(path: Path, alignment_val: int, *, n_tensors: int = 0) -> None:
@@ -2358,32 +2174,6 @@ def test_structure_zerotts_files_hybrid_already_verified(
     assert hybrid_dst in copied
 
 
-def test_structure_zerotts_files_ignores_unpinned_int8_candidate(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Test _structure_zerotts_files leaves INT8 generation to destination engine."""
-    snapshot_dir, dest_dir, tts_spec, test_voice = _setup_structure_test_dirs(tmp_path, monkeypatch)
-
-    int8_file = snapshot_dir / "onnx" / "codec" / ZeroTtsFile.DECODE_STEP_INT8_ONNX
-    int8_file.parent.mkdir(parents=True, exist_ok=True)
-    int8_file.write_bytes(b"INT8_MODEL_DATA")
-    int8_companion = snapshot_dir / "onnx" / "codec" / f"{ZeroTtsFile.DECODE_STEP_INT8_ONNX}.data"
-    int8_companion.write_bytes(b"INT8_EXTERNAL_TENSORS")
-
-    copied = _structure_zerotts_files(
-        snapshot_dir,
-        dest_dir,
-        voices=(test_voice,),
-        zerotts_model=tts_spec,
-    )
-    dst_int8 = dest_dir / "onnx" / "codec" / ZeroTtsFile.DECODE_STEP_INT8_ONNX
-    dst_companion = dest_dir / "onnx" / "codec" / f"{ZeroTtsFile.DECODE_STEP_INT8_ONNX}.data"
-    assert dst_int8 not in copied
-    assert dst_companion not in copied
-    assert not dst_int8.is_file()
-    assert not dst_companion.is_file()
-
-
 def test_structure_zerotts_files_hybrid_converts_and_fails_digest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2448,8 +2238,6 @@ def test_create_q4_hybrid_cli_tool(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     _write_synthetic_gguf(src)
 
     mod.print_q4_hybrid_summary(src, dst)
-    mod.print_q4_hybrid_summary(src, dst, attention_quant="q4_1")
-    mod.print_q4_hybrid_summary(src, dst, attention_quant="q5_0")
 
     monkeypatch.setattr(
         sys, "argv", ["create_q4_hybrid.py", "--input", str(tmp_path / "missing.gguf")]
@@ -2471,55 +2259,11 @@ def test_create_q4_hybrid_cli_tool(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert tensors_default["model.layers.0.mlp.weight"][0] == GGML_TYPE_Q4_0
     assert tensors_default["audio_head.weight"][0] == GGML_TYPE_Q8_0
 
-    dst_q5 = tmp_path / "model-q4-hybrid-q5.gguf"
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "create_q4_hybrid.py",
-            "--input",
-            str(src),
-            "--output",
-            str(dst_q5),
-            "--attention-quant",
-            "q5_0",
-        ],
-    )
-    mod.main()
-    assert dst_q5.is_file()
-
-    tensors_q5, _, _ = _inspect_gguf_tensors(dst_q5)
-    assert tensors_q5["model.layers.0.self_attn.weight"][0] == GGML_TYPE_Q5_0
-    assert tensors_q5["model.layers.0.mlp.weight"][0] == GGML_TYPE_Q4_0
-    assert tensors_q5["audio_head.weight"][0] == GGML_TYPE_Q8_0
-
-    dst_q4_1 = tmp_path / "model-q4-hybrid-q4_1.gguf"
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "create_q4_hybrid.py",
-            "--input",
-            str(src),
-            "--output",
-            str(dst_q4_1),
-            "--attention-quant",
-            "q4_1",
-        ],
-    )
-    mod.main()
-    assert dst_q4_1.is_file()
-
-    tensors_q4_1, _, _ = _inspect_gguf_tensors(dst_q4_1)
-    assert tensors_q4_1["model.layers.0.self_attn.weight"][0] == GGML_TYPE_Q4_1
-    assert tensors_q4_1["model.layers.0.mlp.weight"][0] == GGML_TYPE_Q4_0
-    assert tensors_q4_1["audio_head.weight"][0] == GGML_TYPE_Q8_0
-
     default_out = src.parent / "zerotts-q4-hybrid.gguf"
     monkeypatch.setattr(
         sys,
         "argv",
-        ["create_q4_hybrid.py", "--input", str(src), "--attention-quant", "q8"],
+        ["create_q4_hybrid.py", "--input", str(src)],
     )
     mod.main()
     assert default_out.is_file()

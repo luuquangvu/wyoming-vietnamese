@@ -167,8 +167,6 @@ def _initialize_configured_tts(
                 cpu_threads,
                 resolution=zerotts_resolution,
                 pipelined=server_config.zerotts_pipelined,
-                codec_int8=server_config.zerotts_codec_int8,
-                affinity=server_config.zerotts_affinity,
             )
         if server_config.zerotts_gguf_model is not None:
             _, zerotts_gguf = resolve_zerotts_model(
@@ -181,16 +179,12 @@ def _initialize_configured_tts(
                 cpu_threads,
                 gguf_path=zerotts_gguf,
                 pipelined=server_config.zerotts_pipelined,
-                codec_int8=server_config.zerotts_codec_int8,
-                affinity=server_config.zerotts_affinity,
             )
         return initialize_zerotts(
             tts_path,
             zerotts_voices,
             cpu_threads,
             pipelined=server_config.zerotts_pipelined,
-            codec_int8=server_config.zerotts_codec_int8,
-            affinity=server_config.zerotts_affinity,
         )
     nghitts_voices = tuple(v for v in selected_voices if isinstance(v, NghiTtsVoiceSpec))
     configured_nghitts = (

@@ -10,7 +10,7 @@ import os
 import platform
 import subprocess
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from pathlib import Path
 from typing import Final
 
@@ -755,38 +755,3 @@ def resolve_cpu_threads(
         raise ValueError("configured threads must not be negative")
     available_threads = available_cpu_count(only_physical_cores=only_physical_cores)
     return min(configured_threads, available_threads) if configured_threads else available_threads
-
-
-def get_process_affinity_cpus() -> list[int]:
-    """Return sorted list of logical CPU IDs allowed for the current process.
-
-    Uses detected process affinity if available, or falls back to process-available
-    CPU count indexed from 0, constrained to available CPU limits.
-
-    Returns:
-        Sorted list of integer CPU IDs available to this process.
-    """
-    limit = available_cpu_count()
-    if affinity_set := _cpu_count_affinity_set():
-        allowed = sorted(affinity_set)
-        return allowed[:limit] if len(allowed) > limit else allowed
-    return list(range(limit))
-
-
-def set_thread_affinity(cpu_ids: Sequence[int] | set[int]) -> bool:
-    """Assign current calling thread affinity to specific CPU cores.
-
-    Args:
-        cpu_ids: Collection of CPU core IDs to pin the calling thread to.
-
-    Returns:
-        True if affinity was successfully applied, False otherwise.
-    """
-    if not hasattr(os, "sched_setaffinity"):
-        return False
-    try:
-        os.sched_setaffinity(0, set(cpu_ids))
-        return True
-    except (OSError, ValueError, TypeError) as err:
-        _LOGGER.debug("Could not set CPU affinity to %s: %s", cpu_ids, err)
-        return False

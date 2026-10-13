@@ -2035,8 +2035,6 @@ def initialize_zerotts(
     cpu_variant: str | ZeroTtsVariant | None = None,
     resolution: ZeroTtsModelResolution | None = None,
     pipelined: bool | None = None,
-    codec_int8: bool | None = None,
-    affinity: bool | None = None,
 ) -> ZeroTtsGgmlEngine:
     """Initialize ZeroTTS using default GGUF and runtime paths unless overridden.
 
@@ -2049,8 +2047,6 @@ def initialize_zerotts(
         cpu_variant: Optional explicit CPU variant for model selection.
         resolution: Optional pre-resolved ZeroTTS model resolution carrying spec and path.
         pipelined: Optional override for pipelined streaming execution.
-        codec_int8: Optional override for INT8 dynamic quantized MOSS Codec.
-        affinity: Optional override for CPU core thread affinity.
 
     Returns:
         Configured ZeroTtsGgmlEngine instance.
@@ -2091,10 +2087,6 @@ def initialize_zerotts(
     engine_kwargs: dict[str, Any] = {}
     if pipelined is not None:
         engine_kwargs["pipelined"] = pipelined
-    if codec_int8 is not None:
-        engine_kwargs["codec_int8"] = codec_int8
-    if affinity is not None:
-        engine_kwargs["affinity"] = affinity
 
     engine = ZeroTtsGgmlEngine(
         model_dir=model_dir,

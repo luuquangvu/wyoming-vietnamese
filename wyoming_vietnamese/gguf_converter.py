@@ -142,141 +142,29 @@ def quantize_row_q8_0_to_q4_0(q8_bytes: bytes, n_elements: int) -> bytes:
     return out.tobytes()
 
 
-def quantize_row_q8_0_to_q5_0(q8_bytes: bytes, n_elements: int) -> bytes:
-    """Quantize Q8_0 tensor bytes to Q5_0 format using vectorized NumPy.
-
-    Each 32-element block is packed into 22 bytes:
-    - 2 bytes delta scale (float16)
-    - 4 bytes high bit mask qh (1 bit per element across 32 elements)
-    - 16 bytes low nibbles qs (4 bits per element)
-
-    Args:
-        q8_bytes: Contiguous Q8_0 block byte payload.
-        n_elements: Total number of tensor float elements represented.
-
-    Returns:
-        Packed Q5_0 block byte payload (22 bytes per 32 elements).
-
-    Raises:
-        ValueError: If n_elements is non-positive, not a multiple of 32, or q8_bytes size mismatch.
-    """
-    if n_elements <= 0 or n_elements % 32 != 0:
-        raise ValueError(f"Invalid n_elements: {n_elements}; must be a positive multiple of 32")
-    n_blocks = n_elements // 32
-    if len(q8_bytes) != n_blocks * 34:
-        raise ValueError(f"Unexpected Q8_0 size: expected {n_blocks * 34}, got {len(q8_bytes)}")
-
-    q8_arr = np.frombuffer(q8_bytes, dtype=np.uint8).reshape(n_blocks, 34)
-    deltas = q8_arr[:, :2].copy().view(dtype=np.float16).reshape(n_blocks, 1)
-    qs = q8_arr[:, 2:].copy().view(dtype=np.int8)
-
-    weights_f32 = qs.astype(np.float32) * deltas.astype(np.float32)
-    max_indices = np.argmax(np.abs(weights_f32), axis=1, keepdims=True)
-    max_weights = np.take_along_axis(weights_f32, max_indices, axis=1)
-    d_q5 = np.where(max_weights != 0, max_weights / -16.0, 0.0).astype(np.float16)
-    d_q5_f32 = d_q5.astype(np.float32)
-    safe_d_q5 = np.where(d_q5_f32 != 0, d_q5_f32, 1.0)
-    id_q5 = np.where(d_q5_f32 != 0, 1.0 / safe_d_q5, 0.0)
-
-    q = np.clip(np.round(weights_f32 * id_q5) + 16, 0, 31).astype(np.uint8)
-    qh_bits = (q >> 4) & 1
-    qh_bytes = np.packbits(qh_bits, axis=1, bitorder="little")
-    low_nibble = q[:, :16]
-    high_nibble = q[:, 16:]
-    qs_bytes = (low_nibble & 0x0F) | ((high_nibble & 0x0F) << 4)
-
-    out = np.empty((n_blocks, 22), dtype=np.uint8)
-    out[:, :2] = d_q5.view(np.uint8).reshape(n_blocks, 2)
-    out[:, 2:6] = qh_bytes
-    out[:, 6:22] = qs_bytes
-    return out.tobytes()
-
-
-def quantize_row_q8_0_to_q4_1(q8_bytes: bytes, n_elements: int) -> bytes:
-    """Quantize Q8_0 tensor bytes to Q4_1 format using vectorized NumPy.
-
-    Each 32-element block is packed into 20 bytes:
-    - 2 bytes delta scale (float16)
-    - 2 bytes minimum offset (float16)
-    - 16 bytes nibbles qs (4 bits per element)
-
-    Args:
-        q8_bytes: Contiguous Q8_0 block byte payload.
-        n_elements: Total number of tensor float elements represented.
-
-    Returns:
-        Packed Q4_1 block byte payload (20 bytes per 32 elements).
-
-    Raises:
-        ValueError: If n_elements is non-positive, not a multiple of 32, or q8_bytes size mismatch.
-    """
-    if n_elements <= 0 or n_elements % 32 != 0:
-        raise ValueError(f"Invalid n_elements: {n_elements}; must be a positive multiple of 32")
-    n_blocks = n_elements // 32
-    if len(q8_bytes) != n_blocks * 34:
-        raise ValueError(f"Unexpected Q8_0 size: expected {n_blocks * 34}, got {len(q8_bytes)}")
-
-    q8_arr = np.frombuffer(q8_bytes, dtype=np.uint8).reshape(n_blocks, 34)
-    deltas = q8_arr[:, :2].copy().view(dtype=np.float16).reshape(n_blocks, 1)
-    qs = q8_arr[:, 2:].copy().view(dtype=np.int8)
-
-    weights_f32 = qs.astype(np.float32) * deltas.astype(np.float32)
-    min_val = np.min(weights_f32, axis=1, keepdims=True)
-    max_val = np.max(weights_f32, axis=1, keepdims=True)
-    d = ((max_val - min_val) / 15.0).astype(np.float16)
-    m = min_val.astype(np.float16)
-    d_f32 = d.astype(np.float32)
-    safe_d = np.where(d_f32 != 0, d_f32, 1.0)
-    id_val = np.where(d_f32 != 0, 1.0 / safe_d, 0.0)
-
-    q = np.clip(np.round((weights_f32 - m.astype(np.float32)) * id_val), 0, 15).astype(np.uint8)
-    low_nibble = q[:, :16]
-    high_nibble = q[:, 16:]
-    packed_bytes = (low_nibble & 0x0F) | ((high_nibble & 0x0F) << 4)
-
-    out = np.empty((n_blocks, 20), dtype=np.uint8)
-    out[:, :2] = d.view(np.uint8).reshape(n_blocks, 2)
-    out[:, 2:4] = m.view(np.uint8).reshape(n_blocks, 2)
-    out[:, 4:20] = packed_bytes
-    return out.tobytes()
-
-
 def convert_zerotts_q8_to_q4_hybrid(
     src_path: Path,
     dst_path: Path,
-    *,
-    attention_type: int | None = None,
 ) -> Path:
     """Convert a source ZeroTTS Q8_0 GGUF model into a Q4-Hybrid GGUF model.
 
     Preserves Audio Embeddings, Codebook Output Heads, and Attention projections in
-    native/Q8_0 precision (unless attention_type is explicitly specified).
-    Quantizes Transformer FFN / MLP layers to Q4_0 for optimal CPU cache utilization,
-    memory bandwidth reduction, and zero scalar fallback overhead on edge processors.
-    Optionally quantizes Attention layers when attention_type is specified (e.g. Q5_0 or Q4_1).
-    Validates GGUF magic, versions, structure bounds, key-values, and tensor offsets.
+    native/Q8_0 precision. Quantizes Transformer FFN / MLP layers to Q4_0 for optimal
+    CPU cache utilization, memory bandwidth reduction, and zero scalar fallback overhead
+    on edge processors. Validates GGUF magic, versions, structure bounds, key-values,
+    and tensor offsets.
 
     Args:
         src_path: Path to input Q8_0 GGUF model.
         dst_path: Path to target Q4-Hybrid GGUF model.
-        attention_type: Optional quantization format for Attention layers (default: None,
-            preserving native/Q8_0 precision; pass GGML_TYPE_Q5_0 or GGML_TYPE_Q4_1 if requested).
 
     Returns:
         Path to the generated GGUF file.
 
     Raises:
         FileNotFoundError: If src_path does not exist.
-        ValueError: If src_path is not a valid GGUF file, contains unknown types,
-            or an unsupported attention_type is provided.
+        ValueError: If src_path is not a valid GGUF file or contains unknown types.
     """
-    if attention_type is not None and attention_type not in {
-        GGML_TYPE_Q5_0,
-        GGML_TYPE_Q4_1,
-        GGML_TYPE_Q4_0,
-    }:
-        raise ValueError(f"Unsupported attention quantization type: {attention_type}")
-
     if not src_path.is_file():
         raise FileNotFoundError(f"Source GGUF model file not found: {src_path}")
     file_size = src_path.stat().st_size
@@ -443,18 +331,6 @@ def convert_zerotts_q8_to_q4_hybrid(
             if is_ffn_tensor(info["name"]) and info["ttype"] == GGML_TYPE_Q8_0:
                 info["new_ttype"] = GGML_TYPE_Q4_0
                 info["dst_size"] = (info["n_elem"] // 32) * 18
-            elif (
-                attention_type is not None
-                and is_attention_tensor(info["name"])
-                and info["ttype"] == GGML_TYPE_Q8_0
-            ):
-                info["new_ttype"] = attention_type
-                if attention_type == GGML_TYPE_Q5_0:
-                    info["dst_size"] = (info["n_elem"] // 32) * 22
-                elif attention_type == GGML_TYPE_Q4_1:
-                    info["dst_size"] = (info["n_elem"] // 32) * 20
-                else:
-                    info["dst_size"] = (info["n_elem"] // 32) * 18
             else:
                 info["new_ttype"] = info["ttype"]
                 info["dst_size"] = info["src_size"]
@@ -488,10 +364,6 @@ def convert_zerotts_q8_to_q4_hybrid(
                     raw_src = fin.read(info["src_size"])
                     if info["new_ttype"] == GGML_TYPE_Q4_0 and info["ttype"] == GGML_TYPE_Q8_0:
                         raw_dst = quantize_row_q8_0_to_q4_0(raw_src, info["n_elem"])
-                    elif info["new_ttype"] == GGML_TYPE_Q5_0 and info["ttype"] == GGML_TYPE_Q8_0:
-                        raw_dst = quantize_row_q8_0_to_q5_0(raw_src, info["n_elem"])
-                    elif info["new_ttype"] == GGML_TYPE_Q4_1 and info["ttype"] == GGML_TYPE_Q8_0:
-                        raw_dst = quantize_row_q8_0_to_q4_1(raw_src, info["n_elem"])
                     else:
                         raw_dst = raw_src
                     fout.write(raw_dst)
@@ -503,26 +375,3 @@ def convert_zerotts_q8_to_q4_hybrid(
         finally:
             tmp_dst.unlink(missing_ok=True)
     return dst_path
-
-
-def convert_zerotts_second_order_hybrid(
-    src_path: Path,
-    dst_path: Path,
-    *,
-    attention_type: int = GGML_TYPE_Q5_0,
-) -> Path:
-    """Convert a source ZeroTTS Q8_0 GGUF model into a Second-Order Hybrid GGUF model.
-
-    Preserves discrete audio prediction heads and embedding tables in native Q8_0/FP32 precision.
-    Quantizes Transformer FFN / MLP layers to Q4_0 and Attention projections to Q5_0
-    (or Q4_1) for optimal CPU cache locality and zero-drift prosodic stability.
-
-    Args:
-        src_path: Path to input Q8_0 GGUF model.
-        dst_path: Path to target Second-Order Hybrid GGUF model.
-        attention_type: Quantization format for Attention layers (default: GGML_TYPE_Q5_0).
-
-    Returns:
-        Path to the generated GGUF file.
-    """
-    return convert_zerotts_q8_to_q4_hybrid(src_path, dst_path, attention_type=attention_type)

@@ -43,13 +43,10 @@ from .gguf_converter import (
     GGUF_MAGIC,
     GGUF_VERSION,
     convert_zerotts_q8_to_q4_hybrid,
-    convert_zerotts_second_order_hybrid,
     is_attention_tensor,
     is_ffn_tensor,
     is_pinned_q8_tensor,
     quantize_row_q8_0_to_q4_0,
-    quantize_row_q8_0_to_q4_1,
-    quantize_row_q8_0_to_q5_0,
 )
 from .stt_model import DEFAULT_STT_MODEL, SttArtifact, SttModelSpec, get_stt_model
 from .tts import validate_tts_voices_for_engine
@@ -78,14 +75,11 @@ __all__ = [
     "GGUF_VERSION",
     "ModelDownloadResult",
     "convert_zerotts_q8_to_q4_hybrid",
-    "convert_zerotts_second_order_hybrid",
     "download_models",
     "is_attention_tensor",
     "is_ffn_tensor",
     "is_pinned_q8_tensor",
     "quantize_row_q8_0_to_q4_0",
-    "quantize_row_q8_0_to_q4_1",
-    "quantize_row_q8_0_to_q5_0",
     "setup_hf_environment",
 ]
 
