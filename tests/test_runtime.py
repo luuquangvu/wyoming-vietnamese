@@ -48,6 +48,8 @@ from wyoming_vietnamese.const import (
     TTS_DIR,
     SttEngine,
     TtsEngine,
+    ZeroTtsFile,
+    ZeroTtsVariant,
 )
 from wyoming_vietnamese.cpu import resolve_cpu_threads
 from wyoming_vietnamese.protocol import ByteBudget, ConnectionLimiter
@@ -670,7 +672,7 @@ def test_download_configured_models_branches(
     assert "zerotts_quant" not in download_mock.call_args.kwargs
 
     download_mock.reset_mock()
-    cfg_quant = replace(_config(tmp_path), zerotts_gguf_model="q4_hybrid")
+    cfg_quant = replace(_config(tmp_path), tts_engine=TtsEngine.ZEROTTS, zerotts_model="q4_hybrid")
     _download_configured_models(cfg_quant)
     assert download_mock.call_args.kwargs["zerotts_quant"] == "q4_hybrid"
 
@@ -856,12 +858,13 @@ async def test_run_server_starts_zerotts_engine(
         offline=False,
         tts_engine=TtsEngine.ZEROTTS,
         stt_engine=SttEngine.ZIPFORMER,
+        zerotts_quant="auto",
     )
     init_zerotts.assert_called_once_with(
         tmp_path / TTS_DIR,
         (DEFAULT_ZEROTTS_VOICE,),
         resolve_cpu_threads(0),
-        pipelined=True,
+        gguf_path=tmp_path / TTS_DIR / "gguf" / ZeroTtsFile.DEFAULT_GGUF_MODEL,
     )
     init_nghitts.assert_not_called()
     warm_up.assert_called_once_with(tts, (DEFAULT_ZEROTTS_VOICE,), TtsEngine.ZEROTTS)
@@ -914,14 +917,14 @@ async def _run_configured_zerotts_server(
 async def test_run_server_forwards_custom_zerotts_model_selection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Test run server forwards zerotts_gguf_model to download_models and initialize_zerotts."""
+    """Test run server forwards zerotts_model to download_models and initialize_zerotts."""
     custom_gguf = tmp_path / "custom-zerotts.gguf"
     download_ret = {STT_DIR: tmp_path / STT_DIR, TTS_DIR: tmp_path / TTS_DIR}
     _server, _tts, init_zerotts, download, config = await _run_configured_zerotts_server(
         tmp_path,
         monkeypatch,
         download_ret,
-        env_overrides={"ZEROTTS_GGUF_MODEL": str(custom_gguf)},
+        env_overrides={"ZEROTTS_MODEL": str(custom_gguf)},
     )
 
     download.assert_called_once_with(
@@ -938,26 +941,27 @@ async def test_run_server_forwards_custom_zerotts_model_selection(
         (DEFAULT_ZEROTTS_VOICE,),
         resolve_cpu_threads(0),
         gguf_path=custom_gguf,
-        pipelined=True,
     )
 
 
-async def test_run_server_forwards_zerotts_pipelined_disabled(
+async def test_run_server_auto_selects_zerotts_q4_on_edge_processor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Test run server forwards zerotts_pipelined=False to initialize_zerotts when disabled."""
+    """Test run server auto-selects Q4-Hybrid model on edge CPU architectures when unset."""
     download_ret = {STT_DIR: tmp_path / STT_DIR, TTS_DIR: tmp_path / TTS_DIR}
+    monkeypatch.setattr(
+        "wyoming_vietnamese.tts_model.detect_cpu_variant", lambda: ZeroTtsVariant.SSE4
+    )
     _server, _tts, init_zerotts, _download, _config = await _run_configured_zerotts_server(
         tmp_path,
         monkeypatch,
         download_ret,
-        env_overrides={"ZEROTTS_PIPELINED": "false"},
     )
     init_zerotts.assert_called_once_with(
         tmp_path / TTS_DIR,
         (DEFAULT_ZEROTTS_VOICE,),
         resolve_cpu_threads(0),
-        pipelined=False,
+        gguf_path=tmp_path / TTS_DIR / "gguf" / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL,
     )
 
 
@@ -977,12 +981,17 @@ async def test_run_server_incorporates_zerotts_resolution_in_cache_namespace(
         tmp_path / TTS_DIR,
         zerotts_resolution=res,
     )
-    server, _tts, _init_zerotts, _download, config = await _run_configured_zerotts_server(
+    server, _tts, init_zerotts, _download, config = await _run_configured_zerotts_server(
         tmp_path,
         monkeypatch,
         download_result,
     )
-    assert _init_zerotts.call_args.kwargs["pipelined"] is config.zerotts_pipelined
+    init_zerotts.assert_called_once_with(
+        tmp_path / TTS_DIR,
+        (DEFAULT_ZEROTTS_VOICE,),
+        resolve_cpu_threads(0),
+        resolution=res,
+    )
 
     handler_factory = server.factory
     factory_args = getattr(handler_factory, "args", None)

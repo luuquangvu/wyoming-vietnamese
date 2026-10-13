@@ -156,6 +156,27 @@ _ENABLE_AVX2_FAMILY: Final = [
 ]
 
 
+def _is_compiler_flag_supported(flag: str) -> bool:
+    """Check if the host compiler supports a specific flag.
+
+    Args:
+        flag: Compiler option string to probe.
+
+    Returns:
+        True if the compiler accepts the flag, False otherwise.
+    """
+    try:
+        res = subprocess.run(
+            ["g++", flag, "-E", "-x", "c++", os.devnull, "-o", os.devnull],
+            capture_output=True,
+            check=False,
+            timeout=_COMPILER_PROBE_TIMEOUT_SECONDS,
+        )
+        return res.returncode == 0
+    except OSError, subprocess.SubprocessError:
+        return False
+
+
 def _get_variant_build_flags(variant: str) -> tuple[list[str], list[str]]:
     """Return CMake definition flags and extra compiler flags for a build variant.
 
@@ -221,14 +242,33 @@ def _get_variant_build_flags(variant: str) -> tuple[list[str], list[str]]:
         return (cmake_flags, gxx_flags)
 
     if variant == ZeroTtsVariant.SSE4:
+        sse4_arch_flags: list[str] = (
+            ["-march=x86-64-v2", "-mtune=generic"]
+            if _is_compiler_flag_supported("-march=x86-64-v2")
+            else ["-msse4.2", "-mpopcnt", "-mtune=generic"]
+        )
+        lto_flags = ["-flto"] if _is_compiler_flag_supported("-flto") else []
+        c_flags = [
+            *sse4_arch_flags,
+            "-msse4.2",
+            "-mpopcnt",
+            "-O3",
+            "-fno-math-errno",
+            "-fno-trapping-math",
+            *lto_flags,
+        ]
+        flags_str = " ".join(c_flags)
         cmake_flags = [
             *_COMMON_DISABLED_CMAKE_FLAGS,
+            "-DGGML_OPENMP=ON",
             _ENABLE_SSE42,
             "-DGGML_AVX=OFF",
             *_DISABLE_AVX2_FAMILY,
             *_DISABLE_AVX512_FAMILY,
+            f"-DCMAKE_C_FLAGS={flags_str}",
+            f"-DCMAKE_CXX_FLAGS={flags_str}",
         ]
-        gxx_flags = ["-msse4.2", "-mpopcnt"]
+        gxx_flags = [*sse4_arch_flags, "-msse4.2", "-mpopcnt", "-fno-math-errno", *lto_flags]
         return (cmake_flags, gxx_flags)
 
     # COMPAT baseline
