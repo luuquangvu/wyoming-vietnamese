@@ -23,13 +23,10 @@ from typing import TYPE_CHECKING, Final
 import numpy as np
 
 if TYPE_CHECKING:
-    import onnxruntime as ort
     from zerotts.codec import MossCodecDecoder, MossStreamingDecoder
 
 from .config import get_env_bool
 from .const import (
-    ZEROTTS_AFFINITY,
-    ZEROTTS_CODEC_INT8,
     ZEROTTS_CODEC_THREADS,
     ZEROTTS_GGML_THREADS,
     ZEROTTS_PIPELINED,
@@ -41,9 +38,7 @@ from .const import (
 )
 from .cpu import (
     detect_cpu_variant,
-    get_process_affinity_cpus,
     resolve_cpu_threads,
-    set_thread_affinity,
 )
 from .tts_model import ZEROTTS_VOICES_BY_ID, ZeroTtsVoiceSpec
 
@@ -790,370 +785,6 @@ def resolve_zerotts_thread_budget(
     return total - c_threads, c_threads
 
 
-def _stage_codec_file(src: Path, dst: Path) -> None:
-    """Stage a source file into destination path via hard link or copy.
-
-    Args:
-        src: Source file path.
-        dst: Destination file path.
-    """
-    if src.resolve() == dst.resolve():
-        return
-    try:
-        os.link(src.resolve(), dst)
-    except OSError:
-        shutil.copyfile(src.resolve(), dst)
-
-
-def _validate_quantized_onnx_model(model_path: Path) -> bool:
-    """Validate that an ONNX model and its companion external data can be loaded by ONNX Runtime.
-
-    Args:
-        model_path: Path to the ONNX model file.
-
-    Returns:
-        True if the model loads successfully or ONNX Runtime is unavailable,
-        False on validation failure.
-    """
-    try:
-        import importlib
-
-        ort = importlib.import_module("onnxruntime")
-        if hasattr(ort, "InferenceSession"):
-            opts = ort.SessionOptions()
-            opts.log_severity_level = 3
-            test_sess = ort.InferenceSession(
-                str(model_path),
-                sess_options=opts,
-                providers=["CPUExecutionProvider"],
-            )
-            if (
-                hasattr(test_sess, "get_inputs")
-                and hasattr(test_sess, "get_outputs")
-                and (not test_sess.get_inputs() or not test_sess.get_outputs())
-            ):
-                raise RuntimeError(f"Quantized model {model_path} has empty inputs/outputs")
-        return True
-    except ImportError, AttributeError:
-        return True
-    except Exception as val_err:
-        _LOGGER.warning(
-            "INT8 model at %s failed validation: %s",
-            model_path,
-            val_err,
-        )
-        return False
-
-
-def _cleanup_quantized_target(
-    target_out: Path,
-    preserved_paths: set[Path] | None = None,
-) -> None:
-    """Remove invalid or stale quantized model and its associated companions.
-
-    Args:
-        target_out: Target quantized ONNX file path.
-        preserved_paths: Optional set of file paths that must not be removed.
-    """
-    target_out.unlink(missing_ok=True)
-    protected = {p.resolve() for p in preserved_paths} if preserved_paths else set()
-    for companion in (
-        target_out.with_name(f"{target_out.name}.data"),
-        target_out.with_suffix(".data"),
-    ):
-        with contextlib.suppress(OSError):
-            if companion.is_file() and companion.resolve() not in protected:
-                companion.unlink(missing_ok=True)
-
-
-def _check_and_prepare_cached_int8_model(
-    target_out: Path,
-    shared_data: Path,
-    target_shared: Path,
-    preserved_paths: set[Path],
-) -> bool:
-    """Validate cached INT8 model or clean it up if invalid.
-
-    Args:
-        target_out: Target quantized ONNX file path.
-        shared_data: Path to shared data file in source codec directory.
-        target_shared: Staged path for shared data next to target_out.
-        preserved_paths: Set of paths that must not be deleted during cleanup.
-
-    Returns:
-        True if a valid cached model exists, False otherwise.
-    """
-    if not target_out.is_file():
-        return False
-    if shared_data.is_file() and not target_shared.is_file():
-        _stage_codec_file(shared_data, target_shared)
-    if target_out.stat().st_size > 0 and _validate_quantized_onnx_model(target_out):
-        return True
-    _LOGGER.warning(
-        "Cached INT8 model at %s failed validation; removing and regenerating",
-        target_out,
-    )
-    _cleanup_quantized_target(target_out, preserved_paths)
-    return False
-
-
-def _run_dynamic_quantization(
-    step_model: Path,
-    shared_data: Path,
-    stage_dir: Path,
-    target_out: Path,
-) -> bool:
-    """Run dynamic INT8 quantization inside the staging directory.
-
-    Args:
-        step_model: Source decode step ONNX model file path.
-        shared_data: Shared data companion file path.
-        stage_dir: Temporary staging directory.
-        target_out: Destination quantized model path.
-
-    Returns:
-        True if quantization succeeded and output was generated, False otherwise.
-    """
-    try:
-        import importlib
-
-        importlib.import_module("onnx")
-        ort_quant = importlib.import_module("onnxruntime.quantization")
-        quant_type = ort_quant.QuantType
-        quantize_dynamic_fn = ort_quant.quantize_dynamic
-    except (ImportError, AttributeError) as err:
-        _LOGGER.debug(
-            "ONNX quantization tools unavailable (%s); skipping MOSS Codec INT8 generation",
-            err,
-        )
-        return False
-
-    if shared_data.is_file():
-        _stage_codec_file(shared_data, stage_dir / shared_data.name)
-    _stage_codec_file(step_model, stage_dir / step_model.name)
-
-    temp_in = stage_dir / step_model.name
-    temp_out = stage_dir / target_out.name
-    quantize_dynamic_fn(
-        model_input=str(temp_in),
-        model_output=str(temp_out),
-        weight_type=quant_type.QInt8,
-        op_types_to_quantize=["MatMul", "Gemm"],
-    )
-    return temp_out.is_file() and temp_out.stat().st_size > 0
-
-
-def _publish_shared_data_companion(
-    companion: Path,
-    shared_data: Path,
-    target_shared: Path,
-) -> None:
-    """Publish the shared-data companion to target if distinct from source.
-
-    Args:
-        companion: Staged companion file path.
-        shared_data: Source shared data path.
-        target_shared: Target shared data path.
-    """
-    with contextlib.suppress(OSError):
-        if target_shared.resolve() == shared_data.resolve():
-            return
-    if not target_shared.is_file() or (
-        shared_data.is_file() and companion.stat().st_size != shared_data.stat().st_size
-    ):
-        os.replace(companion, target_shared)
-
-
-def _publish_quantized_companions(
-    stage_dir: Path,
-    target_out: Path,
-    step_model: Path,
-    shared_data: Path,
-    target_shared: Path,
-) -> None:
-    """Publish generated companion files from the staging directory to target directory.
-
-    Args:
-        stage_dir: Staging directory where quantization occurred.
-        target_out: Target quantized ONNX file path.
-        step_model: Original step model path.
-        shared_data: Source shared data path.
-        target_shared: Target shared data path.
-    """
-    for companion in stage_dir.iterdir():
-        if not companion.is_file() or companion.name in (
-            step_model.name,
-            target_out.name,
-        ):
-            continue
-        if companion.name == shared_data.name:
-            _publish_shared_data_companion(companion, shared_data, target_shared)
-            continue
-        os.replace(companion, target_out.parent / companion.name)
-
-    if shared_data.is_file() and not target_shared.is_file():
-        _stage_codec_file(shared_data, target_shared)
-
-
-def quantize_moss_codec_step(
-    codec_dir: Path,
-    output_path: Path | None = None,
-) -> Path | None:
-    """Dynamically quantize MOSS Codec decode_step ONNX model to INT8.
-
-    Args:
-        codec_dir: Directory containing MOSS Codec models and metadata.
-        output_path: Optional explicit output path for the INT8 model.
-
-    Returns:
-        Path to the quantized INT8 model file if successful, None otherwise.
-    """
-    target_out = (
-        output_path if output_path is not None else codec_dir / ZeroTtsFile.DECODE_STEP_INT8_ONNX
-    )
-    shared_data = codec_dir / ZeroTtsFile.DECODE_SHARED_DATA
-    target_shared = target_out.parent / shared_data.name
-    preserved_paths = {shared_data, target_shared}
-
-    if _check_and_prepare_cached_int8_model(
-        target_out, shared_data, target_shared, preserved_paths
-    ):
-        return target_out
-
-    step_model = codec_dir / ZeroTtsFile.DECODE_STEP_ONNX
-    if not step_model.is_file():
-        _LOGGER.debug(
-            "MOSS decode step model missing at %s, skipping INT8 quantization",
-            step_model,
-        )
-        return None
-
-    target_out.parent.mkdir(parents=True, exist_ok=True)
-    stage_dir = target_out.parent / f".tmp_stage_{target_out.name}_{os.getpid()}"
-    stage_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        if not _run_dynamic_quantization(step_model, shared_data, stage_dir, target_out):
-            return None
-
-        temp_out = stage_dir / target_out.name
-        _publish_quantized_companions(stage_dir, target_out, step_model, shared_data, target_shared)
-        os.replace(temp_out, target_out)
-
-        if not _validate_quantized_onnx_model(target_out):
-            _cleanup_quantized_target(target_out, preserved_paths)
-            return None
-
-        _LOGGER.info(
-            "Successfully generated INT8 dynamic quantized MOSS Codec at %s (%d bytes)",
-            target_out,
-            target_out.stat().st_size,
-        )
-        return target_out
-    except Exception as err:
-        _LOGGER.warning("Dynamic INT8 quantization of MOSS Codec failed: %s", err)
-    finally:
-        shutil.rmtree(stage_dir, ignore_errors=True)
-
-    return None
-
-
-def _update_codec_int8_metadata(codec: MossCodecDecoder, codec_dir: Path) -> None:
-    """Update codec metadata dictionary to point to the INT8 model and companions.
-
-    Args:
-        codec: The MossCodecDecoder instance.
-        codec_dir: Directory containing codec files.
-    """
-    meta = getattr(codec, "_meta", None)
-    if not isinstance(meta, dict):
-        return
-    meta.setdefault("files", {})["decode_step"] = ZeroTtsFile.DECODE_STEP_INT8_ONNX
-    ext_files = meta.get("external_data_files")
-    if not isinstance(ext_files, dict):
-        return
-    companion_data = codec_dir / f"{ZeroTtsFile.DECODE_STEP_INT8_ONNX}.data"
-    orig_ext = ext_files.get(ZeroTtsFile.DECODE_STEP_ONNX)
-    if companion_data.is_file():
-        ext_files[ZeroTtsFile.DECODE_STEP_INT8_ONNX] = companion_data.name
-    elif orig_ext and (codec_dir / orig_ext).is_file():
-        ext_files[ZeroTtsFile.DECODE_STEP_INT8_ONNX] = orig_ext
-    else:
-        ext_files.pop(ZeroTtsFile.DECODE_STEP_INT8_ONNX, None)
-
-
-def _create_codec_ort_session(model_path: Path, threads: int) -> ort.InferenceSession:
-    """Create and validate an ONNX Runtime inference session for MOSS decode step.
-
-    Args:
-        model_path: Path to the ONNX model file.
-        threads: Thread count allocated for session inference.
-
-    Returns:
-        Configured ONNX Runtime InferenceSession.
-
-    Raises:
-        RuntimeError: If session inputs or outputs are empty.
-    """
-    import onnxruntime as ort
-
-    sess_options = ort.SessionOptions()
-    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    sess_options.intra_op_num_threads = threads
-    sess_options.inter_op_num_threads = 1
-    sess = ort.InferenceSession(
-        str(model_path),
-        sess_options=sess_options,
-        providers=["CPUExecutionProvider"],
-    )
-    if (
-        hasattr(sess, "get_inputs")
-        and hasattr(sess, "get_outputs")
-        and (not sess.get_inputs() or not sess.get_outputs())
-    ):
-        raise RuntimeError(f"INT8 session at {model_path} has empty inputs/outputs")
-    return sess
-
-
-def _setup_codec_int8_session(
-    codec: MossCodecDecoder,
-    codec_dir: Path,
-    codec_threads: int,
-) -> bool:
-    """Initialize INT8 decode_step ONNX session and patch codec metadata.
-
-    Args:
-        codec: The MossCodecDecoder instance to attach the session to.
-        codec_dir: Directory containing MOSS codec models.
-        codec_threads: Thread count allocated for codec inference.
-
-    Returns:
-        True if INT8 session was successfully loaded and attached, False otherwise.
-    """
-    int8_step_path = codec_dir / ZeroTtsFile.DECODE_STEP_INT8_ONNX
-    if not int8_step_path.is_file():
-        quantize_moss_codec_step(codec_dir, int8_step_path)
-    if not int8_step_path.is_file():
-        return False
-
-    try:
-        sess = _create_codec_ort_session(int8_step_path, codec_threads)
-        codec._decode_step_sess = sess
-        _update_codec_int8_metadata(codec, codec_dir)
-        _LOGGER.info(
-            "ZeroTTS enabled INT8 dynamic quantized MOSS codec from %s",
-            int8_step_path,
-        )
-        return True
-    except Exception as err:
-        _LOGGER.warning(
-            "Failed to load INT8 MOSS codec session from %s (%s); falling back to FP32 decode_step",
-            int8_step_path,
-            err,
-        )
-        return False
-
-
 def _init_null_voice_embedding(model_dir: Path, hp: _ZeroTtsHParams) -> np.ndarray:
     """Initialize null voice latent embedding from model assets or default zeros.
 
@@ -1174,34 +805,28 @@ def _init_null_voice_embedding(model_dir: Path, hp: _ZeroTtsHParams) -> np.ndarr
 def _resolve_engine_options(
     num_threads: int,
     pipelined: bool | None,
-    codec_int8: bool | None,
-    affinity: bool | None,
     codec_threads: int | None,
-) -> tuple[int, bool, bool, bool, int, int]:
-    """Resolve runtime threading, pipelining, and optimization flags.
+) -> tuple[int, bool, int, int]:
+    """Resolve runtime threading and pipelining flags.
 
     Args:
         num_threads: Requested CPU thread count.
         pipelined: Pipelining override.
-        codec_int8: INT8 codec override.
-        affinity: Core affinity override.
         codec_threads: Codec thread count override.
 
     Returns:
-        Tuple of (total_threads, pipelined, codec_int8, affinity, ggml_threads, codec_threads).
+        Tuple of (total_threads, pipelined, ggml_threads, codec_threads).
     """
     total_threads = resolve_cpu_threads(num_threads)
     effective_pipelined = get_env_bool(ZEROTTS_PIPELINED, True) if pipelined is None else pipelined
     is_pipelined = effective_pipelined and total_threads > 1
-    is_codec_int8 = get_env_bool(ZEROTTS_CODEC_INT8, True) if codec_int8 is None else codec_int8
-    is_affinity = get_env_bool(ZEROTTS_AFFINITY, True) if affinity is None else affinity
 
     ggml_thr, codec_thr = resolve_zerotts_thread_budget(
         total_threads,
         pipelined=is_pipelined,
         codec_threads=codec_threads,
     )
-    return total_threads, is_pipelined, is_codec_int8, is_affinity, ggml_thr, codec_thr
+    return total_threads, is_pipelined, ggml_thr, codec_thr
 
 
 def _load_text_processors(
@@ -1243,8 +868,6 @@ class ZeroTtsGgmlEngine:
         seed: int = 1234,
         codec_threads: int | None = None,
         pipelined: bool | None = None,
-        codec_int8: bool | None = None,
-        affinity: bool | None = None,
     ) -> None:
         """Initialize the ZeroTTS GGML engine from local weights and configurations.
 
@@ -1257,8 +880,6 @@ class ZeroTtsGgmlEngine:
             seed: Default random generator seed for deterministic frame sampling.
             codec_threads: Optional CPU thread count for MOSS ONNX decoder.
             pipelined: Whether to overlap GGML frame synthesis and ONNX codec decoding.
-            codec_int8: Whether to enable INT8 dynamic quantized MOSS Codec.
-            affinity: Whether to pin GGML and ONNX codec threads to distinct CPU cores.
 
         Raises:
             ValueError: If no voice is configured.
@@ -1275,18 +896,13 @@ class ZeroTtsGgmlEngine:
         (
             self.total_threads,
             self.pipelined,
-            self.codec_int8,
-            self.affinity_enabled,
             self.threads,
             self.codec_threads,
         ) = _resolve_engine_options(
             num_threads=num_threads,
             pipelined=pipelined,
-            codec_int8=codec_int8,
-            affinity=affinity,
             codec_threads=codec_threads,
         )
-        self._codec_is_int8: bool = False
 
         self.model_dir: Path = model_dir
         self.gguf_path: Path = gguf_path
@@ -1311,16 +927,14 @@ class ZeroTtsGgmlEngine:
             self._lib.zerotts_sampling_defaults(ctypes.byref(self._sp))
 
             self._tokenizer, self._normalize_fn = _load_text_processors(model_dir)
-            self._codec, self._codec_is_int8 = self._init_neural_codec(model_dir)
+            self._codec = self._init_neural_codec(model_dir)
 
             _LOGGER.info(
                 "ZeroTTS thread allocation: ggml_threads=%d codec_threads=%d "
-                "pipelined=%s int8_codec=%s affinity=%s (budget=%d)",
+                "pipelined=%s (budget=%d)",
                 self.threads,
                 self.codec_threads,
                 self.pipelined,
-                self._codec_is_int8,
-                self.affinity_enabled,
                 self.total_threads,
             )
 
@@ -1335,26 +949,22 @@ class ZeroTtsGgmlEngine:
             self.close()
             raise
 
-    def _init_neural_codec(self, model_dir: Path) -> tuple[MossCodecDecoder, bool]:
-        """Initialize the MOSS neural codec decoder and optional INT8 session.
+    def _init_neural_codec(self, model_dir: Path) -> MossCodecDecoder:
+        """Initialize the MOSS neural codec decoder.
 
         Args:
             model_dir: Model assets directory.
 
         Returns:
-            Tuple of (codec_instance, is_int8_enabled).
+            Configured MossCodecDecoder instance.
         """
         from zerotts.codec import MossCodecDecoder
 
         codec_dir = model_dir / "onnx" / "codec"
-        codec = MossCodecDecoder(
+        return MossCodecDecoder(
             codec_dir,
             intra_op_num_threads=self.codec_threads,
         )
-        is_int8 = False
-        if self.codec_int8:
-            is_int8 = _setup_codec_int8_session(codec, codec_dir, self.codec_threads)
-        return codec, is_int8
 
     def _init_voices(self, voices: Sequence[ZeroTtsVoiceSpec]) -> None:
         """Initialize voice mapping catalogs and load voice embeddings.
@@ -1655,20 +1265,6 @@ class ZeroTtsGgmlEngine:
             if audio_out is not None:
                 yield audio_out
 
-    def _resolve_pipeline_affinities(self) -> tuple[set[int] | None, set[int] | None]:
-        """Determine CPU core sets for pipelined producer and consumer threads.
-
-        Returns:
-            Tuple of (producer_cpus, codec_cpus).
-        """
-        if not self.affinity_enabled:
-            return None, None
-        avail = get_process_affinity_cpus()
-        if len(avail) < 2:
-            return None, None
-        c_cnt = min(self.codec_threads, len(avail) - 1)
-        return set(avail[:-c_cnt]), set(avail[-c_cnt:])
-
     @staticmethod
     def _enqueue_chunk(
         chunk_queue: queue.Queue[np.ndarray | Exception | None],
@@ -1698,7 +1294,6 @@ class ZeroTtsGgmlEngine:
         chunk_queue: queue.Queue[np.ndarray | Exception | None],
         stop_event: threading.Event,
         producer_error: list[Exception],
-        producer_cpus: set[int] | None,
     ) -> None:
         """Generate acoustic code frames and push chunk slices to pipeline queue.
 
@@ -1706,10 +1301,7 @@ class ZeroTtsGgmlEngine:
             chunk_queue: Inter-thread queue for generated code chunks.
             stop_event: Event signaling cancellation.
             producer_error: Destination list to capture unhandled worker exception.
-            producer_cpus: Optional CPU core pinning set for the producer.
         """
-        if producer_cpus:
-            set_thread_affinity(producer_cpus)
         first_chunk_target = 2
         cap_chunk_target = 16
         try:
@@ -1843,28 +1435,18 @@ class ZeroTtsGgmlEngine:
         chunk_queue: queue.Queue[np.ndarray | Exception | None] = queue.Queue(maxsize=4)
         stop_event = threading.Event()
         producer_error: list[Exception] = []
-        producer_cpus, codec_cpus = self._resolve_pipeline_affinities()
 
         worker = threading.Thread(
             target=self._run_producer_loop,
-            args=(chunk_queue, stop_event, producer_error, producer_cpus),
+            args=(chunk_queue, stop_event, producer_error),
             daemon=True,
         )
         self._busy_worker = worker
         worker.start()
 
-        consumer_orig_affinity: set[int] | None = None
-        if codec_cpus and hasattr(os, "sched_getaffinity"):
-            with contextlib.suppress(OSError, ValueError):
-                consumer_orig_affinity = set(os.sched_getaffinity(0))
-            if consumer_orig_affinity is not None:
-                set_thread_affinity(codec_cpus)
-
         try:
             yield from self._consume_pipeline_queue(stream, chunk_queue, worker, producer_error)
         finally:
-            if consumer_orig_affinity is not None:
-                set_thread_affinity(consumer_orig_affinity)
             self._drain_and_join_worker(worker, chunk_queue, stop_event)
 
     def infer_stream_normalized(

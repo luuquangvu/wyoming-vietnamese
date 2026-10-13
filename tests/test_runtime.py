@@ -862,8 +862,6 @@ async def test_run_server_starts_zerotts_engine(
         (DEFAULT_ZEROTTS_VOICE,),
         resolve_cpu_threads(0),
         pipelined=True,
-        codec_int8=True,
-        affinity=True,
     )
     init_nghitts.assert_not_called()
     warm_up.assert_called_once_with(tts, (DEFAULT_ZEROTTS_VOICE,), TtsEngine.ZEROTTS)
@@ -941,8 +939,6 @@ async def test_run_server_forwards_custom_zerotts_model_selection(
         resolve_cpu_threads(0),
         gguf_path=custom_gguf,
         pipelined=True,
-        codec_int8=True,
-        affinity=True,
     )
 
 
@@ -962,32 +958,6 @@ async def test_run_server_forwards_zerotts_pipelined_disabled(
         (DEFAULT_ZEROTTS_VOICE,),
         resolve_cpu_threads(0),
         pipelined=False,
-        codec_int8=True,
-        affinity=True,
-    )
-
-
-async def test_run_server_forwards_zerotts_codec_int8_and_affinity_disabled(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Test run server forwards disabled zerotts_codec_int8 and zerotts_affinity."""
-    download_ret = {STT_DIR: tmp_path / STT_DIR, TTS_DIR: tmp_path / TTS_DIR}
-    _server, _tts, init_zerotts, _download, _config = await _run_configured_zerotts_server(
-        tmp_path,
-        monkeypatch,
-        download_ret,
-        env_overrides={
-            "ZEROTTS_CODEC_INT8": "false",
-            "ZEROTTS_AFFINITY": "false",
-        },
-    )
-    init_zerotts.assert_called_once_with(
-        tmp_path / TTS_DIR,
-        (DEFAULT_ZEROTTS_VOICE,),
-        resolve_cpu_threads(0),
-        pipelined=True,
-        codec_int8=False,
-        affinity=False,
     )
 
 
@@ -1013,8 +983,6 @@ async def test_run_server_incorporates_zerotts_resolution_in_cache_namespace(
         download_result,
     )
     assert _init_zerotts.call_args.kwargs["pipelined"] is config.zerotts_pipelined
-    assert _init_zerotts.call_args.kwargs["codec_int8"] is config.zerotts_codec_int8
-    assert _init_zerotts.call_args.kwargs["affinity"] is config.zerotts_affinity
 
     handler_factory = server.factory
     factory_args = getattr(handler_factory, "args", None)

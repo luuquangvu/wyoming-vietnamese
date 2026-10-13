@@ -19,8 +19,6 @@ from .const import (
     DEFAULT_PORT,
     DEFAULT_STT_ENGINE,
     DEFAULT_TTS_ENGINE,
-    ZEROTTS_AFFINITY,
-    ZEROTTS_CODEC_INT8,
     ZEROTTS_GGUF_MODEL,
     ZEROTTS_PIPELINED,
     ConnectionLimit,
@@ -220,8 +218,6 @@ class ServerConfig:
     stt_engine: str = DEFAULT_STT_ENGINE
     zerotts_gguf_model: str | None = None
     zerotts_pipelined: bool = True
-    zerotts_codec_int8: bool = True
-    zerotts_affinity: bool = True
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> ServerConfig:
@@ -324,6 +320,4 @@ class ServerConfig:
             tts_cache_enabled=get_env_bool("TTS_CACHE_ENABLED", True, env),
             zerotts_gguf_model=_get_zerotts_gguf_model(env),
             zerotts_pipelined=get_env_bool(ZEROTTS_PIPELINED, True, env),
-            zerotts_codec_int8=get_env_bool(ZEROTTS_CODEC_INT8, True, env),
-            zerotts_affinity=get_env_bool(ZEROTTS_AFFINITY, True, env),
         )
