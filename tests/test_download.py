@@ -798,14 +798,19 @@ def test_structure_zerotts_files_with_int8_codec_artifact_success(
     assert dest_int8 in copied
 
 
-def test_structure_zerotts_files_int8_codec_graceful_fallback(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Test _structure_zerotts_files gracefully falls back to FP32 if INT8 codec is missing."""
-    snapshot_dir = tmp_path / "snapshot"
-    tts_spec, test_voice = _make_zerotts_snapshot(snapshot_dir)
-    int8_artifact = ZEROTTS_CODEC_INT8_ARTIFACT
-    tts_spec_with_int8 = ZeroTtsModelSpec(
+def _configure_zerotts_int8_spec(
+    monkeypatch: pytest.MonkeyPatch,
+    tts_spec: ZeroTtsModelSpec,
+    test_voice: ZeroTtsVoiceSpec,
+    int8_sha256: str,
+) -> ZeroTtsArtifact:
+    """Configure ZEROTTS_MODEL and ZEROTTS_VOICES with a given INT8 codec sha256 digest."""
+    int8_artifact = ZeroTtsArtifact(
+        f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}",
+        f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}",
+        int8_sha256,
+    )
+    spec = ZeroTtsModelSpec(
         repo=tts_spec.repo,
         revision=tts_spec.revision,
         config=tts_spec.config,
@@ -814,14 +819,79 @@ def test_structure_zerotts_files_int8_codec_graceful_fallback(
         gguf_model=tts_spec.gguf_model,
         codec_files=(*tts_spec.codec_files, int8_artifact),
     )
-    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec_with_int8)
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", spec)
     monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_VOICES", (test_voice,))
+    return int8_artifact
+
+
+def test_structure_zerotts_files_int8_codec_graceful_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test _structure_zerotts_files gracefully falls back to FP32 if INT8 codec is missing."""
+    snapshot_dir = tmp_path / "snapshot"
+    tts_spec, test_voice = _make_zerotts_snapshot(snapshot_dir)
+    _configure_zerotts_int8_spec(
+        monkeypatch, tts_spec, test_voice, ZEROTTS_CODEC_INT8_ARTIFACT.sha256
+    )
+    monkeypatch.setattr(
+        "wyoming_vietnamese.download._BUNDLED_ASSETS_DIR", tmp_path / "empty_assets"
+    )
 
     target_dir = tmp_path / TTS_DIR
     copied = _structure_zerotts_files(snapshot_dir, target_dir, voices=(test_voice,))
     dest_int8 = target_dir / "onnx" / "codec" / ZeroTtsFile.DECODE_STEP_INT8_ONNX
     assert not dest_int8.exists()
     assert dest_int8 not in copied
+
+
+@pytest.mark.parametrize("flat_layout", [False, True])
+def test_structure_zerotts_files_with_int8_codec_bundled_asset_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flat_layout: bool
+) -> None:
+    """Test _structure_zerotts_files copies and verifies INT8 codec from bundled assets."""
+    snapshot_dir = tmp_path / "snapshot"
+    tts_spec, test_voice = _make_zerotts_snapshot(snapshot_dir)
+    bundled_assets_dir = tmp_path / "assets"
+    int8_content = b"BUNDLED_INT8_CODEC_ONNX_BYTES"
+    if flat_layout:
+        bundled_int8 = bundled_assets_dir / ZeroTtsFile.DECODE_STEP_INT8_ONNX
+    else:
+        bundled_int8 = bundled_assets_dir / "onnx" / "codec" / ZeroTtsFile.DECODE_STEP_INT8_ONNX
+    bundled_int8.parent.mkdir(parents=True, exist_ok=True)
+    bundled_int8.write_bytes(int8_content)
+
+    _configure_zerotts_int8_spec(
+        monkeypatch, tts_spec, test_voice, sha256(int8_content).hexdigest()
+    )
+    monkeypatch.setattr("wyoming_vietnamese.download._BUNDLED_ASSETS_DIR", bundled_assets_dir)
+
+    target_dir = tmp_path / TTS_DIR
+    copied = _structure_zerotts_files(snapshot_dir, target_dir, voices=(test_voice,))
+    dest_int8 = target_dir / "onnx" / "codec" / ZeroTtsFile.DECODE_STEP_INT8_ONNX
+    assert dest_int8.is_file()
+    assert dest_int8.read_bytes() == int8_content
+    assert dest_int8 in copied
+
+
+def test_structure_zerotts_files_int8_codec_already_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test _structure_zerotts_files reuses already structured and verified INT8 codec file."""
+    snapshot_dir = tmp_path / "snapshot"
+    tts_spec, test_voice = _make_zerotts_snapshot(snapshot_dir)
+    int8_content = b"EXISTING_VERIFIED_INT8_CODEC"
+    _configure_zerotts_int8_spec(
+        monkeypatch, tts_spec, test_voice, sha256(int8_content).hexdigest()
+    )
+
+    target_dir = tmp_path / TTS_DIR
+    dest_int8 = target_dir / "onnx" / "codec" / ZeroTtsFile.DECODE_STEP_INT8_ONNX
+    dest_int8.parent.mkdir(parents=True, exist_ok=True)
+    dest_int8.write_bytes(int8_content)
+
+    copied = _structure_zerotts_files(snapshot_dir, target_dir, voices=(test_voice,))
+    assert dest_int8 in copied
+    assert dest_int8.read_bytes() == int8_content
 
 
 def test_structure_zerotts_files_int8_codec_corrupted_digest(
@@ -833,25 +903,132 @@ def test_structure_zerotts_files_int8_codec_corrupted_digest(
     int8_file = snapshot_dir / "onnx" / "codec" / ZeroTtsFile.DECODE_STEP_INT8_ONNX
     int8_file.write_bytes(b"CORRUPTED_INT8_BYTES")
 
+    _configure_zerotts_int8_spec(monkeypatch, tts_spec, test_voice, "0" * 64)
+
+    target_dir = tmp_path / TTS_DIR
+    with pytest.raises(RuntimeError, match="does not match its recorded SHA-256 digest"):
+        _structure_zerotts_files(snapshot_dir, target_dir, voices=(test_voice,))
+
+
+def test_locate_zerotts_int8_codec_source_returns_first_verified_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test _locate_zerotts_int8_codec_source returns the first verified candidate."""
+    snapshot_dir = tmp_path / "snapshot"
+    corrupt_candidate = snapshot_dir / "onnx" / "codec" / ZeroTtsFile.DECODE_STEP_INT8_ONNX
+    corrupt_candidate.parent.mkdir(parents=True, exist_ok=True)
+    corrupt_candidate.write_bytes(b"WRONG_INT8_BYTES")
+
+    bundled_dir = tmp_path / "assets"
+    valid_content = b"VALID_INT8_BYTES"
+    valid_candidate = bundled_dir / ZeroTtsFile.DECODE_STEP_INT8_ONNX
+    valid_candidate.parent.mkdir(parents=True, exist_ok=True)
+    valid_candidate.write_bytes(valid_content)
+
+    monkeypatch.setattr("wyoming_vietnamese.download._BUNDLED_ASSETS_DIR", bundled_dir)
+    artifact = ZeroTtsArtifact(
+        f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}",
+        f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}",
+        sha256(valid_content).hexdigest(),
+    )
+    result = download_module._locate_zerotts_int8_codec_source(snapshot_dir, artifact)
+    assert result == valid_candidate
+
+
+def test_locate_zerotts_int8_codec_source_returns_none_when_no_candidate_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test _locate_zerotts_int8_codec_source returns None when no candidate exists."""
+    snapshot_dir = tmp_path / "empty_snapshot"
+    empty_assets = tmp_path / "empty_assets"
+    monkeypatch.setattr("wyoming_vietnamese.download._BUNDLED_ASSETS_DIR", empty_assets)
+    artifact = ZeroTtsArtifact(
+        f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}",
+        f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}",
+        "f" * 64,
+    )
+    assert download_module._locate_zerotts_int8_codec_source(snapshot_dir, artifact) is None
+
+
+def test_locate_zerotts_int8_codec_source_raises_when_candidates_exist_but_none_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test _locate_zerotts_int8_codec_source raises when candidates exist but none match."""
+    snapshot_dir = tmp_path / "snapshot"
+    cand1 = snapshot_dir / "onnx" / "codec" / ZeroTtsFile.DECODE_STEP_INT8_ONNX
+    cand1.parent.mkdir(parents=True, exist_ok=True)
+    cand1.write_bytes(b"WRONG_ONE")
+
+    bundled_dir = tmp_path / "assets"
+    cand2 = bundled_dir / ZeroTtsFile.DECODE_STEP_INT8_ONNX
+    cand2.parent.mkdir(parents=True, exist_ok=True)
+    cand2.write_bytes(b"WRONG_TWO")
+
+    monkeypatch.setattr("wyoming_vietnamese.download._BUNDLED_ASSETS_DIR", bundled_dir)
+    artifact = ZeroTtsArtifact(
+        f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}",
+        f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}",
+        "f" * 64,
+    )
+    with pytest.raises(RuntimeError, match="does not match its recorded SHA-256 digest"):
+        download_module._locate_zerotts_int8_codec_source(snapshot_dir, artifact)
+
+
+def test_structure_zerotts_files_int8_codec_mismatch_when_fp32_updated_without_new_int8(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify INT8 digest error when the FP32 codec is updated without new INT8."""
+    snapshot_dir = tmp_path / "snapshot"
+    tts_spec, test_voice = _make_zerotts_snapshot(snapshot_dir)
+    bundled_assets_dir = tmp_path / "assets"
+
+    old_int8_content = b"OLD_INT8_CODEC_ONNX_BYTES"
+    bundled_int8 = bundled_assets_dir / "onnx" / "codec" / ZeroTtsFile.DECODE_STEP_INT8_ONNX
+    bundled_int8.parent.mkdir(parents=True, exist_ok=True)
+    bundled_int8.write_bytes(old_int8_content)
+
+    updated_fp32_content = b"NEW_FP32_CODEC_ONNX_BYTES"
+    updated_fp32_file = snapshot_dir / "onnx" / "codec" / ZeroTtsFile.DECODE_STEP_ONNX
+    updated_fp32_file.write_bytes(updated_fp32_content)
+    updated_fp32_sha = sha256(updated_fp32_content).hexdigest()
+
+    new_expected_int8_sha = sha256(b"NEW_REGENERATED_INT8_CODEC_BYTES").hexdigest()
     int8_artifact = ZeroTtsArtifact(
         f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}",
         f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}",
-        "0000000000000000000000000000000000000000000000000000000000000000",
+        new_expected_int8_sha,
     )
-    tts_spec_with_int8 = ZeroTtsModelSpec(
+    updated_codec_files = (
+        *(
+            ZeroTtsArtifact(art.remote_name, art.local_name, updated_fp32_sha)
+            if art.local_name == f"onnx/codec/{ZeroTtsFile.DECODE_STEP_ONNX}"
+            else art
+            for art in tts_spec.codec_files
+        ),
+        int8_artifact,
+    )
+
+    updated_spec = ZeroTtsModelSpec(
         repo=tts_spec.repo,
         revision=tts_spec.revision,
         config=tts_spec.config,
         tokenizer=tts_spec.tokenizer,
         null_voice_emb=tts_spec.null_voice_emb,
         gguf_model=tts_spec.gguf_model,
-        codec_files=(*tts_spec.codec_files, int8_artifact),
+        codec_files=updated_codec_files,
     )
-    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec_with_int8)
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", updated_spec)
     monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_VOICES", (test_voice,))
+    monkeypatch.setattr("wyoming_vietnamese.download._BUNDLED_ASSETS_DIR", bundled_assets_dir)
 
     target_dir = tmp_path / TTS_DIR
-    with pytest.raises(RuntimeError, match="does not match its recorded SHA-256 digest"):
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"moss_audio_tokenizer_decode_step\.int8\.onnx.*"
+            "does not match its recorded SHA-256 digest"
+        ),
+    ):
         _structure_zerotts_files(snapshot_dir, target_dir, voices=(test_voice,))
 
 

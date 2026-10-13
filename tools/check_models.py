@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shutil
+import stat
 import sys
+import tempfile
 import unicodedata
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass
 from email.message import Message
 from hashlib import sha256
@@ -27,6 +32,7 @@ from wyoming_vietnamese.const import (
     HUGGINGFACE_BASE_URL,
     ZEROTTS_REPO_ID,
     NghiTtsFile,
+    ZeroTtsFile,
 )
 from wyoming_vietnamese.const import (
     NGHITTS_MODEL_BASE_URL as _NGHITTS_MODEL_BASE_URL_SOURCE,
@@ -41,6 +47,7 @@ from wyoming_vietnamese.tts_model import (
     ZEROTTS_MODEL,
     ZEROTTS_VOICES,
     NghiTtsArtifact,
+    NghiTtsVoiceSpec,
 )
 
 _USER_AGENT: Final = "wyoming-vietnamese-model-check/1.0"
@@ -53,7 +60,14 @@ _SHA256_PATTERN: Final = re.compile(r"^[0-9a-f]{64}$")
 _ZEROTTS_CORE_FILES: Final = tuple(artifact.remote_name for artifact in ZEROTTS_MODEL.artifacts)
 _LINK_HEADER_PATTERN: Final = re.compile(r"<([^>]+)>([^,]*)")
 _REL_PARAM_PATTERN: Final = re.compile(r"""\brel\s*=\s*(?:"([^"]*)"|([^"\s,;]+))""", re.IGNORECASE)
+_SLUG_NON_ALPHANUM_PATTERN: Final = re.compile(r"[^a-z0-9]+")
 _MAX_TREE_PAGES: Final = 1000
+_BUNDLED_ASSETS_DIR: Final[Path] = (
+    Path(__file__).resolve().parent.parent / "wyoming_vietnamese" / "assets"
+)
+_ZEROTTS_LOCAL_ARTIFACT_NAMES: Final[frozenset[str]] = frozenset(
+    {f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}"}
+)
 
 
 class ModelCheckError(RuntimeError):
@@ -399,6 +413,15 @@ def _normalize_sha256_digest(value: object) -> str | None:
     return digest if _SHA256_PATTERN.fullmatch(digest) else None
 
 
+def _sha256_file(path: Path, chunk_size: int = 64 * 1024) -> str:
+    """Calculate the SHA-256 digest of a file incrementally."""
+    hasher = sha256()
+    with path.open("rb") as f:
+        while chunk := f.read(chunk_size):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
 def _remote_voice_names(timeout: int) -> tuple[str, ...]:
     """Read the NghiTTS voice catalogue."""
     payload = _require_dict(
@@ -435,7 +458,7 @@ def _remote_voice_artifacts(
 def _slugify_voice_name(name: str) -> str:
     """Return the repository's conventional ID form for a display name."""
     normalized = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
-    return re.sub(r"[^a-z0-9]+", "-", normalized.lower()).strip("-")
+    return _SLUG_NON_ALPHANUM_PATTERN.sub("-", normalized.lower()).strip("-")
 
 
 def _voice_artifacts_for_name(name: str) -> tuple[NghiTtsArtifact, ...]:
@@ -449,51 +472,64 @@ def _voice_artifacts_for_name(name: str) -> tuple[NghiTtsArtifact, ...]:
     )
 
 
+def _compare_tts_hashed(
+    remote_names: tuple[str, ...],
+    local_by_name: Mapping[str, NghiTtsVoiceSpec],
+    timeout: int,
+) -> list[VoiceComparison]:
+    """Compare remote NghiTTS voices while fetching and hashing artifacts."""
+    remote_jobs: list[
+        tuple[
+            str,
+            str | None,
+            tuple[NghiTtsArtifact, ...],
+            tuple[Future[str | None], ...],
+        ]
+    ] = []
+    executor = ThreadPoolExecutor(max_workers=_HASH_WORKERS)
+    try:
+        for name in remote_names:
+            local_voice = local_by_name.get(name)
+            artifacts = local_voice.artifacts if local_voice else _voice_artifacts_for_name(name)
+            futures = tuple(
+                executor.submit(_request_sha256, _artifact_url(artifact), timeout)
+                for artifact in artifacts
+            )
+            remote_jobs.append((name, local_voice.id if local_voice else None, artifacts, futures))
+        return [
+            VoiceComparison(name, voice_id, _remote_voice_artifacts(artifacts, futures))
+            for name, voice_id, artifacts, futures in remote_jobs
+        ]
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def _compare_tts_unhashed(
+    remote_names: tuple[str, ...],
+    local_by_name: Mapping[str, NghiTtsVoiceSpec],
+) -> list[VoiceComparison]:
+    """Compare remote NghiTTS voices without fetching or hashing artifacts."""
+    voices: list[VoiceComparison] = []
+    for name in remote_names:
+        local_voice = local_by_name.get(name)
+        artifacts = local_voice.artifacts if local_voice else _voice_artifacts_for_name(name)
+        comparisons = tuple(
+            ArtifactComparison(artifact.remote_name, artifact.sha256 or None, None)
+            for artifact in artifacts
+        )
+        voices.append(VoiceComparison(name, local_voice.id if local_voice else None, comparisons))
+    return voices
+
+
 def _compare_tts(timeout: int, *, hash_artifacts: bool) -> TtsComparison:
     """Compare the NghiTTS remote catalogue and artifacts with local pins."""
     remote_names = _remote_voice_names(timeout)
     local_by_name = {voice.name: voice for voice in NGHITTS_VOICES}
-    voices: list[VoiceComparison] = []
-    if hash_artifacts:
-        remote_jobs: list[
-            tuple[
-                str,
-                str | None,
-                tuple[NghiTtsArtifact, ...],
-                tuple[Future[str | None], ...],
-            ]
-        ] = []
-        executor = ThreadPoolExecutor(max_workers=_HASH_WORKERS)
-        try:
-            for name in remote_names:
-                local_voice = local_by_name.get(name)
-                artifacts = (
-                    local_voice.artifacts if local_voice else _voice_artifacts_for_name(name)
-                )
-                futures = tuple(
-                    executor.submit(_request_sha256, _artifact_url(artifact), timeout)
-                    for artifact in artifacts
-                )
-                remote_jobs.append(
-                    (name, local_voice.id if local_voice else None, artifacts, futures)
-                )
-            voices.extend(
-                VoiceComparison(name, voice_id, _remote_voice_artifacts(artifacts, futures))
-                for name, voice_id, artifacts, futures in remote_jobs
-            )
-        finally:
-            executor.shutdown(wait=True, cancel_futures=True)
-    else:
-        for name in remote_names:
-            local_voice = local_by_name.get(name)
-            artifacts = local_voice.artifacts if local_voice else _voice_artifacts_for_name(name)
-            comparisons = tuple(
-                ArtifactComparison(artifact.remote_name, artifact.sha256 or None, None)
-                for artifact in artifacts
-            )
-            voices.append(
-                VoiceComparison(name, local_voice.id if local_voice else None, comparisons)
-            )
+    voices = (
+        _compare_tts_hashed(remote_names, local_by_name, timeout)
+        if hash_artifacts
+        else _compare_tts_unhashed(remote_names, local_by_name)
+    )
 
     remote_name_set = set(remote_names)
     for local_voice in NGHITTS_VOICES:
@@ -675,8 +711,32 @@ def _build_zerotts_artifact_comparison(
     local_sha256: str | None,
     remote_entries: Mapping[str, str | None],
     fetched_hashes: Mapping[str, str | None],
+    *,
+    hash_artifacts: bool = True,
+    bundled_assets_dir: Path = _BUNDLED_ASSETS_DIR,
 ) -> ArtifactComparison:
     """Build one artifact comparison for ZeroTTS, resolving remote presence and hashes."""
+    if remote_name in _ZEROTTS_LOCAL_ARTIFACT_NAMES:
+        candidate = bundled_assets_dir / remote_name
+        if not candidate.is_file():
+            flat_candidate = bundled_assets_dir / Path(remote_name).name
+            if flat_candidate.is_file():
+                candidate = flat_candidate
+        if candidate.is_file():
+            actual_sha = _sha256_file(candidate) if hash_artifacts else None
+            return ArtifactComparison(
+                remote_name=remote_name,
+                local_sha256=local_sha256,
+                remote_sha256=actual_sha,
+                remote_present=True,
+            )
+        return ArtifactComparison(
+            remote_name=remote_name,
+            local_sha256=local_sha256,
+            remote_sha256=None,
+            remote_present=False,
+        )
+
     present = remote_name in remote_entries
     remote_sha = remote_entries.get(remote_name)
     if remote_sha is None and remote_name in fetched_hashes:
@@ -691,7 +751,12 @@ def _build_zerotts_artifact_comparison(
     )
 
 
-def _compare_zerotts(timeout: int, *, hash_artifacts: bool = True) -> ZeroTtsComparison:
+def _compare_zerotts(
+    timeout: int,
+    *,
+    hash_artifacts: bool = True,
+    bundled_assets_dir: Path = _BUNDLED_ASSETS_DIR,
+) -> ZeroTtsComparison:
     """Compare the ZeroTTS voice catalogue and required files with Hugging Face."""
     remote_revision = _remote_hf_revision(ZEROTTS_REPO_ID, timeout)
     remote_entries = _remote_hf_tree_entries(ZEROTTS_REPO_ID, remote_revision, timeout)
@@ -707,7 +772,9 @@ def _compare_zerotts(timeout: int, *, hash_artifacts: bool = True) -> ZeroTtsCom
         if missing_hashes := [
             art.remote_name
             for art in declared_artifacts
-            if art.remote_name in remote_entries and remote_entries.get(art.remote_name) is None
+            if art.remote_name not in _ZEROTTS_LOCAL_ARTIFACT_NAMES
+            and art.remote_name in remote_entries
+            and remote_entries.get(art.remote_name) is None
         ]:
             with ThreadPoolExecutor(max_workers=min(len(missing_hashes), _HASH_WORKERS)) as pool:
                 futures = {
@@ -729,6 +796,8 @@ def _compare_zerotts(timeout: int, *, hash_artifacts: bool = True) -> ZeroTtsCom
             artifact.sha256,
             remote_entries,
             fetched_hashes,
+            hash_artifacts=hash_artifacts,
+            bundled_assets_dir=bundled_assets_dir,
         )
         for artifact in ZEROTTS_MODEL.artifacts
     )
@@ -743,6 +812,8 @@ def _compare_zerotts(timeout: int, *, hash_artifacts: bool = True) -> ZeroTtsCom
                     voice.artifact.sha256,
                     remote_entries,
                     fetched_hashes,
+                    hash_artifacts=hash_artifacts,
+                    bundled_assets_dir=bundled_assets_dir,
                 ),
             ),
         )
@@ -764,15 +835,17 @@ def compare_models(
     timeout: int = _DEFAULT_TIMEOUT_SECONDS,
     *,
     hash_tts: bool = True,
+    bundled_assets_dir: Path = _BUNDLED_ASSETS_DIR,
 ) -> ComparisonReport:
     """Compare remote metadata with local speech model definitions.
 
     ``hash_tts`` controls artifact-body hashing for both NghiTTS and ZeroTTS.
+    ``bundled_assets_dir`` specifies the directory for local bundled assets.
     """
     return ComparisonReport(
         _compare_tts(timeout, hash_artifacts=hash_tts),
         _compare_stt(timeout),
-        _compare_zerotts(timeout, hash_artifacts=hash_tts),
+        _compare_zerotts(timeout, hash_artifacts=hash_tts, bundled_assets_dir=bundled_assets_dir),
     )
 
 
@@ -933,6 +1006,707 @@ def _report_to_dict(report: ComparisonReport) -> dict[str, object]:
     }
 
 
+def _find_exact_match(
+    pattern: str | re.Pattern[str],
+    content: str,
+    error_desc: str,
+    *,
+    flags: int = 0,
+) -> re.Match[str] | None:
+    """Find exactly one regex match in content, failing if ambiguous matches exist.
+
+    Args:
+        pattern: Regular expression pattern to search for.
+        content: Source text to search.
+        error_desc: Human-readable description of the target pin for error messages.
+        flags: Regular expression flags.
+
+    Returns:
+        The matched object, or None if no match is found.
+
+    Raises:
+        ModelCheckError: If multiple matches are found for the pattern.
+    """
+    compiled = re.compile(pattern, flags=flags) if isinstance(pattern, str) else pattern
+    matches = list(compiled.finditer(content))
+    if len(matches) > 1:
+        raise ModelCheckError(f"Ambiguous matches found while updating {error_desc}")
+    return matches[0] if matches else None
+
+
+def _replace_exact_match(
+    pattern: str | re.Pattern[str],
+    replacement: str,
+    content: str,
+    error_desc: str,
+    *,
+    flags: int = 0,
+) -> tuple[str, int]:
+    """Replace exactly one regex match in content, failing if ambiguous matches exist.
+
+    Args:
+        pattern: Regular expression pattern to search for.
+        replacement: String to replace the match with.
+        content: Source text to perform replacement in.
+        error_desc: Human-readable description of the target pin for error messages.
+        flags: Regular expression flags.
+
+    Returns:
+        A tuple of (updated_content, match_count) where match_count is 0 or 1.
+
+    Raises:
+        ModelCheckError: If multiple matches are found for the pattern.
+    """
+    compiled = re.compile(pattern, flags=flags) if isinstance(pattern, str) else pattern
+    match = _find_exact_match(compiled, content, error_desc, flags=flags)
+    if match is None:
+        return content, 0
+    return compiled.sub(replacement, content, count=1), 1
+
+
+def _update_stt_revisions_in_content(
+    content: str,
+    models: tuple[SttModelComparison, ...],
+    changes: list[str],
+) -> str:
+    """Update STT model revisions in stt_model.py content."""
+    for model in models:
+        if not (model.revision_changed and model.remote_revision):
+            continue
+        if unresolved := [
+            art.remote_name for art in model.artifacts if art.status in {"UNKNOWN", "REMOVED"}
+        ]:
+            names = ", ".join(dict.fromkeys(unresolved))
+            raise ModelCheckError(
+                f"Cannot update revision for STT model '{model.engine}' ({model.repo}): "
+                f"unresolved artifacts: {names}"
+            )
+        pattern = (
+            rf'(repo\s*=\s*["\']{re.escape(model.repo)}["\']\s*,\s*'
+            r'revision\s*=\s*)["\'][^"\']+["\']'
+        )
+        new_content, count = _replace_exact_match(
+            pattern,
+            rf'\g<1>"{model.remote_revision}"',
+            content,
+            f"revision pin for STT model '{model.engine}' ({model.repo})",
+        )
+        if count == 0:
+            raise ModelCheckError(
+                f"Failed to find revision pin for STT model '{model.engine}' ({model.repo})"
+            )
+        if new_content != content:
+            content = new_content
+            changes.append(
+                f"STT [{model.engine}] revision: {model.local_revision} -> {model.remote_revision}"
+            )
+    return content
+
+
+def _update_one_stt_artifact(
+    content: str,
+    model: SttModelComparison,
+    art: ArtifactComparison,
+    changes: list[str],
+) -> str:
+    """Update one STT artifact digest targeted by model repo and artifact name."""
+    if not (
+        art.status == "CHANGED"
+        and art.local_sha256
+        and art.remote_sha256
+        and _SHA256_PATTERN.match(art.remote_sha256)
+    ):
+        return content
+
+    pattern = (
+        rf'(repo\s*=\s*["\']{re.escape(model.repo)}["\'](?:(?!repo\s*=).)*?'
+        rf'SttArtifact\(\s*["\']{re.escape(art.remote_name)}["\']\s*,\s*["\'][^"\']*?["\']\s*,\s*)'
+        rf'["\']{re.escape(art.local_sha256)}["\']'
+    )
+    new_content, count = _replace_exact_match(
+        pattern,
+        rf'\g<1>"{art.remote_sha256}"',
+        content,
+        f"STT artifact '{art.remote_name}' in model '{model.engine}'",
+        flags=re.DOTALL,
+    )
+    if count == 0:
+        raise ModelCheckError(
+            f"Failed to update pin for STT artifact '{art.remote_name}' in model "
+            f"'{model.engine}' ({model.repo})"
+        )
+    if new_content != content:
+        changes.append(
+            f"STT [{model.engine}] {art.remote_name}: {art.local_sha256} -> {art.remote_sha256}"
+        )
+        return new_content
+    return content
+
+
+def _update_stt_artifacts_in_content(
+    content: str,
+    models: tuple[SttModelComparison, ...],
+    changes: list[str],
+) -> str:
+    """Update STT artifact digests in stt_model.py content."""
+    for model in models:
+        for art in model.artifacts:
+            content = _update_one_stt_artifact(content, model, art, changes)
+    return content
+
+
+def _sync_dir(path: Path) -> None:
+    """Flush directory changes to durable storage when supported."""
+    try:
+        dir_fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
+
+
+def _atomic_write_text(target_path: Path, content: str, encoding: str = "utf-8") -> None:
+    """Atomically write text content to target_path via a temporary file."""
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding=encoding,
+            dir=target_path.parent,
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            temp_file.write(content)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        if target_path.is_file():
+            shutil.copymode(target_path, temp_path)
+        os.replace(temp_path, target_path)
+        _sync_dir(target_path.parent)
+    except Exception:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        raise
+
+
+def _has_changed_artifact(artifacts: Iterable[ArtifactComparison]) -> bool:
+    """Return whether any artifact in the collection has a valid changed digest."""
+    return any(
+        art.status == "CHANGED"
+        and bool(art.local_sha256)
+        and bool(art.remote_sha256)
+        and bool(_SHA256_PATTERN.match(art.remote_sha256))
+        for art in artifacts
+    )
+
+
+def _stt_has_changes(stt: SttComparison) -> bool:
+    """Return whether the STT comparison contains any revision or artifact updates."""
+    return any(
+        (model.revision_changed and bool(model.remote_revision))
+        or _has_changed_artifact(model.artifacts)
+        for model in stt.models
+    )
+
+
+def _plan_stt_model_updates(stt_path: Path, stt: SttComparison) -> tuple[str, str, list[str]]:
+    """Compute updated content and change summary for stt_model.py.
+
+    Returns:
+        A tuple of (original_content, new_content, changes).
+
+    Raises:
+        ModelCheckError: If stt_model.py is missing when changes are required, or
+            if any changed artifact or revision cannot be matched.
+    """
+    if not _stt_has_changes(stt):
+        return "", "", []
+    if not stt_path.is_file():
+        raise ModelCheckError(f"Cannot update STT pins: '{stt_path}' does not exist")
+
+    try:
+        original = stt_path.read_text(encoding="utf-8")
+    except OSError as err:
+        raise ModelCheckError(f"Cannot read STT pins from '{stt_path}': {err}") from err
+    changes: list[str] = []
+    content = _update_stt_revisions_in_content(original, stt.models, changes)
+    content = _update_stt_artifacts_in_content(content, stt.models, changes)
+    return (original, content, changes) if changes else (original, original, [])
+
+
+def _zerotts_artifact_identifier_patterns(remote_name: str) -> list[str]:
+    """Return regex patterns matching source code identifiers for a ZeroTTS artifact."""
+    patterns = [rf'["\']{re.escape(remote_name)}["\']']
+    for member in ZeroTtsFile:
+        if remote_name == member.value:
+            patterns.append(rf"ZeroTtsFile\.{member.name}")
+        elif remote_name == f"gguf/{member.value}":
+            patterns.append(rf'f?["\']gguf/\{{ZeroTtsFile\.{member.name}\}}["\']')
+        elif remote_name == f"onnx/codec/{member.value}":
+            patterns.append(rf'f?["\']onnx/codec/\{{ZeroTtsFile\.{member.name}\}}["\']')
+    return patterns
+
+
+def _update_one_zerotts_artifact(
+    content: str,
+    art: ArtifactComparison,
+    changes: list[str],
+) -> str:
+    """Update one ZeroTTS artifact digest targeted by declaration or constant."""
+    if not (
+        art.status == "CHANGED"
+        and art.local_sha256
+        and art.remote_sha256
+        and _SHA256_PATTERN.match(art.remote_sha256)
+    ):
+        return content
+
+    if art.remote_name in _ZEROTTS_LOCAL_ARTIFACT_NAMES:
+        pattern = r'(ZEROTTS_CODEC_INT8_SHA256\s*=\s*)["\'][0-9a-fA-F]{64}["\']'
+        new_content, count = _replace_exact_match(
+            pattern,
+            rf'\g<1>"{art.remote_sha256}"',
+            content,
+            f"ZeroTTS local codec pin '{art.remote_name}'",
+        )
+        if count == 0:
+            raise ModelCheckError(
+                f"Failed to update ZeroTTS local codec pin for '{art.remote_name}'"
+            )
+        if new_content != content:
+            changes.append(
+                f"ZeroTTS local codec {art.remote_name}: {art.local_sha256} -> {art.remote_sha256}"
+            )
+            return new_content
+        return content
+
+    ident_pattern = "|".join(_zerotts_artifact_identifier_patterns(art.remote_name))
+    pattern = (
+        rf"((?:ZeroTtsArtifact\(\s*)?(?:{ident_pattern})\s*,\s*"
+        rf'(?:ZeroTtsFile\.[A-Za-z0-9_]+|f?["\'][^"\']*?["\'])\s*,\s*)'
+        rf'["\']{re.escape(art.local_sha256)}["\']'
+    )
+    new_content, count = _replace_exact_match(
+        pattern,
+        rf'\g<1>"{art.remote_sha256}"',
+        content,
+        f"ZeroTTS core artifact pin '{art.remote_name}'",
+        flags=re.DOTALL,
+    )
+    if count == 0:
+        fallback = (
+            rf"(ZEROTTS_MODEL\s*=\s*ZeroTtsModelSpec\((?:(?!ZeroTtsModelSpec).)*?"
+            rf"(?:{ident_pattern})(?:(?!ZeroTtsModelSpec).)*?)"
+            rf'["\']{re.escape(art.local_sha256)}["\']'
+        )
+        new_content, count = _replace_exact_match(
+            fallback,
+            rf'\g<1>"{art.remote_sha256}"',
+            content,
+            f"ZeroTTS core artifact pin '{art.remote_name}'",
+            flags=re.DOTALL,
+        )
+    if count == 0:
+        raise ModelCheckError(f"Failed to update ZeroTTS core artifact pin for '{art.remote_name}'")
+    if new_content != content:
+        changes.append(f"ZeroTTS core {art.remote_name}: {art.local_sha256} -> {art.remote_sha256}")
+        return new_content
+    return content
+
+
+def _update_zerotts_artifacts_in_content(
+    content: str,
+    zerotts: ZeroTtsComparison,
+    changes: list[str],
+) -> str:
+    """Update ZeroTTS core and local codec hashes in tts_model.py content."""
+    for art in zerotts.artifacts:
+        content = _update_one_zerotts_artifact(content, art, changes)
+    return content
+
+
+def _update_one_zerotts_voice(
+    content: str,
+    voice: VoiceComparison,
+    changes: list[str],
+) -> str:
+    """Update artifact digests for one ZeroTTS voice targeted by voice declaration."""
+    voice_key = voice.voice_id or voice.name
+    for art in voice.artifacts:
+        if not (
+            art.status == "CHANGED"
+            and art.local_sha256
+            and art.remote_sha256
+            and _SHA256_PATTERN.match(art.remote_sha256)
+        ):
+            continue
+        pattern = (
+            rf'(_zerotts_voice\(\s*["\']{re.escape(voice_key)}["\']'
+            rf'(?:\s*,\s*["\'][^"\']*?["\'])+\s*,\s*)'
+            rf'["\']{re.escape(art.local_sha256)}["\']'
+        )
+        new_content, count = _replace_exact_match(
+            pattern,
+            rf'\g<1>"{art.remote_sha256}"',
+            content,
+            f"ZeroTTS voice pin for '{voice.name}' ({voice_key})",
+            flags=re.DOTALL,
+        )
+        if count == 0 and voice.voice_id and voice.name:
+            fallback = (
+                rf'(_zerotts_voice\(\s*["\'][^"\']*?["\']\s*,\s*["\']{re.escape(voice.name)}["\']'
+                rf'(?:\s*,\s*["\'][^"\']*?["\'])+\s*,\s*)'
+                rf'["\']{re.escape(art.local_sha256)}["\']'
+            )
+            new_content, count = _replace_exact_match(
+                fallback,
+                rf'\g<1>"{art.remote_sha256}"',
+                content,
+                f"ZeroTTS voice pin for '{voice.name}' ({voice_key})",
+                flags=re.DOTALL,
+            )
+        if count == 0:
+            raise ModelCheckError(
+                f"Failed to update ZeroTTS voice pin for '{voice.name}' ({voice_key})"
+            )
+        if new_content != content:
+            content = new_content
+            changes.append(
+                f"ZeroTTS voice [{voice.name}] {art.remote_name}: "
+                f"{art.local_sha256} -> {art.remote_sha256}"
+            )
+    return content
+
+
+def _update_zerotts_voices_in_content(
+    content: str,
+    voices: Iterable[VoiceComparison],
+    changes: list[str],
+) -> str:
+    """Update ZeroTTS voice artifact hashes in tts_model.py content."""
+    for voice in voices:
+        content = _update_one_zerotts_voice(content, voice, changes)
+    return content
+
+
+def _update_nghitts_config_pin(
+    content: str,
+    voice: VoiceComparison,
+    voice_key: str,
+    local_sha256: str,
+    remote_sha256: str,
+    changes: list[str],
+    updated_shared_constants: set[str],
+) -> tuple[str, bool]:
+    """Update shared NghiTTS config constant or verify it was already updated."""
+    config_pattern = (
+        r"((?P<const_name>_NGHITTS_COMMON_CONFIG_SHA256|_NGHITTS_SOUTH_CONFIG_SHA256)\s*=\s*)"
+        rf'["\']{re.escape(local_sha256)}["\']'
+    )
+    match = _find_exact_match(
+        config_pattern,
+        content,
+        f"NghiTTS config pin for '{voice.name}' ({voice_key})",
+    )
+    if match is not None:
+        const_name = match.group("const_name")
+        if const_name in updated_shared_constants:
+            return content, True
+        new_content, count = _replace_exact_match(
+            config_pattern,
+            rf'\g<1>"{remote_sha256}"',
+            content,
+            f"NghiTTS config pin for '{voice.name}' ({voice_key})",
+        )
+        if count > 0:
+            updated_shared_constants.add(const_name)
+            changes.append(f"NghiTTS config [{const_name}]: {local_sha256} -> {remote_sha256}")
+            return new_content, True
+    already_updated_pattern = (
+        r"(?:_NGHITTS_COMMON_CONFIG_SHA256|_NGHITTS_SOUTH_CONFIG_SHA256)\s*=\s*"
+        rf'["\']{re.escape(remote_sha256)}["\']'
+    )
+    if re.search(already_updated_pattern, content):
+        return content, True
+    return content, False
+
+
+def _update_one_nghitts_voice(
+    content: str,
+    voice: VoiceComparison,
+    changes: list[str],
+    updated_shared_constants: set[str],
+) -> str:
+    """Update artifact digests for one NghiTTS voice targeted by voice declaration."""
+    voice_key = voice.voice_id or voice.name
+    for art in voice.artifacts:
+        if not (
+            art.status == "CHANGED"
+            and art.local_sha256
+            and art.remote_sha256
+            and _SHA256_PATTERN.match(art.remote_sha256)
+        ):
+            continue
+
+        local_sha = art.local_sha256
+        remote_sha = art.remote_sha256
+
+        pattern = (
+            rf'((?:_voice|_south_voice)\(\s*["\']{re.escape(voice_key)}["\']'
+            rf'(?:\s*,\s*["\'][^"\']*?["\'])+\s*,\s*)'
+            rf'["\']{re.escape(local_sha)}["\']'
+        )
+        new_content, count = _replace_exact_match(
+            pattern,
+            rf'\g<1>"{remote_sha}"',
+            content,
+            f"NghiTTS voice pin for '{voice.name}' ({voice_key})",
+            flags=re.DOTALL,
+        )
+        if count == 0 and voice.voice_id and voice.name:
+            fallback = (
+                rf'((?:_voice|_south_voice)\(\s*["\'][^"\']*?["\']\s*,\s*'
+                rf'["\']{re.escape(voice.name)}["\']\s*,\s*)'
+                rf'["\']{re.escape(local_sha)}["\']'
+            )
+            new_content, count = _replace_exact_match(
+                fallback,
+                rf'\g<1>"{remote_sha}"',
+                content,
+                f"NghiTTS voice pin for '{voice.name}' ({voice_key})",
+                flags=re.DOTALL,
+            )
+        if count == 0:
+            content, success = _update_nghitts_config_pin(
+                content,
+                voice,
+                voice_key,
+                local_sha,
+                remote_sha,
+                changes,
+                updated_shared_constants,
+            )
+            if success:
+                continue
+            raise ModelCheckError(
+                f"Failed to update NghiTTS voice pin for '{voice.name}' ({voice_key})"
+            )
+        if new_content != content:
+            content = new_content
+            changes.append(
+                f"NghiTTS voice [{voice.name}] {art.remote_name}: {local_sha} -> {remote_sha}"
+            )
+    return content
+
+
+def _update_nghitts_voices_in_content(
+    content: str,
+    voices: Iterable[VoiceComparison],
+    changes: list[str],
+) -> str:
+    """Update NghiTTS voice artifact hashes in tts_model.py content."""
+    updated_shared_constants: set[str] = set()
+    for voice in voices:
+        content = _update_one_nghitts_voice(content, voice, changes, updated_shared_constants)
+    return content
+
+
+def _tts_has_changes(tts: TtsComparison, zerotts: ZeroTtsComparison) -> bool:
+    """Return whether the TTS comparison contains any revision, artifact, or voice updates."""
+    if zerotts.revision_changed and bool(zerotts.remote_revision):
+        return True
+    if _has_changed_artifact(zerotts.artifacts):
+        return True
+    if any(_has_changed_artifact(voice.artifacts) for voice in zerotts.voices):
+        return True
+    return any(_has_changed_artifact(voice.artifacts) for voice in tts.voices)
+
+
+def _plan_tts_model_updates(
+    tts_path: Path,
+    tts: TtsComparison,
+    zerotts: ZeroTtsComparison,
+) -> tuple[str, str, list[str]]:
+    """Compute updated content and change summary for tts_model.py.
+
+    Returns:
+        A tuple of (original_content, new_content, changes).
+
+    Raises:
+        ModelCheckError: If tts_model.py is missing when changes are required, or
+            if any changed artifact, revision, or voice cannot be matched.
+    """
+    if not _tts_has_changes(tts, zerotts):
+        return "", "", []
+    if not tts_path.is_file():
+        raise ModelCheckError(f"Cannot update TTS pins: '{tts_path}' does not exist")
+
+    try:
+        original = tts_path.read_text(encoding="utf-8")
+    except OSError as err:
+        raise ModelCheckError(f"Cannot read TTS pins from '{tts_path}': {err}") from err
+    changes: list[str] = []
+    content = original
+
+    if zerotts.revision_changed and zerotts.remote_revision:
+        unresolved = [
+            art.remote_name
+            for art in zerotts.artifacts
+            if art.remote_name not in _ZEROTTS_LOCAL_ARTIFACT_NAMES
+            and art.status in {"UNKNOWN", "REMOVED"}
+        ]
+        for voice in zerotts.voices:
+            unresolved.extend(
+                art.remote_name for art in voice.artifacts if art.status in {"UNKNOWN", "REMOVED"}
+            )
+        if unresolved:
+            names = ", ".join(dict.fromkeys(unresolved))
+            raise ModelCheckError(f"Cannot update ZeroTTS revision: unresolved artifacts: {names}")
+        pattern = r'(repo\s*=\s*ZEROTTS_REPO_ID\s*,\s*revision\s*=\s*["\'])([^"\']+)(["\'])'
+        match = _find_exact_match(pattern, content, f"ZeroTTS revision pin in {tts_path.name}")
+        if match is None:
+            raise ModelCheckError(
+                f"Failed to update ZeroTTS revision pin to '{zerotts.remote_revision}' "
+                f"in {tts_path.name}"
+            )
+        old_revision = match.group(2)
+        if old_revision != zerotts.remote_revision:
+            content = content[: match.start(2)] + zerotts.remote_revision + content[match.end(2) :]
+            changes.append(f"ZeroTTS revision: {old_revision} -> {zerotts.remote_revision}")
+
+    content = _update_zerotts_artifacts_in_content(content, zerotts, changes)
+    content = _update_zerotts_voices_in_content(content, zerotts.voices, changes)
+    content = _update_nghitts_voices_in_content(content, tts.voices, changes)
+
+    return (original, content, changes) if changes else (original, original, [])
+
+
+@dataclass(frozen=True, slots=True)
+class _FileBackup:
+    """Snapshot of file existence, content, and metadata prior to writing."""
+
+    path: Path
+    existed: bool
+    content: str
+    stat_result: os.stat_result | None = None
+
+
+def _snapshot_file(path: Path, original_content: str) -> _FileBackup:
+    """Capture whether path exists, its content, and its metadata."""
+    if not path.is_file():
+        return _FileBackup(path=path, existed=False, content=original_content, stat_result=None)
+    try:
+        stat_result = path.stat()
+    except OSError:
+        stat_result = None
+    return _FileBackup(path=path, existed=True, content=original_content, stat_result=stat_result)
+
+
+def _restore_file_metadata(backup: _FileBackup) -> None:
+    """Restore file permissions, timestamps, and flags from snapshot."""
+    if backup.stat_result is None or not backup.path.is_file():
+        return
+    stat_res = backup.stat_result
+    mode = stat.S_IMODE(stat_res.st_mode)
+    os.chmod(backup.path, mode)
+    os.utime(backup.path, ns=(stat_res.st_atime_ns, stat_res.st_mtime_ns))
+    flags = getattr(stat_res, "st_flags", None)
+    chflags_fn = getattr(os, "chflags", None)
+    if flags is not None and callable(chflags_fn):
+        with suppress(OSError):
+            chflags_fn(backup.path, flags)
+
+
+def _rollback_single_file(backup: _FileBackup) -> None:
+    """Restore path to its pre-transaction state and metadata."""
+    if not backup.existed:
+        backup.path.unlink(missing_ok=True)
+        return
+
+    needs_content_write = True
+    with suppress(Exception):
+        if backup.path.is_file() and backup.path.read_text(encoding="utf-8") == backup.content:
+            needs_content_write = False
+
+    if needs_content_write:
+        _atomic_write_text(backup.path, backup.content)
+
+    _restore_file_metadata(backup)
+
+
+def _apply_transactional_writes(updates: list[tuple[Path, str, str]]) -> None:
+    """Apply planned file updates atomically with automatic rollback on error.
+
+    Args:
+        updates: List of (target_path, new_content, original_content) tuples.
+
+    Raises:
+        ModelCheckError: If applying updates fails, preserving the original cause
+            and reporting any rollback failures.
+    """
+    attempted_writes: list[_FileBackup] = []
+    try:
+        for path, new_content, original_content in updates:
+            backup = _snapshot_file(path, original_content)
+            attempted_writes.append(backup)
+            _atomic_write_text(path, new_content)
+    except Exception as write_err:
+        rollback_failures: list[str] = []
+        for backup in reversed(attempted_writes):
+            try:
+                _rollback_single_file(backup)
+            except Exception as rb_err:
+                rollback_failures.append(f"{backup.path.name} ({rb_err})")
+        if rollback_failures:
+            error_details = ", ".join(rollback_failures)
+            msg = (
+                f"Failed to write model pin updates: {write_err}. "
+                f"Additionally, rollback failed for: {error_details}"
+            )
+        else:
+            msg = f"Failed to write model pin updates: {write_err}"
+        raise ModelCheckError(msg) from write_err
+
+
+def update_model_pins(
+    report: ComparisonReport,
+    models_dir: Path | None = None,
+) -> list[str]:
+    """Update pinned SHA-256 digests and revisions in local model definition files.
+
+    Args:
+        report: Model comparison report containing remote and local digest differences.
+        models_dir: Directory containing tts_model.py and stt_model.py (defaults to
+            package root).
+
+    Returns:
+        List of human-readable messages describing the applied changes.
+
+    Raises:
+        ModelCheckError: If a required model definition file is missing or if
+            any pin update cannot be matched in the source files.
+    """
+    target_dir = models_dir or (Path(__file__).resolve().parent.parent / "wyoming_vietnamese")
+    stt_path = target_dir / "stt_model.py"
+    tts_path = target_dir / "tts_model.py"
+
+    orig_stt, new_stt, stt_changes = _plan_stt_model_updates(stt_path, report.stt)
+    orig_tts, new_tts, tts_changes = _plan_tts_model_updates(tts_path, report.tts, report.zerotts)
+
+    updates_to_write: list[tuple[Path, str, str]] = []
+    if stt_changes:
+        updates_to_write.append((stt_path, new_stt, orig_stt))
+    if tts_changes:
+        updates_to_write.append((tts_path, new_tts, orig_tts))
+
+    _apply_transactional_writes(updates_to_write)
+    return [*stt_changes, *tts_changes]
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line options."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -943,12 +1717,51 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--json", action="store_true", help="print machine-readable JSON")
     parser.add_argument(
+        "--update",
+        action="store_true",
+        help="update pinned SHA-256 hashes and revisions in tts_model.py and stt_model.py",
+    )
+    parser.add_argument(
         "--timeout",
         type=int,
         default=_DEFAULT_TIMEOUT_SECONDS,
         help=f"HTTP timeout in seconds (default: {_DEFAULT_TIMEOUT_SECONDS})",
     )
     return parser.parse_args(argv)
+
+
+def _handle_update_result(report: ComparisonReport, json_output: bool) -> None:
+    """Apply updates to model definition files and output summary."""
+    changes = update_model_pins(report)
+    has_voice_review = bool(
+        report.tts.added_names
+        or report.tts.removed_names
+        or report.zerotts.added_voice_ids
+        or report.zerotts.removed_voice_ids
+    )
+    if json_output:
+        payload: dict[str, object] = {
+            "updated": changes,
+            "report": _report_to_dict(report),
+        }
+        if has_voice_review:
+            payload["note"] = "Voice additions or removals require manual review."
+        print(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+    if changes:
+        print("UPDATED MODEL PINS:")
+        for change in changes:
+            print(f"  {change}")
+    else:
+        print("All model pins are already up to date.")
+    if has_voice_review:
+        print("NOTE: Voice additions or removals require manual review.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -959,7 +1772,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         report = compare_models(args.timeout, hash_tts=not args.skip_tts_hashes)
-    except ModelCheckError as err:
+        if args.update:
+            _handle_update_result(report, args.json)
+            return 0
+    except (ModelCheckError, OSError) as err:
         print(f"ERROR: {err}", file=sys.stderr)
         return 2
     if args.json:

@@ -123,6 +123,8 @@ _LOGGER = logging.getLogger(__name__)
 
 _DOWNLOAD_TIMEOUT_SECONDS: Final[float] = 60.0
 
+_BUNDLED_ASSETS_DIR: Final[Path] = Path(__file__).resolve().parent / "assets"
+
 
 def setup_hf_environment(cache_dir: Path, offline: bool = False) -> None:
     """Point Hugging Face home and its default Hub cache at persistent storage."""
@@ -879,6 +881,44 @@ def _structure_zerotts_hybrid_artifact(
     return dst
 
 
+def _find_zerotts_int8_codec_candidates(
+    snapshot_path: Path,
+    artifact: ZeroTtsArtifact,
+) -> tuple[Path, ...]:
+    """Return candidate search locations for the optional ZeroTTS INT8 codec model."""
+    return (
+        snapshot_path / artifact.remote_name,
+        snapshot_path / artifact.local_name,
+        _BUNDLED_ASSETS_DIR / artifact.local_name,
+        _BUNDLED_ASSETS_DIR / Path(artifact.local_name).name,
+    )
+
+
+def _locate_zerotts_int8_codec_source(
+    snapshot_path: Path,
+    artifact: ZeroTtsArtifact,
+) -> Path | None:
+    """Locate optional ZeroTTS INT8 codec model across snapshot and bundled package assets."""
+    search_locations = _find_zerotts_int8_codec_candidates(snapshot_path, artifact)
+    existing_candidates = [candidate for candidate in search_locations if candidate.is_file()]
+    if not existing_candidates:
+        _LOGGER.debug(
+            "Optional ZeroTTS INT8 codec asset not found in snapshot %s "
+            "or package assets; falling back to FP32",
+            snapshot_path,
+        )
+        return None
+
+    for candidate in existing_candidates:
+        if _is_verified_file(candidate, artifact.sha256):
+            return candidate
+
+    raise RuntimeError(
+        f"Pinned ZeroTTS artifact {artifact.remote_name!r} does not match its recorded "
+        f"SHA-256 digest"
+    )
+
+
 def _structure_zerotts_artifact(
     snapshot_path: Path,
     dest_dir: Path,
@@ -890,32 +930,14 @@ def _structure_zerotts_artifact(
         return _structure_zerotts_hybrid_artifact(snapshot_path, dst, artifact)
 
     if artifact.local_name == f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}":
-        source = snapshot_path / artifact.remote_name
-        if not source.is_file():
-            alt_source = snapshot_path / artifact.local_name
-            if alt_source.is_file():
-                source = alt_source
-            else:
-                _LOGGER.debug(
-                    "Optional ZeroTTS INT8 codec asset not found in snapshot %s; "
-                    "falling back to FP32",
-                    snapshot_path,
-                )
-                return None
-        if not _is_verified_file(source, artifact.sha256):
-            raise RuntimeError(
-                f"Pinned ZeroTTS artifact {artifact.remote_name!r} does not match its recorded "
-                f"SHA-256 digest"
-            )
-        _copy_or_link(source, dst)
-        if not _is_verified_file(dst, artifact.sha256):
-            raise RuntimeError(
-                f"Structured ZeroTTS artifact {artifact.local_name!r} does not match its "
-                f"recorded SHA-256 digest"
-            )
-        return dst
+        if not dst.is_symlink() and _is_verified_file(dst, artifact.sha256):
+            return dst
+        source = _locate_zerotts_int8_codec_source(snapshot_path, artifact)
+        if source is None:
+            return None
+    else:
+        source = _verified_zerotts_source(snapshot_path, artifact)
 
-    source = _verified_zerotts_source(snapshot_path, artifact)
     _copy_or_link(source, dst)
     if not _is_verified_file(dst, artifact.sha256):
         raise RuntimeError(
