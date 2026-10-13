@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 from contextlib import AbstractContextManager, closing
 from email.message import Message
 from hashlib import sha256
 from io import BytesIO
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import quote, unquote
 from urllib.request import Request
@@ -14,7 +16,7 @@ from urllib.request import Request
 import pytest
 
 from tools import check_models
-from wyoming_vietnamese.const import ZEROTTS_REPO_ID
+from wyoming_vietnamese.const import ZEROTTS_REPO_ID, ZeroTtsFile
 from wyoming_vietnamese.stt_model import GIPFORMER_MODEL, ZIPFORMER_MODEL
 from wyoming_vietnamese.tts_model import NGHITTS_VOICES, ZEROTTS_MODEL, ZEROTTS_VOICES
 
@@ -289,7 +291,7 @@ def test_compare_zerotts_detects_added_and_removed_voices_and_missing_files(
     assert config_art.remote_present is True
 
     missing_arts = [art for art in comparison.artifacts if not art.remote_present]
-    assert len(missing_arts) == len(check_models._ZEROTTS_CORE_FILES) - 1
+    assert len(missing_arts) == len(check_models._ZEROTTS_CORE_FILES) - 2
 
 
 def test_compare_zerotts_fetches_voice_and_codec_hashes_when_missing_from_tree(
@@ -719,3 +721,1134 @@ def test_stt_comparison_properties() -> None:
     comp_unknown = check_models.SttComparison((m1, m2_unknown))
     assert comp_unknown.revision_changed is False
     assert comp_unknown.needs_update is False
+
+
+def _mock_zerotts_remote_repo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mock remote revision and tree endpoints for ZeroTTS repo."""
+    monkeypatch.setattr(
+        check_models, "_remote_hf_revision", lambda _repo, _timeout: ZEROTTS_MODEL.revision
+    )
+    monkeypatch.setattr(check_models, "_remote_hf_tree_entries", lambda _repo, _rev, _timeout: {})
+
+
+def _find_int8_artifact(
+    comparison: check_models.ZeroTtsComparison,
+) -> check_models.ArtifactComparison:
+    """Find the INT8 codec artifact comparison within a ZeroTTS comparison."""
+    return next(
+        a
+        for a in comparison.artifacts
+        if a.remote_name == f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}"
+    )
+
+
+def test_compare_zerotts_handles_local_bundled_asset_present(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Test ZeroTTS comparison resolves local bundled assets matching pinned hash."""
+    _mock_zerotts_remote_repo(monkeypatch)
+    fake_assets = tmp_path / "assets"
+    int8_file = fake_assets / "onnx" / "codec" / ZeroTtsFile.DECODE_STEP_INT8_ONNX
+    int8_file.parent.mkdir(parents=True, exist_ok=True)
+    int8_file.write_bytes(b"int8_model_content")
+    int8_sha = sha256(b"int8_model_content").hexdigest()
+
+    comparison = check_models._compare_zerotts(
+        timeout=1,
+        hash_artifacts=True,
+        bundled_assets_dir=fake_assets,
+    )
+    int8_comp = _find_int8_artifact(comparison)
+    assert int8_comp.remote_present is True
+    assert int8_comp.remote_sha256 == int8_sha
+
+
+def test_compare_zerotts_handles_local_bundled_asset_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Test ZeroTTS comparison marks local bundled assets REMOVED when file is missing."""
+    _mock_zerotts_remote_repo(monkeypatch)
+    empty_assets = tmp_path / "empty_assets"
+    empty_assets.mkdir(parents=True, exist_ok=True)
+
+    comparison = check_models._compare_zerotts(
+        timeout=1,
+        hash_artifacts=False,
+        bundled_assets_dir=empty_assets,
+    )
+    int8_comp = _find_int8_artifact(comparison)
+    assert int8_comp.remote_present is False
+    assert int8_comp.status == "REMOVED"
+
+
+def test_compare_zerotts_handles_local_bundled_asset_changed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Test ZeroTTS comparison marks local bundled assets CHANGED when file hash differs."""
+    _mock_zerotts_remote_repo(monkeypatch)
+    fake_assets = tmp_path / "assets"
+    flat_int8 = fake_assets / ZeroTtsFile.DECODE_STEP_INT8_ONNX
+    flat_int8.parent.mkdir(parents=True, exist_ok=True)
+    flat_int8.write_bytes(b"different_content")
+
+    comparison = check_models._compare_zerotts(
+        timeout=1,
+        hash_artifacts=True,
+        bundled_assets_dir=fake_assets,
+    )
+    int8_comp = _find_int8_artifact(comparison)
+    assert int8_comp.remote_present is True
+    assert int8_comp.remote_sha256 == sha256(b"different_content").hexdigest()
+    assert int8_comp.status == "CHANGED"
+
+
+def test_compare_zerotts_handles_local_bundled_asset_unhashed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Test ZeroTTS comparison skips local bundled asset hashing when hash_artifacts is False."""
+    _mock_zerotts_remote_repo(monkeypatch)
+    fake_assets = tmp_path / "assets"
+    int8_file = fake_assets / "onnx" / "codec" / ZeroTtsFile.DECODE_STEP_INT8_ONNX
+    int8_file.parent.mkdir(parents=True, exist_ok=True)
+    int8_file.write_bytes(b"int8_model_content")
+
+    comparison = check_models._compare_zerotts(
+        timeout=1,
+        hash_artifacts=False,
+        bundled_assets_dir=fake_assets,
+    )
+    int8_comp = _find_int8_artifact(comparison)
+    assert int8_comp.remote_present is True
+    assert int8_comp.remote_sha256 is None
+    assert int8_comp.status == "UNKNOWN"
+
+
+def _assert_file_contains(path: Path, *expected_substrings: str) -> None:
+    """Assert that the specified file contains all expected substrings."""
+    content = path.read_text(encoding="utf-8")
+    for substring in expected_substrings:
+        assert substring in content
+
+
+def _make_test_report(
+    *,
+    stt_models: tuple[check_models.SttModelComparison, ...] = (),
+    zerotts_revision: str = ZEROTTS_MODEL.revision,
+    zerotts_remote_voice_ids: tuple[str, ...] = (),
+    zerotts_artifacts: tuple[check_models.ArtifactComparison, ...] = (),
+    zerotts_voices: tuple[check_models.VoiceComparison, ...] = (),
+    tts_voices: tuple[check_models.VoiceComparison, ...] = (),
+    tts_remote_names: tuple[str, ...] = (),
+) -> check_models.ComparisonReport:
+    """Build a ComparisonReport fixture for tests with convenient defaults."""
+    return check_models.ComparisonReport(
+        stt=check_models.SttComparison(models=stt_models),
+        zerotts=check_models.ZeroTtsComparison(
+            repo=ZEROTTS_REPO_ID,
+            remote_revision=zerotts_revision,
+            remote_voice_ids=zerotts_remote_voice_ids,
+            local_voice_ids=(),
+            artifacts=zerotts_artifacts,
+            voices=zerotts_voices,
+        ),
+        tts=check_models.TtsComparison(
+            remote_names=tts_remote_names,
+            local_names=(),
+            voices=tts_voices,
+            hashes_checked=True,
+        ),
+    )
+
+
+def _setup_two_transaction_files(
+    tmp_path: Path,
+) -> tuple[Path, Path, list[tuple[Path, str, str]]]:
+    """Create two text files and return them alongside standard update tuples."""
+    file1 = tmp_path / "file1.txt"
+    file2 = tmp_path / "file2.txt"
+    file1.write_text("orig1", encoding="utf-8")
+    file2.write_text("orig2", encoding="utf-8")
+    return file1, file2, [(file1, "new1", "orig1"), (file2, "new2", "orig2")]
+
+
+def _setup_zerotts_model_files(
+    tmp_path: Path,
+    revision: str = "old_rev",
+) -> tuple[Path, Path]:
+    """Create stub stt_model.py and tts_model.py with specified ZeroTTS revision."""
+    stt_file = tmp_path / "stt_model.py"
+    stt_file.write_text("", encoding="utf-8")
+    tts_file = tmp_path / "tts_model.py"
+    tts_file.write_text(
+        "ZEROTTS_MODEL = ZeroTtsModelSpec(\n"
+        "    repo=ZEROTTS_REPO_ID,\n"
+        f'    revision="{revision}",\n'
+        ")\n",
+        encoding="utf-8",
+    )
+    return stt_file, tts_file
+
+
+def test_update_model_pins_updates_stt_and_tts_files(tmp_path: Path) -> None:
+    """Test update_model_pins modifies pinned hashes and revisions in source files."""
+    stt_file = tmp_path / "stt_model.py"
+    stt_file.write_text(
+        "ZIPFORMER_MODEL = SttModelSpec(\n"
+        '    repo="hynt/Zipformer-30M-RNNT-6000h",\n'
+        '    revision="old_stt_rev",\n'
+        "    graphs=(\n"
+        "        SttArtifact(\n"
+        '            "encoder-epoch-20-avg-10.int8.onnx",\n'
+        '            "encoder.onnx",\n'
+        '            "1111111111111111111111111111111111111111111111111111111111111111",\n'
+        "        ),\n"
+        "    ),\n"
+        ")\n",
+        encoding="utf-8",
+    )
+
+    tts_file = tmp_path / "tts_model.py"
+    tts_file.write_text(
+        'ZEROTTS_CODEC_INT8_SHA256 = "'
+        '2222222222222222222222222222222222222222222222222222222222222222"\n'
+        "ZEROTTS_MODEL = ZeroTtsModelSpec(\n"
+        "    repo=ZEROTTS_REPO_ID,\n"
+        '    revision="old_tts_rev",\n'
+        ")\n",
+        encoding="utf-8",
+    )
+
+    new_stt_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    new_int8_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+    stt_comp = check_models.SttComparison(
+        models=(
+            check_models.SttModelComparison(
+                engine="zipformer",
+                repo="hynt/Zipformer-30M-RNNT-6000h",
+                local_revision="old_stt_rev",
+                remote_revision="new_stt_rev",
+                artifacts=(
+                    check_models.ArtifactComparison(
+                        "encoder-epoch-20-avg-10.int8.onnx",
+                        "1111111111111111111111111111111111111111111111111111111111111111",
+                        new_stt_sha,
+                        True,
+                    ),
+                ),
+            ),
+        )
+    )
+
+    zerotts_comp = check_models.ZeroTtsComparison(
+        repo=ZEROTTS_REPO_ID,
+        remote_revision="new_tts_rev",
+        remote_voice_ids=(),
+        local_voice_ids=(),
+        artifacts=(
+            check_models.ArtifactComparison(
+                f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}",
+                "2222222222222222222222222222222222222222222222222222222222222222",
+                new_int8_sha,
+                True,
+            ),
+        ),
+    )
+
+    tts_comp = check_models.TtsComparison(
+        remote_names=(),
+        local_names=(),
+        voices=(),
+        hashes_checked=True,
+    )
+
+    report = check_models.ComparisonReport(tts=tts_comp, stt=stt_comp, zerotts=zerotts_comp)
+    changes = check_models.update_model_pins(report, models_dir=tmp_path)
+
+    assert changes == [
+        "STT [zipformer] revision: old_stt_rev -> new_stt_rev",
+        (
+            f"STT [zipformer] encoder-epoch-20-avg-10.int8.onnx: "
+            f"1111111111111111111111111111111111111111111111111111111111111111 -> {new_stt_sha}"
+        ),
+        "ZeroTTS revision: old_tts_rev -> new_tts_rev",
+        (
+            f"ZeroTTS local codec onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}: "
+            f"2222222222222222222222222222222222222222222222222222222222222222 -> {new_int8_sha}"
+        ),
+    ]
+    _assert_file_contains(stt_file, 'revision="new_stt_rev"', new_stt_sha)
+    _assert_file_contains(tts_file, 'revision="new_tts_rev"', new_int8_sha)
+
+
+def test_update_model_pins_targets_specific_artifact_declarations(tmp_path: Path) -> None:
+    """Test updating pins targets specific artifact declarations even if hashes are identical."""
+    shared_stt_sha = "1111111111111111111111111111111111111111111111111111111111111111"
+    shared_voice_sha = "2222222222222222222222222222222222222222222222222222222222222222"
+    shared_core_sha = "3333333333333333333333333333333333333333333333333333333333333333"
+    shared_nghitts_sha = "4444444444444444444444444444444444444444444444444444444444444444"
+
+    new_stt_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    new_voice_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    new_core_sha = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    new_nghitts_sha = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+
+    stt_file = tmp_path / "stt_model.py"
+    stt_file.write_text(
+        "ZIPFORMER_MODEL = SttModelSpec(\n"
+        '    repo="hynt/Zipformer-30M-RNNT-6000h",\n'
+        '    revision="rev",\n'
+        "    graphs=(\n"
+        f'        SttArtifact("encoder.onnx", "enc", "{shared_stt_sha}"),\n'
+        f'        SttArtifact("decoder.onnx", "dec", "{shared_stt_sha}"),\n'
+        "    ),\n"
+        ")\n",
+        encoding="utf-8",
+    )
+
+    tts_file = tmp_path / "tts_model.py"
+    tts_file.write_text(
+        "ZEROTTS_MODEL = ZeroTtsModelSpec(\n"
+        "    repo=ZEROTTS_REPO_ID,\n"
+        '    revision="rev",\n'
+        f'    config=ZeroTtsArtifact(ZeroTtsFile.CONFIG, "cfg", "{shared_core_sha}"),\n'
+        f'    tokenizer=ZeroTtsArtifact(ZeroTtsFile.TOKENIZER, "tok", "{shared_core_sha}"),\n'
+        ")\n"
+        "ZEROTTS_VOICES = (\n"
+        '    _zerotts_voice("maichi", "Mai Chi", "nu", "Nữ miền Bắc (nhẹ nhàng)",\n'
+        f'        "{shared_voice_sha}"),\n'
+        f'    _zerotts_voice("baotrang", "Bao Trang", "nu", "desc", "{shared_voice_sha}"),\n'
+        ")\n"
+        "NGHITTS_VOICES = (\n"
+        f'    _voice("duy-onyx-moi", "Duy Onyx (mới)", "{shared_nghitts_sha}"),\n'
+        f'    _voice("duy-oryx", "Duy Oryx", "{shared_nghitts_sha}"),\n'
+        ")\n",
+        encoding="utf-8",
+    )
+
+    stt_comp = check_models.SttComparison(
+        models=(
+            check_models.SttModelComparison(
+                engine="zipformer",
+                repo="hynt/Zipformer-30M-RNNT-6000h",
+                local_revision="rev",
+                remote_revision="rev",
+                artifacts=(
+                    check_models.ArtifactComparison(
+                        "encoder.onnx",
+                        shared_stt_sha,
+                        new_stt_sha,
+                        True,
+                    ),
+                    check_models.ArtifactComparison(
+                        "decoder.onnx",
+                        shared_stt_sha,
+                        shared_stt_sha,
+                        True,
+                    ),
+                ),
+            ),
+        )
+    )
+
+    zerotts_comp = check_models.ZeroTtsComparison(
+        repo=ZEROTTS_REPO_ID,
+        remote_revision="rev",
+        remote_voice_ids=(),
+        local_voice_ids=(),
+        artifacts=(
+            check_models.ArtifactComparison(
+                ZeroTtsFile.CONFIG,
+                shared_core_sha,
+                new_core_sha,
+                True,
+            ),
+            check_models.ArtifactComparison(
+                ZeroTtsFile.TOKENIZER,
+                shared_core_sha,
+                shared_core_sha,
+                True,
+            ),
+        ),
+        voices=(
+            check_models.VoiceComparison(
+                name="Mai Chi",
+                voice_id="maichi",
+                artifacts=(
+                    check_models.ArtifactComparison(
+                        "voices/maichi/voice.npz",
+                        shared_voice_sha,
+                        new_voice_sha,
+                        True,
+                    ),
+                ),
+            ),
+            check_models.VoiceComparison(
+                name="Bao Trang",
+                voice_id="baotrang",
+                artifacts=(
+                    check_models.ArtifactComparison(
+                        "voices/baotrang/voice.npz",
+                        shared_voice_sha,
+                        shared_voice_sha,
+                        True,
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    tts_comp = check_models.TtsComparison(
+        remote_names=(),
+        local_names=(),
+        voices=(
+            check_models.VoiceComparison(
+                name="Duy Onyx (mới)",
+                voice_id="duy-onyx-moi",
+                artifacts=(
+                    check_models.ArtifactComparison(
+                        "Duy Onyx (mới).onnx",
+                        shared_nghitts_sha,
+                        new_nghitts_sha,
+                        True,
+                    ),
+                ),
+            ),
+            check_models.VoiceComparison(
+                name="Duy Oryx",
+                voice_id="duy-oryx",
+                artifacts=(
+                    check_models.ArtifactComparison(
+                        "Duy Onyx.onnx",
+                        shared_nghitts_sha,
+                        shared_nghitts_sha,
+                        True,
+                    ),
+                ),
+            ),
+        ),
+        hashes_checked=True,
+    )
+
+    report = check_models.ComparisonReport(tts=tts_comp, stt=stt_comp, zerotts=zerotts_comp)
+    changes = check_models.update_model_pins(report, models_dir=tmp_path)
+
+    assert changes == [
+        f"STT [zipformer] encoder.onnx: {shared_stt_sha} -> {new_stt_sha}",
+        f"ZeroTTS core {ZeroTtsFile.CONFIG}: {shared_core_sha} -> {new_core_sha}",
+        f"ZeroTTS voice [Mai Chi] voices/maichi/voice.npz: {shared_voice_sha} -> {new_voice_sha}",
+        (
+            f"NghiTTS voice [Duy Onyx (mới)] Duy Onyx (mới).onnx: "
+            f"{shared_nghitts_sha} -> {new_nghitts_sha}"
+        ),
+    ]
+
+    stt_text = stt_file.read_text(encoding="utf-8")
+    assert f'SttArtifact("encoder.onnx", "enc", "{new_stt_sha}")' in stt_text
+    assert f'SttArtifact("decoder.onnx", "dec", "{shared_stt_sha}")' in stt_text
+
+    tts_text = tts_file.read_text(encoding="utf-8")
+    assert f'config=ZeroTtsArtifact(ZeroTtsFile.CONFIG, "cfg", "{new_core_sha}")' in tts_text
+    assert (
+        f'tokenizer=ZeroTtsArtifact(ZeroTtsFile.TOKENIZER, "tok", "{shared_core_sha}")' in tts_text
+    )
+    assert (
+        '_zerotts_voice("maichi", "Mai Chi", "nu", "Nữ miền Bắc (nhẹ nhàng)",\n'
+        f'        "{new_voice_sha}")' in tts_text
+    )
+    assert (
+        f'_zerotts_voice("baotrang", "Bao Trang", "nu", "desc", "{shared_voice_sha}")' in tts_text
+    )
+    assert f'_voice("duy-onyx-moi", "Duy Onyx (mới)", "{new_nghitts_sha}")' in tts_text
+    assert f'_voice("duy-oryx", "Duy Oryx", "{shared_nghitts_sha}")' in tts_text
+
+
+def test_main_update_flag_outputs_summary(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Test main with --update flag applies updates and returns 0."""
+    report = _make_test_report()
+
+    monkeypatch.setattr(check_models, "compare_models", lambda *_args, **_kwargs: report)
+    monkeypatch.setattr(check_models, "update_model_pins", lambda _r, **_kw: ["Updated pin foo"])
+
+    rc = check_models.main(["--update"])
+    assert rc == 0
+    captured = capsys.readouterr().out
+    assert "UPDATED MODEL PINS:" in captured
+    assert "Updated pin foo" in captured
+
+    rc_json = check_models.main(["--update", "--json"])
+    assert rc_json == 0
+    captured_json = capsys.readouterr().out
+    data = json.loads(captured_json)
+    assert data["updated"] == ["Updated pin foo"]
+
+
+def test_main_update_flag_noop_outputs_message(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Test main with --update flag outputs all up to date when no changes occur."""
+    report = _make_test_report()
+
+    monkeypatch.setattr(check_models, "compare_models", lambda *_args, **_kwargs: report)
+    monkeypatch.setattr(check_models, "update_model_pins", lambda _r, **_kw: [])
+
+    rc = check_models.main(["--update"])
+    assert rc == 0
+    captured = capsys.readouterr().out
+    assert "All model pins are already up to date." in captured
+    assert "UPDATED MODEL PINS:" not in captured
+
+
+def test_main_update_flag_manual_review_note(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Test main with --update flag notes manual review when voices are added or removed."""
+    report = _make_test_report(
+        zerotts_remote_voice_ids=("new_voice_id",),
+        tts_remote_names=("new_tts_name",),
+    )
+
+    monkeypatch.setattr(check_models, "compare_models", lambda *_args, **_kwargs: report)
+    monkeypatch.setattr(check_models, "update_model_pins", lambda _r, **_kw: ["Updated pin foo"])
+
+    rc = check_models.main(["--update"])
+    assert rc == 0
+    captured = capsys.readouterr().out
+    assert "NOTE: Voice additions or removals require manual review." in captured
+
+
+@pytest.mark.parametrize(
+    ("error_cls", "error_msg"),
+    [
+        (check_models.ModelCheckError, "Simulated update failure"),
+        (OSError, "Disk write failure"),
+    ],
+)
+def test_main_update_flag_error_exits_2(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    error_cls: type[Exception],
+    error_msg: str,
+) -> None:
+    """Test main with --update flag prints error and returns 2 when update fails."""
+    report = _make_test_report()
+
+    def _raise_error(*_args: object, **_kwargs: object) -> list[str]:
+        raise error_cls(error_msg)
+
+    monkeypatch.setattr(check_models, "compare_models", lambda *_args, **_kwargs: report)
+    monkeypatch.setattr(check_models, "update_model_pins", _raise_error)
+
+    rc = check_models.main(["--update"])
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert f"ERROR: {error_msg}" in captured.err
+
+
+def test_update_model_pins_raises_model_check_error_on_missing_stt_artifact(
+    tmp_path: Path,
+) -> None:
+    """Test update_model_pins raises ModelCheckError when STT artifact cannot be matched."""
+    stt_file = tmp_path / "stt_model.py"
+    stt_file.write_text(
+        'SttModelSpec(engine="zipformer", repo="dummy/repo", revision="rev1", artifacts=())\n',
+        encoding="utf-8",
+    )
+    tts_file = tmp_path / "tts_model.py"
+    tts_file.write_text("", encoding="utf-8")
+
+    stt_comp = check_models.SttModelComparison(
+        engine="zipformer",
+        repo="dummy/repo",
+        local_revision="rev1",
+        remote_revision="rev1",
+        artifacts=(check_models.ArtifactComparison("missing.onnx", "a" * 64, "b" * 64, True),),
+    )
+    report = _make_test_report(stt_models=(stt_comp,))
+
+    with pytest.raises(check_models.ModelCheckError, match="Failed to update pin for STT artifact"):
+        check_models.update_model_pins(report, models_dir=tmp_path)
+
+
+def test_update_model_pins_raises_model_check_error_on_missing_stt_revision(
+    tmp_path: Path,
+) -> None:
+    """Test update_model_pins raises ModelCheckError when STT revision cannot be matched."""
+    stt_file = tmp_path / "stt_model.py"
+    stt_file.write_text(
+        "# Empty stt file without repo or revision\n",
+        encoding="utf-8",
+    )
+    tts_file = tmp_path / "tts_model.py"
+    tts_file.write_text("", encoding="utf-8")
+
+    stt_comp = check_models.SttModelComparison(
+        engine="zipformer",
+        repo="dummy/repo",
+        local_revision="rev1",
+        remote_revision="rev2",
+        artifacts=(),
+    )
+    report = _make_test_report(stt_models=(stt_comp,))
+
+    with pytest.raises(
+        check_models.ModelCheckError, match="Failed to find revision pin for STT model"
+    ):
+        check_models.update_model_pins(report, models_dir=tmp_path)
+
+
+def test_update_model_pins_raises_model_check_error_on_missing_tts_artifact(
+    tmp_path: Path,
+) -> None:
+    """Test update_model_pins raises ModelCheckError when TTS artifact cannot be matched."""
+    stt_file = tmp_path / "stt_model.py"
+    stt_file.write_text("", encoding="utf-8")
+    tts_file = tmp_path / "tts_model.py"
+    tts_file.write_text("# Empty tts file\n", encoding="utf-8")
+
+    art = check_models.ArtifactComparison("config.json", "a" * 64, "b" * 64, True)
+    report = _make_test_report(zerotts_artifacts=(art,))
+
+    with pytest.raises(
+        check_models.ModelCheckError, match="Failed to update ZeroTTS core artifact pin"
+    ):
+        check_models.update_model_pins(report, models_dir=tmp_path)
+
+
+def test_atomic_write_text_preserves_file_permissions(tmp_path: Path) -> None:
+    """Test _atomic_write_text preserves existing file mode permissions."""
+    target = tmp_path / "target_file.py"
+    target.write_text("initial content\n", encoding="utf-8")
+    target.chmod(0o644)
+    expected_mode = target.stat().st_mode
+
+    check_models._atomic_write_text(target, "new content\n")
+    assert target.read_text(encoding="utf-8") == "new content\n"
+    assert target.stat().st_mode == expected_mode
+
+
+def test_atomic_write_text_flushes_and_syncs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test _atomic_write_text flushes and fsyncs temporary file and parent directory."""
+    target = tmp_path / "sync_target.txt"
+    target.write_text("initial", encoding="utf-8")
+
+    fsynced_fds: list[int] = []
+    orig_fsync = os.fsync
+
+    def mock_fsync(fd: int) -> None:
+        fsynced_fds.append(fd)
+        orig_fsync(fd)
+
+    monkeypatch.setattr(check_models.os, "fsync", mock_fsync)
+    check_models._atomic_write_text(target, "persisted data")
+
+    assert target.read_text(encoding="utf-8") == "persisted data"
+    assert len(fsynced_fds) >= 2
+
+
+def test_sync_dir_handles_os_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test _sync_dir gracefully ignores OSError when directory sync is unsupported."""
+
+    def mock_open(*_args: object, **_kwargs: object) -> int:
+        raise OSError("Directory sync not supported")
+
+    monkeypatch.setattr(check_models.os, "open", mock_open)
+    check_models._sync_dir(tmp_path)
+
+
+def test_update_model_pins_transactional_rollback_on_tts_failure(
+    tmp_path: Path,
+) -> None:
+    """Test update_model_pins leaves stt_model.py untouched when TTS matching fails."""
+    stt_file = tmp_path / "stt_model.py"
+    original_stt = (
+        "ZIPFORMER_MODEL = SttModelSpec(\n"
+        '    repo="hynt/Zipformer-30M-RNNT-6000h",\n'
+        '    revision="old_stt_rev",\n'
+        "    graphs=(),\n"
+        ")\n"
+    )
+    stt_file.write_text(original_stt, encoding="utf-8")
+
+    tts_file = tmp_path / "tts_model.py"
+    tts_file.write_text("# Empty tts file\n", encoding="utf-8")
+
+    stt_comp = check_models.SttModelComparison(
+        engine="zipformer",
+        repo="hynt/Zipformer-30M-RNNT-6000h",
+        local_revision="old_stt_rev",
+        remote_revision="new_stt_rev",
+        artifacts=(),
+    )
+    art = check_models.ArtifactComparison("config.json", "a" * 64, "b" * 64, True)
+    report = _make_test_report(stt_models=(stt_comp,), zerotts_artifacts=(art,))
+
+    with pytest.raises(
+        check_models.ModelCheckError, match="Failed to update ZeroTTS core artifact pin"
+    ):
+        check_models.update_model_pins(report, models_dir=tmp_path)
+
+    assert stt_file.read_text(encoding="utf-8") == original_stt
+
+
+def test_update_model_pins_raises_when_stt_file_missing_with_changes(
+    tmp_path: Path,
+) -> None:
+    """Test update_model_pins raises ModelCheckError when stt_model.py is missing."""
+    tts_file = tmp_path / "tts_model.py"
+    tts_file.write_text("", encoding="utf-8")
+
+    stt_comp = check_models.SttModelComparison(
+        engine="zipformer",
+        repo="hynt/Zipformer-30M-RNNT-6000h",
+        local_revision="old_stt_rev",
+        remote_revision="new_stt_rev",
+        artifacts=(),
+    )
+    report = _make_test_report(stt_models=(stt_comp,))
+
+    with pytest.raises(
+        check_models.ModelCheckError, match=r"Cannot update STT pins: '.*' does not exist"
+    ):
+        check_models.update_model_pins(report, models_dir=tmp_path)
+
+
+def test_update_model_pins_raises_when_tts_file_missing_with_changes(
+    tmp_path: Path,
+) -> None:
+    """Test update_model_pins raises ModelCheckError when tts_model.py is missing."""
+    stt_file = tmp_path / "stt_model.py"
+    stt_file.write_text("", encoding="utf-8")
+
+    report = _make_test_report(zerotts_revision="new_tts_rev")
+
+    with pytest.raises(
+        check_models.ModelCheckError, match=r"Cannot update TTS pins: '.*' does not exist"
+    ):
+        check_models.update_model_pins(report, models_dir=tmp_path)
+
+
+def test_apply_transactional_writes_rolls_back_on_write_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test _apply_transactional_writes restores written files when a write fails."""
+    file1, file2, updates = _setup_two_transaction_files(tmp_path)
+    call_count = 0
+    orig_atomic = check_models._atomic_write_text
+
+    def mock_atomic(target: Path, content: str, encoding: str = "utf-8") -> None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise OSError("Disk write failed")
+        orig_atomic(target, content, encoding)
+
+    monkeypatch.setattr(check_models, "_atomic_write_text", mock_atomic)
+
+    with pytest.raises(
+        check_models.ModelCheckError, match="Failed to write model pin updates: Disk write failed"
+    ) as exc_info:
+        check_models._apply_transactional_writes(updates)
+
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert file1.read_text(encoding="utf-8") == "orig1"
+    assert file2.read_text(encoding="utf-8") == "orig2"
+
+
+def test_apply_transactional_writes_reports_rollback_failures_without_masking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test _apply_transactional_writes preserves original error when rollback also fails."""
+    _file1, _file2, updates = _setup_two_transaction_files(tmp_path)
+    call_count = 0
+    orig_atomic = check_models._atomic_write_text
+
+    def mock_atomic(target: Path, content: str, encoding: str = "utf-8") -> None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise OSError("Write failed on file2")
+        if call_count == 3:
+            raise OSError("Rollback failed on file1")
+        orig_atomic(target, content, encoding)
+
+    monkeypatch.setattr(check_models, "_atomic_write_text", mock_atomic)
+
+    expected_pattern = (
+        r"Failed to write model pin updates: Write failed on file2\."
+        r" Additionally, rollback failed for: file1\.txt \(Rollback failed on file1\)"
+    )
+    with pytest.raises(check_models.ModelCheckError, match=expected_pattern) as exc_info:
+        check_models._apply_transactional_writes(updates)
+
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert str(exc_info.value.__cause__) == "Write failed on file2"
+
+
+def test_apply_transactional_writes_rolls_back_failing_file_if_modified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test _apply_transactional_writes restores the failing file if modified before error."""
+    file1, file2, updates = _setup_two_transaction_files(tmp_path)
+    orig_atomic = check_models._atomic_write_text
+
+    def mock_atomic(target: Path, content: str, encoding: str = "utf-8") -> None:
+        if target == file2 and content == "new2":
+            orig_atomic(target, content, encoding)
+            raise OSError("Write failed after replacement on file2")
+        orig_atomic(target, content, encoding)
+
+    monkeypatch.setattr(check_models, "_atomic_write_text", mock_atomic)
+
+    with pytest.raises(
+        check_models.ModelCheckError,
+        match="Failed to write model pin updates: Write failed after replacement on file2",
+    ):
+        check_models._apply_transactional_writes(updates)
+
+    assert file1.read_text(encoding="utf-8") == "orig1"
+    assert file2.read_text(encoding="utf-8") == "orig2"
+
+
+def test_replace_exact_match_raises_on_ambiguous_matches() -> None:
+    """Test _replace_exact_match raises ModelCheckError when multiple matches exist."""
+    content = 'foo="old"\nfoo="old"\n'
+    with pytest.raises(
+        check_models.ModelCheckError, match="Ambiguous matches found while updating test pin"
+    ):
+        check_models._replace_exact_match(
+            r'foo="old"',
+            'foo="new"',
+            content,
+            "test pin",
+        )
+
+
+def test_update_model_pins_raises_on_ambiguous_voice_matches(tmp_path: Path) -> None:
+    """Test update_model_pins raises ModelCheckError when duplicate voice pins exist."""
+    stt_file = tmp_path / "stt_model.py"
+    stt_file.write_text("", encoding="utf-8")
+
+    shared_sha = "1111111111111111111111111111111111111111111111111111111111111111"
+    new_sha = "2222222222222222222222222222222222222222222222222222222222222222"
+    tts_file = tmp_path / "tts_model.py"
+    tts_file.write_text(
+        f'_voice("duy-onyx", "Duy Onyx", "{shared_sha}")\n'
+        f'_voice("duy-onyx", "Duy Onyx", "{shared_sha}")\n',
+        encoding="utf-8",
+    )
+
+    voice_comp = check_models.VoiceComparison(
+        name="Duy Onyx",
+        voice_id="duy-onyx",
+        artifacts=(check_models.ArtifactComparison("Duy Onyx.onnx", shared_sha, new_sha, True),),
+    )
+    report = _make_test_report(tts_voices=(voice_comp,))
+
+    with pytest.raises(
+        check_models.ModelCheckError, match="Ambiguous matches found while updating"
+    ):
+        check_models.update_model_pins(report, models_dir=tmp_path)
+
+
+def test_update_model_pins_captures_arbitrary_tts_file_revision(
+    tmp_path: Path,
+) -> None:
+    """Test update_model_pins derives the ZeroTTS old revision directly from tts_model.py."""
+    _stt_file, tts_file = _setup_zerotts_model_files(tmp_path, revision="arbitrary_local_rev")
+
+    report = _make_test_report(zerotts_revision="new_hf_rev")
+    changes = check_models.update_model_pins(report, models_dir=tmp_path)
+
+    assert changes == ["ZeroTTS revision: arbitrary_local_rev -> new_hf_rev"]
+    _assert_file_contains(tts_file, 'revision="new_hf_rev"')
+
+
+def test_update_model_pins_raises_model_check_error_on_missing_zerotts_revision(
+    tmp_path: Path,
+) -> None:
+    """Test update_model_pins raises ModelCheckError when ZeroTTS revision cannot be matched."""
+    stt_file = tmp_path / "stt_model.py"
+    stt_file.write_text("", encoding="utf-8")
+
+    tts_file = tmp_path / "tts_model.py"
+    tts_file.write_text("# No ZEROTTS_MODEL revision pin\n", encoding="utf-8")
+
+    report = _make_test_report(zerotts_revision="new_hf_rev")
+
+    with pytest.raises(check_models.ModelCheckError, match="Failed to update ZeroTTS revision pin"):
+        check_models.update_model_pins(report, models_dir=tmp_path)
+
+
+def test_update_model_pins_raises_model_check_error_on_ambiguous_zerotts_revision(
+    tmp_path: Path,
+) -> None:
+    """Test update_model_pins raises ModelCheckError when duplicate ZeroTTS revision pins exist."""
+    stt_file = tmp_path / "stt_model.py"
+    stt_file.write_text("", encoding="utf-8")
+
+    tts_file = tmp_path / "tts_model.py"
+    tts_file.write_text(
+        "ZEROTTS_MODEL = ZeroTtsModelSpec(\n"
+        "    repo=ZEROTTS_REPO_ID,\n"
+        '    revision="rev_one",\n'
+        ")\n"
+        "ZEROTTS_MODEL_DUP = ZeroTtsModelSpec(\n"
+        "    repo=ZEROTTS_REPO_ID,\n"
+        '    revision="rev_two",\n'
+        ")\n",
+        encoding="utf-8",
+    )
+
+    report = _make_test_report(zerotts_revision="new_hf_rev")
+
+    with pytest.raises(
+        check_models.ModelCheckError,
+        match="Ambiguous matches found while updating ZeroTTS revision pin",
+    ):
+        check_models.update_model_pins(report, models_dir=tmp_path)
+
+
+def test_update_model_pins_updates_shared_nghitts_config_once(tmp_path: Path) -> None:
+    """Test update_model_pins updates shared NghiTTS config constants once for multiple voices."""
+    stt_file = tmp_path / "stt_model.py"
+    stt_file.write_text("", encoding="utf-8")
+
+    shared_cfg_old = "1111111111111111111111111111111111111111111111111111111111111111"
+    shared_cfg_new = "2222222222222222222222222222222222222222222222222222222222222222"
+    tts_file = tmp_path / "tts_model.py"
+    tts_file.write_text(
+        f'_NGHITTS_COMMON_CONFIG_SHA256 = "{shared_cfg_old}"\n'
+        "NGHITTS_VOICES = (\n"
+        '    _voice("v1", "Voice One",\n'
+        '           "3333333333333333333333333333333333333333333333333333333333333333"),\n'
+        '    _voice("v2", "Voice Two",\n'
+        '           "4444444444444444444444444444444444444444444444444444444444444444"),\n'
+        ")\n",
+        encoding="utf-8",
+    )
+
+    voices = (
+        check_models.VoiceComparison(
+            name="Voice One",
+            voice_id="v1",
+            artifacts=(
+                check_models.ArtifactComparison(
+                    "Voice One.onnx.json",
+                    shared_cfg_old,
+                    shared_cfg_new,
+                    True,
+                ),
+            ),
+        ),
+        check_models.VoiceComparison(
+            name="Voice Two",
+            voice_id="v2",
+            artifacts=(
+                check_models.ArtifactComparison(
+                    "Voice Two.onnx.json",
+                    shared_cfg_old,
+                    shared_cfg_new,
+                    True,
+                ),
+            ),
+        ),
+    )
+    report = _make_test_report(tts_voices=voices)
+    changes = check_models.update_model_pins(report, models_dir=tmp_path)
+
+    assert changes == [
+        f"NghiTTS config [_NGHITTS_COMMON_CONFIG_SHA256]: {shared_cfg_old} -> {shared_cfg_new}"
+    ]
+    assert f'_NGHITTS_COMMON_CONFIG_SHA256 = "{shared_cfg_new}"' in tts_file.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_main_update_flag_json_includes_voice_review_note(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Test main with --update --json includes review note when voice additions exist."""
+    report = _make_test_report(tts_remote_names=("extra_voice",))
+
+    monkeypatch.setattr(check_models, "compare_models", lambda *_args, **_kwargs: report)
+    monkeypatch.setattr(check_models, "update_model_pins", lambda _r, **_kw: ["Updated pin foo"])
+
+    rc = check_models.main(["--update", "--json"])
+    assert rc == 0
+    captured = capsys.readouterr().out
+    data = json.loads(captured)
+    assert data["updated"] == ["Updated pin foo"]
+    assert data["note"] == "Voice additions or removals require manual review."
+
+
+def test_apply_transactional_writes_rolls_back_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test _apply_transactional_writes restores original file timestamps and mode on rollback."""
+    file1, file2, updates = _setup_two_transaction_files(tmp_path)
+
+    past_atime_ns = 1_000_000_000_000_000_000
+    past_mtime_ns = 1_200_000_000_000_000_000
+    os.utime(file1, ns=(past_atime_ns, past_mtime_ns))
+    orig_stat = file1.stat()
+
+    orig_atomic = check_models._atomic_write_text
+
+    def mock_atomic(target: Path, content: str, encoding: str = "utf-8") -> None:
+        if target == file2:
+            raise OSError("Disk write failed on file2")
+        orig_atomic(target, content, encoding)
+
+    monkeypatch.setattr(check_models, "_atomic_write_text", mock_atomic)
+
+    with pytest.raises(
+        check_models.ModelCheckError,
+        match="Failed to write model pin updates: Disk write failed on file2",
+    ):
+        check_models._apply_transactional_writes(updates)
+
+    assert file1.read_text(encoding="utf-8") == "orig1"
+    post_rollback_stat = file1.stat()
+    assert post_rollback_stat.st_mtime_ns == orig_stat.st_mtime_ns
+    assert post_rollback_stat.st_mode == orig_stat.st_mode
+
+
+def test_apply_transactional_writes_cleans_up_previously_absent_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test rollback unlinks previously absent paths without leaving empty files."""
+    file_absent = tmp_path / "absent.txt"
+    file2 = tmp_path / "file2.txt"
+    file2.write_text("orig2", encoding="utf-8")
+
+    orig_atomic = check_models._atomic_write_text
+
+    def mock_atomic(target: Path, content: str, encoding: str = "utf-8") -> None:
+        if target == file2:
+            raise OSError("Disk write failed on file2")
+        orig_atomic(target, content, encoding)
+
+    monkeypatch.setattr(check_models, "_atomic_write_text", mock_atomic)
+
+    updates = [(file_absent, "new_created", ""), (file2, "new2", "orig2")]
+    with pytest.raises(
+        check_models.ModelCheckError,
+        match="Failed to write model pin updates: Disk write failed on file2",
+    ):
+        check_models._apply_transactional_writes(updates)
+
+    assert not file_absent.exists()
+    assert file2.read_text(encoding="utf-8") == "orig2"
+
+
+def test_apply_transactional_writes_failed_write_on_absent_file_leaves_no_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test failed write to previously absent path does not leave an empty file."""
+    file_absent = tmp_path / "absent.txt"
+
+    def mock_atomic(target: Path, content: str, encoding: str = "utf-8") -> None:
+        raise OSError("Permission denied on absent file")
+
+    monkeypatch.setattr(check_models, "_atomic_write_text", mock_atomic)
+
+    updates = [(file_absent, "new_created", "")]
+    with pytest.raises(
+        check_models.ModelCheckError,
+        match="Failed to write model pin updates: Permission denied on absent file",
+    ):
+        check_models._apply_transactional_writes(updates)
+
+    assert not file_absent.exists()
+
+
+def test_update_model_pins_blocks_stt_revision_when_artifact_unresolved(
+    tmp_path: Path,
+) -> None:
+    """Test update_model_pins blocks STT revision bump when artifact is unresolved."""
+    stt_file = tmp_path / "stt_model.py"
+    stt_file.write_text(
+        "ZIPFORMER_MODEL = SttModelSpec(\n"
+        '    repo="hynt/Zipformer-30M-RNNT-6000h",\n'
+        '    revision="old_rev",\n'
+        ")\n",
+        encoding="utf-8",
+    )
+    tts_file = tmp_path / "tts_model.py"
+    tts_file.write_text("", encoding="utf-8")
+
+    stt_model = check_models.SttModelComparison(
+        engine="zipformer",
+        repo="hynt/Zipformer-30M-RNNT-6000h",
+        local_revision="old_rev",
+        remote_revision="new_rev",
+        artifacts=(check_models.ArtifactComparison("encoder.onnx", "a" * 64, None, True),),
+    )
+    report = _make_test_report(stt_models=(stt_model,))
+    with pytest.raises(
+        check_models.ModelCheckError,
+        match=(
+            r"Cannot update revision for STT model 'zipformer'"
+            r".*unresolved artifacts: encoder\.onnx"
+        ),
+    ):
+        check_models.update_model_pins(report, models_dir=tmp_path)
+
+
+def test_update_model_pins_blocks_zerotts_revision_when_core_artifact_unresolved(
+    tmp_path: Path,
+) -> None:
+    """Test update_model_pins blocks ZeroTTS revision bump when core artifact is REMOVED."""
+    _setup_zerotts_model_files(tmp_path)
+
+    art = check_models.ArtifactComparison("config.json", "a" * 64, None, False)
+    report = _make_test_report(zerotts_revision="new_rev", zerotts_artifacts=(art,))
+    with pytest.raises(
+        check_models.ModelCheckError,
+        match=r"Cannot update ZeroTTS revision: unresolved artifacts: config\.json",
+    ):
+        check_models.update_model_pins(report, models_dir=tmp_path)
+
+
+def test_update_model_pins_blocks_zerotts_revision_when_voice_artifact_unresolved(
+    tmp_path: Path,
+) -> None:
+    """Test update_model_pins blocks ZeroTTS revision bump when voice artifact is UNKNOWN."""
+    _setup_zerotts_model_files(tmp_path)
+
+    voice = check_models.VoiceComparison(
+        name="Mai Chi",
+        voice_id="maichi",
+        artifacts=(
+            check_models.ArtifactComparison("voices/maichi/voice.npz", "a" * 64, None, True),
+        ),
+    )
+    report = _make_test_report(zerotts_revision="new_rev", zerotts_voices=(voice,))
+    with pytest.raises(
+        check_models.ModelCheckError,
+        match=r"Cannot update ZeroTTS revision: unresolved artifacts: voices/maichi/voice\.npz",
+    ):
+        check_models.update_model_pins(report, models_dir=tmp_path)
+
+
+def test_update_model_pins_allows_zerotts_revision_when_local_artifact_unresolved(
+    tmp_path: Path,
+) -> None:
+    """Test update_model_pins allows ZeroTTS revision bump when only local artifact is UNKNOWN."""
+    _stt_file, tts_file = _setup_zerotts_model_files(tmp_path)
+
+    local_art = check_models.ArtifactComparison(
+        f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}",
+        "a" * 64,
+        None,
+        False,
+    )
+    report = _make_test_report(zerotts_revision="new_rev", zerotts_artifacts=(local_art,))
+    changes = check_models.update_model_pins(report, models_dir=tmp_path)
+    assert changes == ["ZeroTTS revision: old_rev -> new_rev"]
+    _assert_file_contains(tts_file, 'revision="new_rev"')
