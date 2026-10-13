@@ -974,10 +974,10 @@ def test_locate_zerotts_int8_codec_source_raises_when_candidates_exist_but_none_
         download_module._locate_zerotts_int8_codec_source(snapshot_dir, artifact)
 
 
-def test_structure_zerotts_files_int8_codec_mismatch_when_fp32_and_q4_updated_without_new_int8(
+def test_structure_zerotts_files_int8_codec_mismatch_when_fp32_updated_without_new_int8(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify digest error when FP32 codec and Q4 hybrid are updated without new INT8."""
+    """Verify INT8 digest error when the FP32 codec is updated without new INT8."""
     snapshot_dir = tmp_path / "snapshot"
     tts_spec, test_voice = _make_zerotts_snapshot(snapshot_dir)
     bundled_assets_dir = tmp_path / "assets"
@@ -998,13 +998,6 @@ def test_structure_zerotts_files_int8_codec_mismatch_when_fp32_and_q4_updated_wi
         f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}",
         new_expected_int8_sha,
     )
-    new_q4_hybrid_sha = sha256(b"NEW_Q4_HYBRID_GGUF_BYTES").hexdigest()
-    q4_artifact = ZeroTtsArtifact(
-        tts_spec.gguf_model.remote_name if tts_spec.gguf_model else "gguf/zerotts-q8_0.gguf",
-        f"gguf/{ZeroTtsFile.Q4_HYBRID_GGUF_MODEL}",
-        new_q4_hybrid_sha,
-    )
-
     updated_codec_files = (
         *(
             ZeroTtsArtifact(art.remote_name, art.local_name, updated_fp32_sha)
@@ -1021,7 +1014,7 @@ def test_structure_zerotts_files_int8_codec_mismatch_when_fp32_and_q4_updated_wi
         config=tts_spec.config,
         tokenizer=tts_spec.tokenizer,
         null_voice_emb=tts_spec.null_voice_emb,
-        gguf_model=q4_artifact,
+        gguf_model=tts_spec.gguf_model,
         codec_files=updated_codec_files,
     )
     monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", updated_spec)
@@ -1029,7 +1022,13 @@ def test_structure_zerotts_files_int8_codec_mismatch_when_fp32_and_q4_updated_wi
     monkeypatch.setattr("wyoming_vietnamese.download._BUNDLED_ASSETS_DIR", bundled_assets_dir)
 
     target_dir = tmp_path / TTS_DIR
-    with pytest.raises(RuntimeError, match="does not match its recorded SHA-256 digest"):
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"moss_audio_tokenizer_decode_step\.int8\.onnx.*"
+            "does not match its recorded SHA-256 digest"
+        ),
+    ):
         _structure_zerotts_files(snapshot_dir, target_dir, voices=(test_voice,))
 
 
