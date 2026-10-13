@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from time import monotonic, perf_counter
-from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 import numpy as np
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
@@ -2035,6 +2035,8 @@ def initialize_zerotts(
     cpu_variant: str | ZeroTtsVariant | None = None,
     resolution: ZeroTtsModelResolution | None = None,
     pipelined: bool | None = None,
+    codec_int8: bool | None = None,
+    affinity: bool | None = None,
 ) -> ZeroTtsGgmlEngine:
     """Initialize ZeroTTS using default GGUF and runtime paths unless overridden.
 
@@ -2047,6 +2049,8 @@ def initialize_zerotts(
         cpu_variant: Optional explicit CPU variant for model selection.
         resolution: Optional pre-resolved ZeroTTS model resolution carrying spec and path.
         pipelined: Optional override for pipelined streaming execution.
+        codec_int8: Optional override for INT8 dynamic quantized MOSS Codec.
+        affinity: Optional override for CPU core thread affinity.
 
     Returns:
         Configured ZeroTtsGgmlEngine instance.
@@ -2084,23 +2088,22 @@ def initialize_zerotts(
         actual_gguf_path,
     )
     initialization_started = perf_counter()
+    engine_kwargs: dict[str, Any] = {}
     if pipelined is not None:
-        engine = ZeroTtsGgmlEngine(
-            model_dir=model_dir,
-            gguf_path=actual_gguf_path,
-            voices=voices,
-            num_threads=threads,
-            custom_lib_path=custom_lib_path,
-            pipelined=pipelined,
-        )
-    else:
-        engine = ZeroTtsGgmlEngine(
-            model_dir=model_dir,
-            gguf_path=actual_gguf_path,
-            voices=voices,
-            num_threads=threads,
-            custom_lib_path=custom_lib_path,
-        )
+        engine_kwargs["pipelined"] = pipelined
+    if codec_int8 is not None:
+        engine_kwargs["codec_int8"] = codec_int8
+    if affinity is not None:
+        engine_kwargs["affinity"] = affinity
+
+    engine = ZeroTtsGgmlEngine(
+        model_dir=model_dir,
+        gguf_path=actual_gguf_path,
+        voices=voices,
+        num_threads=threads,
+        custom_lib_path=custom_lib_path,
+        **engine_kwargs,
+    )
     _LOGGER.info(
         "Initialized ZeroTTS GGML: sample_rate=%d duration_ms=%.3f",
         engine.sample_rate,

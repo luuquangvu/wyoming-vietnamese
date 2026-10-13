@@ -964,7 +964,6 @@ def _structure_zerotts_files(
         for artifact in target_model.artifacts
     ]
     copied_paths.extend(_structure_zerotts_voice_files(snapshot_path, dest_dir))
-
     if voices:
         _verify_configured_zerotts_voices(snapshot_path, dest_dir, voices)
 

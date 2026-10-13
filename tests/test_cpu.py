@@ -30,7 +30,9 @@ from wyoming_vietnamese.cpu import (
     _read_cgroup_v1_quota,
     _read_cgroup_v2_quota,
     available_cpu_count,
+    get_process_affinity_cpus,
     resolve_cpu_threads,
+    set_thread_affinity,
 )
 
 
@@ -543,3 +545,70 @@ def test_resolve_cpu_threads_uses_cpu_count_fallback(
     assert resolve_cpu_threads(0) == 2
     monkeypatch.setattr("wyoming_vietnamese.cpu.os.cpu_count", lambda: None)
     assert resolve_cpu_threads(0) == 1
+
+
+def test_get_process_affinity_cpus(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test get_process_affinity_cpus with affinity masks, cgroup limits, and fallbacks."""
+    # Explicit affinity mask within limits
+    monkeypatch.setattr("wyoming_vietnamese.cpu._cpu_count_affinity_set", lambda: {3, 1, 2})
+    monkeypatch.setattr("wyoming_vietnamese.cpu.available_cpu_count", lambda: 4)
+    assert get_process_affinity_cpus() == [1, 2, 3]
+
+    # Affinity mask larger than available_cpu_count (e.g. cgroup limit on large host)
+    monkeypatch.setattr(
+        "wyoming_vietnamese.cpu._cpu_count_affinity_set", lambda: {0, 1, 2, 3, 4, 5, 6, 7}
+    )
+    monkeypatch.setattr("wyoming_vietnamese.cpu.available_cpu_count", lambda: 2)
+    assert get_process_affinity_cpus() == [0, 1]
+
+    # Fallback when affinity unavailable
+    monkeypatch.setattr("wyoming_vietnamese.cpu._cpu_count_affinity_set", lambda: None)
+    monkeypatch.setattr("wyoming_vietnamese.cpu.available_cpu_count", lambda: 3)
+    assert get_process_affinity_cpus() == [0, 1, 2]
+
+    # Fallback when affinity mask is empty
+    monkeypatch.setattr("wyoming_vietnamese.cpu._cpu_count_affinity_set", set)
+    assert get_process_affinity_cpus() == [0, 1, 2]
+
+
+def test_set_thread_affinity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test set_thread_affinity behavior, exception handling, and platform fallbacks."""
+    called_with: list[tuple[int, set[int]]] = []
+
+    def mock_setaffinity(pid: int, mask: set[int]) -> None:
+        called_with.append((pid, mask))
+
+    monkeypatch.setattr(
+        "wyoming_vietnamese.cpu.os.sched_setaffinity", mock_setaffinity, raising=False
+    )
+    assert set_thread_affinity([0, 1]) is True
+    assert called_with == [(0, {0, 1})]
+
+    # OSError returns False
+    def mock_os_error(_pid: int, _mask: set[int]) -> None:
+        raise OSError("Operation not permitted")
+
+    monkeypatch.setattr("wyoming_vietnamese.cpu.os.sched_setaffinity", mock_os_error, raising=False)
+    assert set_thread_affinity([0]) is False
+
+    # TypeError returns False
+    def mock_type_error(_pid: int, _mask: set[int]) -> None:
+        raise TypeError("Invalid mask")
+
+    monkeypatch.setattr(
+        "wyoming_vietnamese.cpu.os.sched_setaffinity", mock_type_error, raising=False
+    )
+    assert set_thread_affinity([0]) is False
+
+    # ValueError returns False
+    def mock_value_error(_pid: int, _mask: set[int]) -> None:
+        raise ValueError("Invalid CPU ID")
+
+    monkeypatch.setattr(
+        "wyoming_vietnamese.cpu.os.sched_setaffinity", mock_value_error, raising=False
+    )
+    assert set_thread_affinity([0]) is False
+
+    # Unsupported platform (no sched_setaffinity)
+    monkeypatch.delattr("wyoming_vietnamese.cpu.os.sched_setaffinity", raising=False)
+    assert set_thread_affinity([0, 1]) is False

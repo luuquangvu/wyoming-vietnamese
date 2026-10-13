@@ -1173,6 +1173,50 @@ def test_initialize_zerotts_forwards_pipelined_parameter(
     )
 
 
+def test_initialize_zerotts_forwards_codec_int8_parameter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test initialize_zerotts forwards explicit codec_int8 parameter to engine."""
+    fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
+    engine_cls = Mock(return_value=fake_engine)
+    monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
+    monkeypatch.setattr(
+        "wyoming_vietnamese.tts_model.detect_cpu_variant", lambda: ZeroTtsVariant.AVX2
+    )
+
+    initialize_zerotts(tmp_path, (DEFAULT_ZEROTTS_VOICE,), num_threads=4, codec_int8=False)
+    engine_cls.assert_called_once_with(
+        model_dir=tmp_path,
+        gguf_path=tmp_path / ZeroTtsDirectory.GGUF / ZeroTtsFile.DEFAULT_GGUF_MODEL,
+        voices=(DEFAULT_ZEROTTS_VOICE,),
+        num_threads=4,
+        custom_lib_path=None,
+        codec_int8=False,
+    )
+
+
+def test_initialize_zerotts_forwards_affinity_parameter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test initialize_zerotts forwards explicit affinity parameter to engine."""
+    fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
+    engine_cls = Mock(return_value=fake_engine)
+    monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
+    monkeypatch.setattr(
+        "wyoming_vietnamese.tts_model.detect_cpu_variant", lambda: ZeroTtsVariant.AVX2
+    )
+
+    initialize_zerotts(tmp_path, (DEFAULT_ZEROTTS_VOICE,), num_threads=4, affinity=False)
+    engine_cls.assert_called_once_with(
+        model_dir=tmp_path,
+        gguf_path=tmp_path / ZeroTtsDirectory.GGUF / ZeroTtsFile.DEFAULT_GGUF_MODEL,
+        voices=(DEFAULT_ZEROTTS_VOICE,),
+        num_threads=4,
+        custom_lib_path=None,
+        affinity=False,
+    )
+
+
 def test_initialize_zerotts_env_model_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Test initialize_zerotts respects ZEROTTS_GGUF_MODEL with absolute path."""
     fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)

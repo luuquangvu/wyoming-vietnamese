@@ -2358,6 +2358,32 @@ def test_structure_zerotts_files_hybrid_already_verified(
     assert hybrid_dst in copied
 
 
+def test_structure_zerotts_files_ignores_unpinned_int8_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test _structure_zerotts_files leaves INT8 generation to destination engine."""
+    snapshot_dir, dest_dir, tts_spec, test_voice = _setup_structure_test_dirs(tmp_path, monkeypatch)
+
+    int8_file = snapshot_dir / "onnx" / "codec" / ZeroTtsFile.DECODE_STEP_INT8_ONNX
+    int8_file.parent.mkdir(parents=True, exist_ok=True)
+    int8_file.write_bytes(b"INT8_MODEL_DATA")
+    int8_companion = snapshot_dir / "onnx" / "codec" / f"{ZeroTtsFile.DECODE_STEP_INT8_ONNX}.data"
+    int8_companion.write_bytes(b"INT8_EXTERNAL_TENSORS")
+
+    copied = _structure_zerotts_files(
+        snapshot_dir,
+        dest_dir,
+        voices=(test_voice,),
+        zerotts_model=tts_spec,
+    )
+    dst_int8 = dest_dir / "onnx" / "codec" / ZeroTtsFile.DECODE_STEP_INT8_ONNX
+    dst_companion = dest_dir / "onnx" / "codec" / f"{ZeroTtsFile.DECODE_STEP_INT8_ONNX}.data"
+    assert dst_int8 not in copied
+    assert dst_companion not in copied
+    assert not dst_int8.is_file()
+    assert not dst_companion.is_file()
+
+
 def test_structure_zerotts_files_hybrid_converts_and_fails_digest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

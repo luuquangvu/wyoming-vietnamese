@@ -82,11 +82,18 @@ class ZeroTtsFile(StrEnum):
     Q4_HYBRID_GGUF_MODEL = "zerotts-q4-hybrid.gguf"
     Q8_0_GGUF_MODEL = "zerotts-q8_0.gguf"
     LIBZEROTTS_SO = "libzerotts.so"
+    DECODE_STEP_ONNX = "moss_audio_tokenizer_decode_step.onnx"
+    DECODE_STEP_INT8_ONNX = "moss_audio_tokenizer_decode_step_int8.onnx"
+    DECODE_SHARED_DATA = "moss_audio_tokenizer_decode_shared.data"
 
 
 ZEROTTS_GGUF_MODEL = "ZEROTTS_GGUF_MODEL"
 DEFAULT_ZEROTTS_GGUF_MODEL = "auto"
 ZEROTTS_PIPELINED = "ZEROTTS_PIPELINED"
+ZEROTTS_CODEC_INT8 = "ZEROTTS_CODEC_INT8"
+ZEROTTS_AFFINITY = "ZEROTTS_AFFINITY"
+ZEROTTS_GGML_THREADS = "ZEROTTS_GGML_THREADS"
+ZEROTTS_CODEC_THREADS = "ZEROTTS_CODEC_THREADS"
 
 
 class ZeroTtsDirectory(StrEnum):
