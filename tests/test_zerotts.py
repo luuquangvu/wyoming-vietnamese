@@ -724,6 +724,8 @@ def _setup_engine_fixture(
     *,
     pipelined: bool | None = None,
     codec_int8: bool | None = None,
+    opportunistic: bool = True,
+    codec_threads: int | None = None,
 ) -> tuple[ZeroTtsGgmlEngine, MagicMock, MagicMock, Mock]:
     """Helper creating a test ZeroTtsGgmlEngine with mocked dependencies."""
     model_dir, gguf_path = _setup_mock_zerotts_assets(tmp_path)
@@ -765,6 +767,8 @@ def _setup_engine_fixture(
             num_threads=num_threads,
             pipelined=pipelined,
             codec_int8=codec_int8,
+            opportunistic=opportunistic,
+            codec_threads=codec_threads,
         )
 
     return engine, fake_cdll, fake_stream_decoder, fake_tokenizer
@@ -3369,8 +3373,8 @@ def test_build_zerotts_handle_build_signals_context_manager() -> None:
         (-4, 1, 1),
         (1, 1, 1),
         (2, 1, 1),
-        (3, 2, 1),
-        (4, 3, 1),
+        (3, 3, 1),
+        (4, 4, 1),
         (5, 3, 2),
         (6, 4, 2),
         (8, 6, 2),
@@ -3387,6 +3391,37 @@ def test_resolve_zerotts_thread_budget_pipelined(
     ggml, codec = resolve_zerotts_thread_budget(total_threads, pipelined=True)
     assert ggml == expected_ggml
     assert codec == expected_codec
+    if total_threads in {3, 4}:
+        assert ggml + codec == total_threads + 1
+    elif total_threads >= 2:
+        assert ggml + codec <= total_threads
+
+
+@pytest.mark.parametrize(
+    ("total_threads", "expected_ggml", "expected_codec"),
+    [
+        (0, 1, 1),
+        (-4, 1, 1),
+        (1, 1, 1),
+        (2, 1, 1),
+        (3, 2, 1),
+        (4, 3, 1),
+        (5, 3, 2),
+        (6, 4, 2),
+        (8, 6, 2),
+        (10, 7, 3),
+        (12, 9, 3),
+        (16, 12, 4),
+        (20, 16, 4),
+    ],
+)
+def test_resolve_zerotts_thread_budget_strict(
+    total_threads: int, expected_ggml: int, expected_codec: int
+) -> None:
+    """Test strict thread budget allocation under pipelined streaming (opportunistic=False)."""
+    ggml, codec = resolve_zerotts_thread_budget(total_threads, pipelined=True, opportunistic=False)
+    assert ggml == expected_ggml
+    assert codec == expected_codec
     if total_threads >= 2:
         assert ggml + codec <= total_threads
 
@@ -3398,13 +3433,13 @@ def test_resolve_zerotts_thread_budget_custom_codec_override() -> None:
     assert ggml == 2
     assert codec == 2
 
-    # Non-positive override clamps to 1
+    # Non-positive override clamps to 1; under opportunistic budgeting on 4 cores, GGML gets 4
     ggml, codec = resolve_zerotts_thread_budget(4, pipelined=True, codec_threads=0)
-    assert ggml == 3
+    assert ggml == 4
     assert codec == 1
 
     ggml, codec = resolve_zerotts_thread_budget(4, pipelined=True, codec_threads=-2)
-    assert ggml == 3
+    assert ggml == 4
     assert codec == 1
 
     # Override >= total budget preserves the budget limit (codec capped at total - 1)
@@ -3438,7 +3473,9 @@ def test_resolve_zerotts_thread_budget_non_pipelined() -> None:
     assert resolve_zerotts_thread_budget(4, pipelined=False, codec_threads=-1) == (4, 1)
 
 
-def test_zerotts_engine_dynamic_thread_allocation(tmp_path: Path) -> None:
+def test_zerotts_engine_dynamic_thread_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Test ZeroTtsGgmlEngine sets up dynamic thread allocation across configurations."""
     # Explicit 2 threads
     engine, _, _, _ = _setup_engine_fixture(tmp_path, num_threads=2)
@@ -3454,13 +3491,38 @@ def test_zerotts_engine_dynamic_thread_allocation(tmp_path: Path) -> None:
     assert engine_single.total_threads == 1
     assert engine_single.pipelined is False
 
-    # Auto thread detection with num_threads=0, resolving to 4 threads
+    # Auto thread detection with num_threads=0, resolving to 4 threads (opportunistic)
     with patch("wyoming_vietnamese.zerotts_engine.resolve_cpu_threads", return_value=4):
         engine_auto, _, _, _ = _setup_engine_fixture(tmp_path, num_threads=0)
         assert engine_auto.total_threads == 4
-        assert engine_auto.threads == 3
+        assert engine_auto.threads == 4
         assert engine_auto.codec_threads == 1
         assert engine_auto.pipelined is True
+
+        # Strict budget opt-out with opportunistic=False
+        engine_strict, _, _, _ = _setup_engine_fixture(tmp_path, num_threads=0, opportunistic=False)
+        assert engine_strict.total_threads == 4
+        assert engine_strict.threads == 3
+        assert engine_strict.codec_threads == 1
+        assert engine_strict.pipelined is True
+
+        # Strict budget with explicit codec_threads override
+        engine_codec, _, _, _ = _setup_engine_fixture(
+            tmp_path, num_threads=0, codec_threads=2, opportunistic=False
+        )
+        assert engine_codec.total_threads == 4
+        assert engine_codec.threads == 2
+        assert engine_codec.codec_threads == 2
+        assert engine_codec.pipelined is True
+
+        # Strict budget with explicit ZEROTTS_GGML_THREADS override
+        monkeypatch.setenv(ZEROTTS_GGML_THREADS, "2")
+        engine_ggml, _, _, _ = _setup_engine_fixture(tmp_path, num_threads=0, opportunistic=False)
+        assert engine_ggml.total_threads == 4
+        assert engine_ggml.threads == 2
+        assert engine_ggml.codec_threads == 2
+        assert engine_ggml.pipelined is True
+        monkeypatch.delenv(ZEROTTS_GGML_THREADS, raising=False)
 
     # Negative thread count raises ValueError
     with pytest.raises(ValueError, match="configured threads must not be negative"):
@@ -3474,10 +3536,10 @@ def test_zerotts_engine_pipelining_explicit_override(tmp_path: Path) -> None:
         engine, _, _, _ = _setup_engine_fixture(tmp_path, num_threads=4, pipelined=pipelined)
         return engine
 
-    # Default is pipelined (when total_threads > 1)
+    # Default is pipelined (when total_threads > 1, opportunistic allocates 4 to GGML)
     engine_default = _create_engine()
     assert engine_default.pipelined is True
-    assert engine_default.threads == 3
+    assert engine_default.threads == 4
     assert engine_default.codec_threads == 1
 
     # Explicit pipelined=False dedicates all threads to GGML
@@ -3557,16 +3619,22 @@ def test_zerotts_engine_inplace_tensor_reuse_and_zero_copy_buffers(tmp_path: Pat
 
 def test_resolve_zerotts_thread_budget_ggml_and_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Test dynamic thread allocation with ggml_threads and environment variables."""
-    # Explicit ggml_threads override
+    # Explicit ggml_threads override (opportunistic allows up to total threads for N <= 4)
     assert resolve_zerotts_thread_budget(4, pipelined=True, ggml_threads=2) == (2, 2)
-    assert resolve_zerotts_thread_budget(4, pipelined=True, ggml_threads=10) == (3, 1)
+    assert resolve_zerotts_thread_budget(4, pipelined=True, ggml_threads=10) == (4, 1)
     assert resolve_zerotts_thread_budget(4, pipelined=True, ggml_threads=0) == (1, 3)
     assert resolve_zerotts_thread_budget(4, pipelined=True, ggml_threads=-2) == (1, 3)
     assert resolve_zerotts_thread_budget(1, pipelined=True, ggml_threads=2) == (1, 1)
 
-    # Explicit codec_threads override
-    assert resolve_zerotts_thread_budget(4, pipelined=True, codec_threads=0) == (3, 1)
-    assert resolve_zerotts_thread_budget(4, pipelined=True, codec_threads=-3) == (3, 1)
+    # Explicit codec_threads override (under opportunistic, c_threads=1 gives ggml=4)
+    assert resolve_zerotts_thread_budget(4, pipelined=True, codec_threads=0) == (4, 1)
+    assert resolve_zerotts_thread_budget(4, pipelined=True, codec_threads=-3) == (4, 1)
+
+    # Explicit override coverage for 3-thread boundary and codec_threads > 1
+    assert resolve_zerotts_thread_budget(3, pipelined=True, codec_threads=1) == (3, 1)
+    assert resolve_zerotts_thread_budget(4, pipelined=True, codec_threads=2) == (2, 2)
+    assert resolve_zerotts_thread_budget(3, pipelined=True, ggml_threads=3) == (3, 1)
+    assert resolve_zerotts_thread_budget(3, pipelined=True, ggml_threads=2) == (2, 1)
 
     # Both ggml_threads and codec_threads specified
     assert resolve_zerotts_thread_budget(4, pipelined=True, ggml_threads=2, codec_threads=1) == (
@@ -3581,6 +3649,42 @@ def test_resolve_zerotts_thread_budget_ggml_and_env(monkeypatch: pytest.MonkeyPa
         1,
         3,
     )
+    # Both overrides with opportunistic mode (preserves (4, 1) and (3, 1))
+    assert resolve_zerotts_thread_budget(4, pipelined=True, ggml_threads=4, codec_threads=1) == (
+        4,
+        1,
+    )
+    assert resolve_zerotts_thread_budget(
+        4, pipelined=True, ggml_threads=4, codec_threads=1, opportunistic=False
+    ) == (3, 1)
+    assert resolve_zerotts_thread_budget(3, pipelined=True, ggml_threads=3, codec_threads=1) == (
+        3,
+        1,
+    )
+    assert resolve_zerotts_thread_budget(
+        3, pipelined=True, ggml_threads=3, codec_threads=1, opportunistic=False
+    ) == (2, 1)
+
+    # Two-core overrides do not oversubscribe (total <= 2 stays within budget)
+    assert resolve_zerotts_thread_budget(2, pipelined=True, codec_threads=1) == (1, 1)
+    assert resolve_zerotts_thread_budget(2, pipelined=True, ggml_threads=2) == (1, 1)
+    assert resolve_zerotts_thread_budget(2, pipelined=True, ggml_threads=2, codec_threads=1) == (
+        1,
+        1,
+    )
+
+    # Strict budgeting policy (opportunistic=False)
+    assert resolve_zerotts_thread_budget(4, pipelined=True, opportunistic=False) == (3, 1)
+    assert resolve_zerotts_thread_budget(3, pipelined=True, opportunistic=False) == (2, 1)
+    assert resolve_zerotts_thread_budget(
+        4, pipelined=True, codec_threads=1, opportunistic=False
+    ) == (3, 1)
+    assert resolve_zerotts_thread_budget(
+        4, pipelined=True, ggml_threads=4, opportunistic=False
+    ) == (3, 1)
+    assert resolve_zerotts_thread_budget(
+        3, pipelined=True, ggml_threads=3, opportunistic=False
+    ) == (2, 1)
 
     # Non-pipelined with ggml_threads / codec_threads
     assert resolve_zerotts_thread_budget(4, pipelined=False, ggml_threads=3) == (3, 2)
@@ -3594,10 +3698,13 @@ def test_resolve_zerotts_thread_budget_ggml_and_env(monkeypatch: pytest.MonkeyPa
     )
 
     # Environment variables (valid and invalid fallbacks)
-    for ggml_env, codec_env in [("3", "1"), ("invalid", "-5")]:
-        monkeypatch.setenv(ZEROTTS_GGML_THREADS, ggml_env)
-        monkeypatch.setenv(ZEROTTS_CODEC_THREADS, codec_env)
-        assert resolve_zerotts_thread_budget(4, pipelined=True) == (3, 1)
+    monkeypatch.setenv(ZEROTTS_GGML_THREADS, "3")
+    monkeypatch.setenv(ZEROTTS_CODEC_THREADS, "1")
+    assert resolve_zerotts_thread_budget(4, pipelined=True) == (3, 1)
+
+    monkeypatch.setenv(ZEROTTS_GGML_THREADS, "invalid")
+    monkeypatch.setenv(ZEROTTS_CODEC_THREADS, "-5")
+    assert resolve_zerotts_thread_budget(4, pipelined=True) == (4, 1)
 
 
 def test_zerotts_engine_codec_int8_binding_and_fallback(

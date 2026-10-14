@@ -711,18 +711,97 @@ def _read_env_thread_override(env_var_name: str) -> int | None:
     return None
 
 
+def _resolve_dual_override_threads(
+    effective_codec: int,
+    effective_ggml: int,
+    total: int,
+    *,
+    opportunistic: bool,
+) -> tuple[int, int]:
+    """Resolve thread allocation when both codec and GGML overrides are specified.
+
+    Args:
+        effective_codec: Resolved codec thread count override.
+        effective_ggml: Resolved GGML thread count override.
+        total: Available CPU threads budget (at least 2).
+        opportunistic: Whether opportunistic oversubscription is allowed for <= 4 cores.
+
+    Returns:
+        Tuple of (ggml_threads, codec_threads).
+    """
+    c_threads = min(max(1, effective_codec), total - 1)
+    g_max = total if (opportunistic and 2 < total <= 4 and c_threads == 1) else total - c_threads
+    g_threads = min(max(1, effective_ggml), g_max)
+    return g_threads, c_threads
+
+
+def _resolve_explicit_pipelined_threads(
+    effective_codec: int | None,
+    effective_ggml: int | None,
+    total: int,
+    *,
+    opportunistic: bool = True,
+) -> tuple[int, int] | None:
+    """Resolve thread allocation when explicit overrides are specified.
+
+    Args:
+        effective_codec: Resolved codec thread count override or None.
+        effective_ggml: Resolved GGML thread count override or None.
+        total: Available CPU threads budget (at least 2).
+        opportunistic: Whether opportunistic oversubscription is allowed for <= 4 cores.
+
+    Returns:
+        Tuple of (ggml_threads, codec_threads) if overrides exist, None otherwise.
+    """
+    if effective_codec is not None and effective_ggml is not None:
+        return _resolve_dual_override_threads(
+            effective_codec, effective_ggml, total, opportunistic=opportunistic
+        )
+
+    if effective_codec is not None:
+        c_requested = max(1, effective_codec)
+        c_threads = min(c_requested, total - 1)
+        g_threads = (
+            total
+            if (opportunistic and 2 < total <= 4 and c_threads == 1)
+            else max(1, total - c_threads)
+        )
+        return g_threads, c_threads
+
+    if effective_ggml is not None:
+        g_requested = max(1, effective_ggml)
+        g_max = total if (opportunistic and 2 < total <= 4) else total - 1
+        g_threads = min(g_requested, g_max)
+        c_threads = (
+            1
+            if (opportunistic and 2 < total <= 4 and g_threads == total)
+            else max(1, total - g_threads)
+        )
+        return g_threads, c_threads
+
+    return None
+
+
 def resolve_zerotts_thread_budget(
     total_threads: int,
     *,
     pipelined: bool = True,
     codec_threads: int | None = None,
     ggml_threads: int | None = None,
+    opportunistic: bool = True,
 ) -> tuple[int, int]:
     """Dynamically allocate CPU threads between GGML frame generation and ONNX codec.
 
     When pipelined streaming overlaps GGML autoregression with ONNX codec decoding,
-    allocating full threads to both causes severe thread oversubscription, context switching,
-    and CPU cache thrashing on multi-core systems (e.g. 4 GGML + 2 Codec = 6 threads on 4 cores).
+    allocating full threads to both causes severe thread oversubscription on many-core systems.
+    However, on edge quad-core CPUs (e.g. Intel Celeron N5105 / J4125 / Raspberry Pi 4),
+    the neural codec decoding runs for only ~15 ms every 16 frames (~1.28 s). Under opportunistic
+    budgeting (opportunistic=True, default), GGML is allocated all available cores (total_threads)
+    while the codec is assigned 1 thread, allowing the CPU to execute GGML at full capacity for >98%
+    of the generation time while the OS CFS scheduler timeslices during brief codec bursts.
+
+    Strict partitioning (ggml + codec <= total_threads) is enforced with opportunistic=False,
+    allowing callers on resource-constrained or strict-quota systems to retain strict budgeting.
 
     Note on single-core systems: When pipelined is True and total_threads <= 1,
     strict budget compliance is impossible because both runtimes require at least 1 thread.
@@ -734,6 +813,7 @@ def resolve_zerotts_thread_budget(
         pipelined: Whether frame generation and codec decoding run concurrently.
         codec_threads: Optional explicit override for MOSS ONNX decoder threads.
         ggml_threads: Optional explicit override for GGML autoregressive transformer threads.
+        opportunistic: Whether to allow opportunistic 1-thread oversubscription on <= 4 cores.
 
     Returns:
         Tuple of (ggml_threads, codec_threads), both >= 1.
@@ -762,27 +842,17 @@ def resolve_zerotts_thread_budget(
     if total <= 1:
         return 1, 1
 
-    if effective_codec is not None and effective_ggml is not None:
-        c_req = max(1, effective_codec)
-        g_req = max(1, effective_ggml)
-        c_threads = min(c_req, total - 1)
-        g_threads = min(g_req, total - c_threads)
-        return g_threads, c_threads
-
-    if effective_codec is not None:
-        c_requested = max(1, effective_codec)
-        c_threads = min(c_requested, total - 1)
-        g_threads = total - c_threads
-        return g_threads, c_threads
-
-    if effective_ggml is not None:
-        g_requested = max(1, effective_ggml)
-        g_threads = min(g_requested, total - 1)
-        c_threads = max(1, total - g_threads)
-        return g_threads, c_threads
+    explicit = _resolve_explicit_pipelined_threads(
+        effective_codec, effective_ggml, total, opportunistic=opportunistic
+    )
+    if explicit is not None:
+        return explicit
 
     if total <= 2:
         return 1, 1
+
+    if total <= 4:
+        return (total, 1) if opportunistic else (total - 1, 1)
 
     c_threads = _default_pipelined_codec_threads(total)
     return total - c_threads, c_threads
@@ -809,6 +879,7 @@ def _resolve_engine_options(
     num_threads: int,
     pipelined: bool | None,
     codec_threads: int | None,
+    opportunistic: bool = True,
 ) -> tuple[int, bool, int, int]:
     """Resolve runtime threading and pipelining flags.
 
@@ -816,6 +887,7 @@ def _resolve_engine_options(
         num_threads: Requested CPU thread count.
         pipelined: Pipelining override.
         codec_threads: Codec thread count override.
+        opportunistic: Whether to allow opportunistic thread budgeting on <= 4 cores.
 
     Returns:
         Tuple of (total_threads, pipelined, ggml_threads, codec_threads).
@@ -828,6 +900,7 @@ def _resolve_engine_options(
         total_threads,
         pipelined=is_pipelined,
         codec_threads=codec_threads,
+        opportunistic=opportunistic,
     )
     return total_threads, is_pipelined, ggml_thr, codec_thr
 
@@ -872,6 +945,7 @@ class ZeroTtsGgmlEngine:
         codec_threads: int | None = None,
         pipelined: bool | None = None,
         codec_int8: bool | None = None,
+        opportunistic: bool = True,
     ) -> None:
         """Initialize the ZeroTTS GGML engine from local weights and configurations.
 
@@ -885,6 +959,7 @@ class ZeroTtsGgmlEngine:
             codec_threads: Optional CPU thread count for MOSS ONNX decoder.
             pipelined: Whether to overlap GGML frame synthesis and ONNX codec decoding.
             codec_int8: Optional override for MOSS neural codec INT8 precision.
+            opportunistic: Whether to allow opportunistic thread budgeting on <= 4 cores.
 
         Raises:
             ValueError: If no voice is configured.
@@ -907,6 +982,7 @@ class ZeroTtsGgmlEngine:
             num_threads=num_threads,
             pipelined=pipelined,
             codec_threads=codec_threads,
+            opportunistic=opportunistic,
         )
         self.codec_int8: bool = resolve_zerotts_codec_int8(
             codec_int8,

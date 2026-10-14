@@ -1009,6 +1009,26 @@ async def test_run_server_incorporates_zerotts_resolution_in_cache_namespace(
     assert factory_keywords["cache_namespace"] == expected_ns
 
 
+async def test_run_server_forwards_zerotts_opportunistic_setting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test run server forwards zerotts_opportunistic=False to initialize_zerotts."""
+    download_ret = {STT_DIR: tmp_path / STT_DIR, TTS_DIR: tmp_path / TTS_DIR}
+    _server, _tts, init_zerotts, _download, _config = await _run_configured_zerotts_server(
+        tmp_path,
+        monkeypatch,
+        download_ret,
+        env_overrides={"ZEROTTS_OPPORTUNISTIC": "false"},
+    )
+    init_zerotts.assert_called_once_with(
+        tmp_path / TTS_DIR,
+        (DEFAULT_ZEROTTS_VOICE,),
+        resolve_cpu_threads(0),
+        gguf_path=tmp_path / TTS_DIR / "gguf" / ZeroTtsFile.DEFAULT_GGUF_MODEL,
+        opportunistic=False,
+    )
+
+
 async def test_run_server_drains_stt_and_tts_concurrently(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

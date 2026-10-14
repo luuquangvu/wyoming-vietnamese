@@ -85,6 +85,7 @@ def test_server_config_defaults() -> None:
     assert config.tts_clause_silence_ms == TtsSilenceMs.CLAUSE
     assert config.tts_paragraph_silence_ms == TtsSilenceMs.PARAGRAPH
     assert config.zerotts_model == "auto"
+    assert config.zerotts_opportunistic is True
 
 
 def test_server_config_custom_values() -> None:
@@ -108,6 +109,7 @@ def test_server_config_custom_values() -> None:
             "WYOMING_WRITE_TIMEOUT": "0.75",
             "MAX_ACTIVE_CONNECTIONS": "12",
             "MAX_STT_BUFFER_MB": "34",
+            "ZEROTTS_OPPORTUNISTIC": "false",
         }
     )
     assert config.port == 12000
@@ -134,6 +136,7 @@ def test_server_config_custom_values() -> None:
     assert config.write_timeout == 0.75
     assert config.max_active_connections == 12
     assert config.max_stt_buffer_bytes == 34 * 1024 * 1024
+    assert config.zerotts_opportunistic is False
 
 
 @pytest.mark.parametrize(

@@ -1173,6 +1173,28 @@ def test_initialize_zerotts_forwards_pipelined_parameter(
     )
 
 
+def test_initialize_zerotts_forwards_opportunistic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test initialize_zerotts forwards opportunistic parameter to engine."""
+    fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
+    engine_cls = Mock(return_value=fake_engine)
+    monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
+    monkeypatch.setattr(
+        "wyoming_vietnamese.tts_model.detect_cpu_variant", lambda: ZeroTtsVariant.AVX2
+    )
+
+    initialize_zerotts(tmp_path, (DEFAULT_ZEROTTS_VOICE,), num_threads=4, opportunistic=False)
+    engine_cls.assert_called_once_with(
+        model_dir=tmp_path,
+        gguf_path=tmp_path / ZeroTtsDirectory.GGUF / ZeroTtsFile.DEFAULT_GGUF_MODEL,
+        voices=(DEFAULT_ZEROTTS_VOICE,),
+        num_threads=4,
+        custom_lib_path=None,
+        opportunistic=False,
+    )
+
+
 def test_initialize_zerotts_forwards_codec_int8(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
