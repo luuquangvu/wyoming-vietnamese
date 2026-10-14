@@ -2036,6 +2036,7 @@ def initialize_zerotts(
     resolution: ZeroTtsModelResolution | None = None,
     pipelined: bool | None = None,
     codec_int8: bool | None = None,
+    opportunistic: bool | None = None,
 ) -> ZeroTtsGgmlEngine:
     """Initialize ZeroTTS using default GGUF and runtime paths unless overridden.
 
@@ -2049,6 +2050,7 @@ def initialize_zerotts(
         resolution: Optional pre-resolved ZeroTTS model resolution carrying spec and path.
         pipelined: Optional override for pipelined streaming execution.
         codec_int8: Optional override for MOSS neural codec INT8 precision.
+        opportunistic: Optional override for opportunistic thread budgeting.
 
     Returns:
         Configured ZeroTtsGgmlEngine instance.
@@ -2091,6 +2093,8 @@ def initialize_zerotts(
         engine_kwargs["pipelined"] = pipelined
     if codec_int8 is not None:
         engine_kwargs["codec_int8"] = codec_int8
+    if opportunistic is not None:
+        engine_kwargs["opportunistic"] = opportunistic
 
     engine = ZeroTtsGgmlEngine(
         model_dir=model_dir,

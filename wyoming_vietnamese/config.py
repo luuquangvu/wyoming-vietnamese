@@ -21,6 +21,7 @@ from .const import (
     DEFAULT_TTS_ENGINE,
     DEFAULT_ZEROTTS_AUTO,
     ZEROTTS_MODEL,
+    ZEROTTS_OPPORTUNISTIC,
     ConnectionLimit,
     SttEngine,
     Timeout,
@@ -91,20 +92,12 @@ def _get_int(
     return value
 
 
-def _get_float(
-    environ: Mapping[str, str],
-    name: str,
-    default: float,
-    *,
-    minimum_exclusive: float | None = None,
-    minimum_inclusive: float | None = None,
-    maximum_inclusive: float | None = None,
-) -> float:
-    """Read and range-check a floating-point environment variable.
-
-    Specify either `minimum_exclusive` or `minimum_inclusive` (not both).
-    `maximum_inclusive` must be >= `minimum_inclusive` or > `minimum_exclusive`.
-    """
+def _validate_float_bounds(
+    minimum_exclusive: float | None,
+    minimum_inclusive: float | None,
+    maximum_inclusive: float | None,
+) -> None:
+    """Validate consistency of floating-point range bounds."""
     if minimum_exclusive is not None and minimum_inclusive is not None:
         raise ValueError("Cannot specify both minimum_exclusive and minimum_inclusive")
     if (
@@ -119,6 +112,23 @@ def _get_float(
         and maximum_inclusive <= minimum_exclusive
     ):
         raise ValueError("maximum_inclusive must be greater than minimum_exclusive")
+
+
+def _get_float(
+    environ: Mapping[str, str],
+    name: str,
+    default: float,
+    *,
+    minimum_exclusive: float | None = None,
+    minimum_inclusive: float | None = None,
+    maximum_inclusive: float | None = None,
+) -> float:
+    """Read and range-check a floating-point environment variable.
+
+    Specify either `minimum_exclusive` or `minimum_inclusive` (not both).
+    `maximum_inclusive` must be >= `minimum_inclusive` or > `minimum_exclusive`.
+    """
+    _validate_float_bounds(minimum_exclusive, minimum_inclusive, maximum_inclusive)
 
     raw_value = environ.get(name)
     try:
@@ -217,6 +227,7 @@ class ServerConfig:
     tts_cache_enabled: bool = True
     stt_engine: str = DEFAULT_STT_ENGINE
     zerotts_model: str = DEFAULT_ZEROTTS_AUTO
+    zerotts_opportunistic: bool = True
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> ServerConfig:
@@ -319,4 +330,5 @@ class ServerConfig:
             ),
             tts_cache_enabled=get_env_bool("TTS_CACHE_ENABLED", True, env),
             zerotts_model=zerotts_model,
+            zerotts_opportunistic=get_env_bool(ZEROTTS_OPPORTUNISTIC, True, env),
         )

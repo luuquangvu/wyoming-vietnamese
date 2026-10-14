@@ -145,6 +145,62 @@ def _log_startup_configuration(
     )
 
 
+def _init_zerotts_from_config(
+    server_config: ServerConfig,
+    tts_path: Path,
+    cpu_threads: int,
+    voices: tuple[ZeroTtsVoiceSpec, ...],
+    *,
+    zerotts_resolution: ZeroTtsModelResolution | None = None,
+    opportunistic: bool | None = None,
+) -> TTSEngine:
+    """Initialize ZeroTTS engine respecting server configuration and thread policies.
+
+    Args:
+        server_config: Active server runtime configuration.
+        tts_path: Directory where TTS assets and models are stored.
+        cpu_threads: Allocated CPU thread count.
+        voices: Configured ZeroTTS voices.
+        zerotts_resolution: Optional resolved model resolution structure.
+        opportunistic: Optional explicit override for opportunistic thread budgeting.
+
+    Returns:
+        Configured TTSEngine instance.
+    """
+    opt_override = server_config.zerotts_opportunistic if opportunistic is None else opportunistic
+    if zerotts_resolution is not None:
+        if opportunistic is not None or not opt_override:
+            return initialize_zerotts(
+                tts_path,
+                voices,
+                cpu_threads,
+                resolution=zerotts_resolution,
+                opportunistic=opt_override,
+            )
+        return initialize_zerotts(
+            tts_path,
+            voices,
+            cpu_threads,
+            resolution=zerotts_resolution,
+        )
+
+    _, gguf_path = resolve_zerotts_model(tts_path, server_config.zerotts_model)
+    if opportunistic is not None or not opt_override:
+        return initialize_zerotts(
+            tts_path,
+            voices,
+            cpu_threads,
+            gguf_path=gguf_path,
+            opportunistic=opt_override,
+        )
+    return initialize_zerotts(
+        tts_path,
+        voices,
+        cpu_threads,
+        gguf_path=gguf_path,
+    )
+
+
 def _initialize_configured_tts(
     server_config: ServerConfig,
     tts_path: Path,
@@ -154,28 +210,20 @@ def _initialize_configured_tts(
     all_voices: tuple[NghiTtsVoiceSpec | ZeroTtsVoiceSpec, ...] | None = None,
     max_loaded_voices: int | None = None,
     zerotts_resolution: ZeroTtsModelResolution | None = None,
+    opportunistic: bool | None = None,
 ) -> TTSEngine:
     """Initialize the configured TTS engine according to selected engine."""
     selected_voices = server_config.tts_voices if voices is None else voices
     validate_tts_voices_for_engine(selected_voices, server_config.tts_engine)
     if server_config.tts_engine == TtsEngine.ZEROTTS:
         zerotts_voices = tuple(v for v in selected_voices if isinstance(v, ZeroTtsVoiceSpec))
-        if zerotts_resolution is not None:
-            return initialize_zerotts(
-                tts_path,
-                zerotts_voices,
-                cpu_threads,
-                resolution=zerotts_resolution,
-            )
-        _, zerotts_gguf = resolve_zerotts_model(
+        return _init_zerotts_from_config(
+            server_config,
             tts_path,
-            server_config.zerotts_model,
-        )
-        return initialize_zerotts(
-            tts_path,
-            zerotts_voices,
             cpu_threads,
-            gguf_path=zerotts_gguf,
+            zerotts_voices,
+            zerotts_resolution=zerotts_resolution,
+            opportunistic=opportunistic,
         )
     nghitts_voices = tuple(v for v in selected_voices if isinstance(v, NghiTtsVoiceSpec))
     configured_nghitts = (
