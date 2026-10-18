@@ -1993,6 +1993,7 @@ def test_is_attention_tensor_patterns(tensor_name: str, expected: bool) -> None:
     [
         ("audio_head.0.weight", True),
         ("audio_embed.15.weight", True),
+        ("text_embed.weight", True),
         ("codebook.weight", True),
         ("text_encoder.weight", True),
         ("txt.0.attn_q.weight", True),
@@ -2138,7 +2139,7 @@ def _inspect_gguf_tensors(
 
 def _assert_synthetic_hybrid_tensors(
     tensors: dict[str, tuple[int, int]],
-    expected_attn_type: int = GGML_TYPE_Q8_0,
+    expected_attn_type: int = GGML_TYPE_Q4_0,
 ) -> None:
     """Assert common synthetic GGUF tensor types and count."""
     assert len(tensors) == 6
@@ -2190,14 +2191,14 @@ def test_convert_zerotts_q8_to_q4_hybrid_success(tmp_path: Path) -> None:
 
     tensors, q4_payload, data_start = _inspect_gguf_tensors(dst)
     assert data_start % 32 == 0
-    _assert_synthetic_hybrid_tensors(tensors, GGML_TYPE_Q8_0)
+    _assert_synthetic_hybrid_tensors(tensors, GGML_TYPE_Q4_0)
 
     assert len(q4_payload) == 18
     expected_q4 = quantize_row_q8_0_to_q4_0(np.float16(1.0).tobytes() + (b"\x01" * 32), 32)
     assert q4_payload == expected_q4
 
-    expected_q8 = np.float16(1.0).tobytes() + (b"\x02" * 32)
-    _assert_hybrid_attention_and_head_payloads(dst, tensors, data_start, expected_q8)
+    expected_attn_q4 = quantize_row_q8_0_to_q4_0(np.float16(1.0).tobytes() + (b"\x02" * 32), 32)
+    _assert_hybrid_attention_and_head_payloads(dst, tensors, data_start, expected_attn_q4)
 
 
 def _write_gguf_with_alignment(path: Path, alignment_val: int, *, n_tensors: int = 0) -> None:
@@ -2520,7 +2521,7 @@ def test_create_q4_hybrid_cli_tool(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         """Verify that quantized hybrid tensors match expected quantization types."""
         assert target.is_file()
         tensors, _, _ = _inspect_gguf_tensors(target)
-        assert tensors["model.layers.0.self_attn.weight"][0] == GGML_TYPE_Q8_0
+        assert tensors["model.layers.0.self_attn.weight"][0] == GGML_TYPE_Q4_0
         assert tensors["model.layers.0.mlp.weight"][0] == GGML_TYPE_Q4_0
         assert tensors["audio_head.weight"][0] == GGML_TYPE_Q8_0
 

@@ -6,8 +6,9 @@ with 4MB L3 cache and Raspberry Pi 4).
 
 Architecture Strategy:
 - Audio Embeddings & Codebook Heads: Keep Q8_0 (preserves acoustic discrete token fidelity).
-- Attention Layers (Self-Attention, Cross-Attention): Keep Q8_0 (prevents phonetic token drift).
-- Text Encoder: Keep Q8_0 or FP16 (lightweight, runs once per utterance).
+- Attention Layers (Self-Attention, Cross-Attention): Quantize to Q4_0 (cuts DRAM memory bandwidth
+  by ~47% and utilizes native SSSE3 vector dot-products).
+- Text Encoder & Embeddings: Keep Q8_0 or FP16 (lightweight, runs once per utterance).
 - Transformer FFN (Feed-Forward Networks): Quantize to Q4_0 (reduces working memory footprint
   allowing the active local step to fit inside CPU cache and avoiding DRAM bus saturation).
 """
@@ -40,8 +41,8 @@ def print_q4_hybrid_summary(input_path: Path, output_path: Path) -> None:
     print(f"Target Hybrid: {output_path}")
     print("\nTensor Quantization Mapping:")
     print("  [Q8_0 / Native] Audio Embedding & Prediction Codebook Heads")
-    print("  [Q8_0 / Native] Self-Attention & Cross-Attention (Q, K, V, O)")
     print("  [Q8_0 / Native] Text Encoder & Layer Norms")
+    print("  [Q4_0         ] Attention Layers (Self-Attention & Cross-Attention Q, K, V, O)")
     print("  [Q4_0         ] Transformer Feed-Forward Networks (FFN / MLP)")
     print("\nBenefits:")
     print("  - Fits Local Transformer in 4MB L3 Cache (N5105 / J4125 / Pi 4)")
