@@ -41,7 +41,7 @@ _ATTN_TOKEN_PATTERN: Final = re.compile(
     r")(?:[._]|$)"
 )
 _PINNED_Q8_TOKEN_PATTERN: Final = re.compile(
-    r"(?:^|[._])(?:audio_head|audio_embed|codebook|text_encoder|txt)(?:[._]|$)"
+    r"(?:^|[._])(?:audio_head|audio_embed|text_embed|codebook|text_encoder|txt)(?:[._]|$)"
 )
 _ATTN_EXCLUDE_TOKEN_PATTERN: Final = re.compile(
     r"(?:^|[._])(?:norm|bias|emb|embed|embedding|head|codebook)(?:[._]|$)"
@@ -54,9 +54,10 @@ _FFN_EXCLUDE_TOKEN_PATTERN: Final = re.compile(
 def is_pinned_q8_tensor(tensor_name: str) -> bool:
     """Return True if tensor must remain in Q8_0 or higher precision to preserve audio fidelity.
 
-    Audio codebook prediction heads (audio_head.*) and embedding lookup tables (audio_embed.*)
-    are sensitive discrete probability distributions and embedding bases; quantizing them
-    below Q8 causes metallic distortion and phoneme collapse.
+    Audio codebook prediction heads (audio_head.*), audio embedding lookup tables (audio_embed.*),
+    and text token embeddings (text_embed.*) are sensitive discrete probability distributions
+    and embedding bases; quantizing them below Q8 causes metallic distortion, phonetic collapse,
+    and chaotic codebook sampling.
 
     Args:
         tensor_name: Name of the GGUF tensor.
@@ -148,11 +149,12 @@ def convert_zerotts_q8_to_q4_hybrid(
 ) -> Path:
     """Convert a source ZeroTTS Q8_0 GGUF model into a Q4-Hybrid GGUF model.
 
-    Preserves Audio Embeddings, Codebook Output Heads, and Attention projections in
-    native/Q8_0 precision. Quantizes Transformer FFN / MLP layers to Q4_0 for optimal
-    CPU cache utilization, memory bandwidth reduction, and zero scalar fallback overhead
-    on edge processors. Validates GGUF magic, versions, structure bounds, key-values,
-    and tensor offsets.
+    Preserves Audio Embeddings, Codebook Output Heads, Text Embeddings, and Normalization
+    layers in native/Q8_0/FP32 precision. Quantizes Transformer Attention projections
+    (Self-Attention and Cross-Attention Q, K, V, O) and FFN / MLP layers to Q4_0 for
+    optimal CPU cache utilization, memory bandwidth reduction, and zero scalar fallback
+    overhead on edge processors. Validates GGUF magic, versions, structure bounds,
+    key-values, and tensor offsets.
 
     Args:
         src_path: Path to input Q8_0 GGUF model.
@@ -328,7 +330,11 @@ def convert_zerotts_q8_to_q4_hybrid(
 
         new_offset = 0
         for info in tensor_infos:
-            if is_ffn_tensor(info["name"]) and info["ttype"] == GGML_TYPE_Q8_0:
+            name = info["name"]
+            should_q4 = (
+                is_ffn_tensor(name) or is_attention_tensor(name)
+            ) and not is_pinned_q8_tensor(name)
+            if should_q4 and info["ttype"] == GGML_TYPE_Q8_0:
                 info["new_ttype"] = GGML_TYPE_Q4_0
                 info["dst_size"] = (info["n_elem"] // 32) * 18
             else:
