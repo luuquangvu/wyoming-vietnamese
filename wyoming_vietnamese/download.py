@@ -21,7 +21,6 @@ from .config import get_env_bool
 from .const import (
     DEFAULT_STT_ENGINE,
     DEFAULT_TTS_ENGINE,
-    DEFAULT_ZEROTTS_AUTO,
     NGHITTS_MODEL_BASE_URL,
     STT_DIR,
     TTS_DIR,
@@ -29,11 +28,9 @@ from .const import (
     NghiTtsFile,
     TtsEngine,
     ZeroTtsDirectory,
+    ZeroTtsEnv,
     ZeroTtsFile,
     ZeroTtsVariant,
-)
-from .const import (
-    ZEROTTS_MODEL as ENV_ZEROTTS_MODEL,
 )
 from .gguf_converter import (
     GGML_TYPE_F16,
@@ -53,7 +50,9 @@ from .gguf_converter import (
 from .stt_model import DEFAULT_STT_MODEL, SttArtifact, SttModelSpec, get_stt_model
 from .tts import validate_tts_voices_for_engine
 from .tts_model import (
+    ZEROTTS_BASE_MODEL,
     ZEROTTS_MODEL,
+    ZEROTTS_Q4_MODEL,
     ZEROTTS_VOICES,
     NghiTtsVoiceSpec,
     ZeroTtsArtifact,
@@ -124,6 +123,8 @@ _LOGGER = logging.getLogger(__name__)
 _DOWNLOAD_TIMEOUT_SECONDS: Final[float] = 60.0
 
 _BUNDLED_ASSETS_DIR: Final[Path] = Path(__file__).resolve().parent / "assets"
+_ZEROTTS_VOICE_FILENAME: Final[str] = "voice.npz"
+_GGUF_GLOB: Final[str] = "*.gguf"
 
 
 def setup_hf_environment(cache_dir: Path, offline: bool = False) -> None:
@@ -197,8 +198,14 @@ def download_models(
     zerotts_resolution: ZeroTtsModelResolution | None = None
 
     if tts_engine_name == TtsEngine.ZEROTTS:
-        effective_quant = zerotts_quant or os.environ.get(ENV_ZEROTTS_MODEL, "").strip() or None
-        normalized_quant = normalize_zerotts_model(effective_quant or DEFAULT_ZEROTTS_AUTO)
+        if zerotts_quant is not None:
+            effective_quant = zerotts_quant
+        elif model_env := os.environ.get(ZeroTtsEnv.MODEL, "").strip():
+            effective_quant = model_env
+        else:
+            quality = os.environ.get(ZeroTtsEnv.QUALITY, "").strip().lower()
+            effective_quant = tts_model.resolve_quality_zerotts_model(quality)
+        normalized_quant = normalize_zerotts_model(effective_quant)
 
         def _download_spec_resolver(
             model_name: str | None = None,
@@ -238,16 +245,37 @@ def download_models(
             len(zerotts_spec.artifacts),
             gguf_label,
         )
-        zerotts_snapshot = _sync_repo(
-            zerotts_spec.repo,
-            offline,
-            revision=zerotts_spec.revision,
-            allow_patterns=zerotts_spec.allow_patterns,
-        )
         with _model_structure_lock(download_dir):
             stt_dest.mkdir(parents=True, exist_ok=True)
             _structure_stt_files(stt_snapshot, stt_dest, stt_model)
-            _structure_zerotts_files(zerotts_snapshot, tts_dest, tts_voices, zerotts_spec)
+
+        try:
+            zerotts_snapshot = _sync_repo(
+                zerotts_spec.repo,
+                offline,
+                revision=zerotts_spec.revision,
+                allow_patterns=zerotts_spec.allow_patterns,
+            )
+            with _model_structure_lock(download_dir):
+                _structure_zerotts_files(zerotts_snapshot, tts_dest, tts_voices, zerotts_spec)
+        except Exception as sync_err:
+            fallback = _find_existing_zerotts_fallback(
+                tts_dest,
+                zerotts_spec,
+                resolved_gguf_path=resolved_gguf_path,
+                voices=tts_voices,
+            )
+            if fallback is not None:
+                _LOGGER.warning(
+                    "Failed to download or update ZeroTTS model (%s); "
+                    "falling back to existing model at %s: %s",
+                    gguf_label,
+                    fallback.gguf_path,
+                    sync_err,
+                )
+                zerotts_resolution = fallback
+            else:
+                raise
     elif tts_engine_name == TtsEngine.NGHITTS:
         nghitts_voices = tuple(voice for voice in tts_voices if isinstance(voice, NghiTtsVoiceSpec))
         tts_snapshots = {
@@ -786,6 +814,123 @@ def _structure_nghitts_files(snapshot_path: Path, dest_dir: Path) -> list[Path]:
     return [model_destination, config_destination, tokens_destination]
 
 
+def _verify_candidate_artifacts(dest_dir: Path, spec: ZeroTtsModelSpec) -> bool:
+    """Verify that all non-GGUF artifacts for a model spec exist and match checksums."""
+    int8_name = f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}"
+    for artifact in (spec.config, spec.tokenizer, spec.null_voice_emb):
+        if not _is_verified_file(dest_dir / artifact.local_name, artifact.sha256):
+            return False
+    for codec_art in spec.codec_files:
+        codec_path = dest_dir / codec_art.local_name
+        if codec_art.local_name == int8_name:
+            if codec_path.is_file() and not _is_verified_file(codec_path, codec_art.sha256):
+                return False
+            continue
+        if not _is_verified_file(codec_path, codec_art.sha256):
+            return False
+    return True
+
+
+def _verify_candidate_voices(dest_dir: Path, voices: Sequence[AnyVoiceSpec] | None) -> bool:
+    """Verify that all configured ZeroTTS voices exist and match checksums."""
+    if not voices:
+        return True
+    for v in voices:
+        if isinstance(v, ZeroTtsVoiceSpec):
+            voice_path = dest_dir / "voices" / v.id / _ZEROTTS_VOICE_FILENAME
+            if not _is_verified_file(voice_path, v.artifact.sha256):
+                return False
+    return True
+
+
+def _verify_existing_zerotts_candidate(
+    dest_dir: Path,
+    spec: ZeroTtsModelSpec,
+    gguf_path: Path,
+    voices: Sequence[AnyVoiceSpec] | None = None,
+) -> bool:
+    """Verify that an existing model candidate has valid GGUF, artifacts, and voices."""
+    if not gguf_path.is_file():
+        return False
+    if spec.gguf_model is not None and not _is_verified_file(gguf_path, spec.gguf_model.sha256):
+        return False
+    return _verify_candidate_artifacts(dest_dir, spec) and _verify_candidate_voices(
+        dest_dir, voices
+    )
+
+
+def _find_unpinned_zerotts_fallback(
+    dest_dir: Path,
+    gguf_dir: Path,
+    checked_filenames: set[str],
+    voices: Sequence[AnyVoiceSpec] | None = None,
+) -> ZeroTtsModelResolution | None:
+    """Find an unpinned custom GGUF model in gguf_dir passing candidate verification.
+
+    Args:
+        dest_dir: Root directory for ZeroTTS assets.
+        gguf_dir: Subdirectory containing candidate GGUF files.
+        checked_filenames: Set of filenames already checked and rejected.
+        voices: Optional configured voices to verify.
+
+    Returns:
+        ZeroTtsModelResolution if a valid custom model is found, None otherwise.
+    """
+    if not gguf_dir.is_dir():
+        return None
+    for gguf_file in sorted(gguf_dir.glob(_GGUF_GLOB)):
+        if gguf_file.name in checked_filenames:
+            continue
+        if _verify_existing_zerotts_candidate(dest_dir, ZEROTTS_BASE_MODEL, gguf_file, voices):
+            return ZeroTtsModelResolution(spec=ZEROTTS_BASE_MODEL, gguf_path=gguf_file)
+    return None
+
+
+def _find_existing_zerotts_fallback(
+    dest_dir: Path,
+    target_spec: ZeroTtsModelSpec,
+    resolved_gguf_path: Path | None = None,
+    voices: Sequence[AnyVoiceSpec] | None = None,
+) -> ZeroTtsModelResolution | None:
+    """Find a verified usable existing ZeroTTS model on disk when download or sync fails.
+
+    Args:
+        dest_dir: Root directory for ZeroTTS assets.
+        target_spec: Target model specification requested.
+        resolved_gguf_path: Optional candidate GGUF path to check first for unpinned specs.
+        voices: Optional configured voices to verify.
+
+    Returns:
+        ZeroTtsModelResolution if a valid fallback model is found, None otherwise.
+    """
+    gguf_dir = dest_dir / ZeroTtsDirectory.GGUF
+    checked_filenames: set[str] = set()
+
+    target_path = (
+        dest_dir / target_spec.gguf_model.local_name
+        if target_spec.gguf_model is not None
+        else resolved_gguf_path
+    )
+    if target_path is not None:
+        checked_filenames.add(target_path.name)
+        if _verify_existing_zerotts_candidate(dest_dir, target_spec, target_path, voices):
+            return ZeroTtsModelResolution(spec=target_spec, gguf_path=target_path)
+
+    candidates = (
+        (ZeroTtsFile.Q4_HYBRID_GGUF_MODEL, ZEROTTS_Q4_MODEL),
+        (ZeroTtsFile.DEFAULT_GGUF_MODEL, ZEROTTS_MODEL),
+    )
+    for model_file, spec in candidates:
+        if model_file in checked_filenames:
+            continue
+        checked_filenames.add(model_file)
+        candidate_path = gguf_dir / model_file
+        if _verify_existing_zerotts_candidate(dest_dir, spec, candidate_path, voices):
+            return ZeroTtsModelResolution(spec=spec, gguf_path=candidate_path)
+
+    return _find_unpinned_zerotts_fallback(dest_dir, gguf_dir, checked_filenames, voices)
+
+
 def _locate_zerotts_gguf(snapshot_path: Path, artifact: ZeroTtsArtifact) -> Path:
     """Locate a ZeroTTS GGUF model file across snapshot directories."""
     expected_name = Path(artifact.remote_name).name
@@ -797,11 +942,11 @@ def _locate_zerotts_gguf(snapshot_path: Path, artifact: ZeroTtsArtifact) -> Path
         return candidate
 
     gguf_candidates = [
-        f for f in snapshot_path.glob("*.gguf") if _is_verified_file(f, artifact.sha256)
+        f for f in snapshot_path.glob(_GGUF_GLOB) if _is_verified_file(f, artifact.sha256)
     ]
     if gguf_dir.is_dir():
         gguf_candidates.extend(
-            f for f in gguf_dir.glob("*.gguf") if _is_verified_file(f, artifact.sha256)
+            f for f in gguf_dir.glob(_GGUF_GLOB) if _is_verified_file(f, artifact.sha256)
         )
     if gguf_candidates:
         return gguf_candidates[0]
@@ -962,7 +1107,7 @@ def _structure_zerotts_voice_files(snapshot_path: Path, dest_dir: Path) -> list[
             raise RuntimeError(
                 f"Pinned ZeroTTS voice {voice.id!r} does not match its recorded SHA-256 digest"
             )
-        dst = dest_dir / "voices" / voice.id / "voice.npz"
+        dst = dest_dir / "voices" / voice.id / _ZEROTTS_VOICE_FILENAME
         _copy_or_link(source, dst)
         copied_paths.append(dst)
     return copied_paths
@@ -976,7 +1121,7 @@ def _verify_configured_zerotts_voices(
     """Verify that all explicitly configured ZeroTTS voices exist and match pinned digests."""
     for v in voices:
         if isinstance(v, ZeroTtsVoiceSpec):
-            expected_dst = dest_dir / "voices" / v.id / "voice.npz"
+            expected_dst = dest_dir / "voices" / v.id / _ZEROTTS_VOICE_FILENAME
             if not expected_dst.is_file():
                 raise FileNotFoundError(
                     f"Configured ZeroTTS voice {v.id!r} is missing from {snapshot_path!s}"

@@ -27,11 +27,11 @@ if TYPE_CHECKING:
     from zerotts.codec import MossCodecDecoder, MossStreamingDecoder
 
 from .const import (
-    ZEROTTS_CODEC_THREADS,
-    ZEROTTS_GGML_THREADS,
     ZEROTTS_REPO_URL,
     ZEROTTS_SOURCE_COMMIT,
     ZeroTtsAudio,
+    ZeroTtsCodebook,
+    ZeroTtsEnv,
     ZeroTtsFile,
     ZeroTtsVariant,
 )
@@ -42,6 +42,8 @@ from .cpu import (
 from .tts_model import (
     ZEROTTS_VOICES_BY_ID,
     ZeroTtsVoiceSpec,
+    is_zerotts_edge_variant,
+    resolve_quality_codebooks,
     resolve_zerotts_codec_int8,
 )
 
@@ -660,6 +662,9 @@ def _configure_zerotts_lib_signatures(lib: ctypes.CDLL) -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_int),
     ]
     lib.zerotts_timings.restype = None
+    if hasattr(lib, "zerotts_set_max_codebooks"):
+        lib.zerotts_set_max_codebooks.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.zerotts_set_max_codebooks.restype = None
     return lib
 
 
@@ -822,12 +827,12 @@ def resolve_zerotts_thread_budget(
     effective_codec = (
         codec_threads
         if codec_threads is not None
-        else _read_env_thread_override(ZEROTTS_CODEC_THREADS)
+        else _read_env_thread_override(ZeroTtsEnv.CODEC_THREADS)
     )
     effective_ggml = (
         ggml_threads
         if ggml_threads is not None
-        else _read_env_thread_override(ZEROTTS_GGML_THREADS)
+        else _read_env_thread_override(ZeroTtsEnv.GGML_THREADS)
     )
 
     if not pipelined:
@@ -880,17 +885,19 @@ def _resolve_engine_options(
     pipelined: bool | None,
     codec_threads: int | None,
     opportunistic: bool = True,
-) -> tuple[int, bool, int, int]:
-    """Resolve runtime threading and pipelining flags.
+    max_codebooks: int | None = None,
+) -> tuple[int, bool, int, int, int]:
+    """Resolve runtime threading, pipelining, and codebook depth flags.
 
     Args:
         num_threads: Requested CPU thread count.
         pipelined: Pipelining override.
         codec_threads: Codec thread count override.
         opportunistic: Whether to allow opportunistic thread budgeting on <= 4 cores.
+        max_codebooks: Optional upper bound on generated acoustic codebooks.
 
     Returns:
-        Tuple of (total_threads, pipelined, ggml_threads, codec_threads).
+        Tuple of (total_threads, pipelined, ggml_threads, codec_threads, max_codebooks).
     """
     total_threads = resolve_cpu_threads(num_threads)
     effective_pipelined = True if pipelined is None else pipelined
@@ -902,7 +909,18 @@ def _resolve_engine_options(
         codec_threads=codec_threads,
         opportunistic=opportunistic,
     )
-    return total_threads, is_pipelined, ggml_thr, codec_thr
+
+    if max_codebooks is not None:
+        effective_cbks = max(ZeroTtsCodebook.MIN, min(ZeroTtsCodebook.MAX, max_codebooks))
+    else:
+        env_cbk = os.environ.get(ZeroTtsEnv.MAX_CODEBOOKS, "").strip()
+        if env_cbk.isdigit():
+            effective_cbks = max(ZeroTtsCodebook.MIN, min(ZeroTtsCodebook.MAX, int(env_cbk)))
+        else:
+            quality = os.environ.get(ZeroTtsEnv.QUALITY, "").strip().lower()
+            effective_cbks = resolve_quality_codebooks(quality, is_edge=is_zerotts_edge_variant())
+
+    return total_threads, is_pipelined, ggml_thr, codec_thr, effective_cbks
 
 
 def _load_text_processors(
@@ -946,6 +964,7 @@ class ZeroTtsGgmlEngine:
         pipelined: bool | None = None,
         codec_int8: bool | None = None,
         opportunistic: bool = True,
+        max_codebooks: int | None = None,
     ) -> None:
         """Initialize the ZeroTTS GGML engine from local weights and configurations.
 
@@ -960,6 +979,7 @@ class ZeroTtsGgmlEngine:
             pipelined: Whether to overlap GGML frame synthesis and ONNX codec decoding.
             codec_int8: Optional override for MOSS neural codec INT8 precision.
             opportunistic: Whether to allow opportunistic thread budgeting on <= 4 cores.
+            max_codebooks: Optional upper bound on generated acoustic codebooks.
 
         Raises:
             ValueError: If no voice is configured.
@@ -978,11 +998,13 @@ class ZeroTtsGgmlEngine:
             self.pipelined,
             self.threads,
             self.codec_threads,
+            self.max_codebooks,
         ) = _resolve_engine_options(
             num_threads=num_threads,
             pipelined=pipelined,
             codec_threads=codec_threads,
             opportunistic=opportunistic,
+            max_codebooks=max_codebooks,
         )
         self.codec_int8: bool = resolve_zerotts_codec_int8(
             codec_int8,
@@ -1007,6 +1029,11 @@ class ZeroTtsGgmlEngine:
             hp_ptr = self._lib.zerotts_hparams_of(self._ctx)
             self._hp = hp_ptr.contents
             self.num_codebooks: int = int(self._hp.num_codebooks)
+
+            if hasattr(self._lib, "zerotts_set_max_codebooks"):
+                self._lib.zerotts_set_max_codebooks(self._ctx, self.max_codebooks)
+            else:
+                self.max_codebooks = self.num_codebooks
 
             self._sp = _ZeroTtsSampling()
             self._lib.zerotts_sampling_defaults(ctypes.byref(self._sp))
@@ -1247,6 +1274,14 @@ class ZeroTtsGgmlEngine:
         updated = tail_left - 1
         return updated, updated <= 0
 
+    @staticmethod
+    def _zero_residual_codebooks(
+        codes_buf: ctypes.Array[ctypes.c_int32], max_codebooks: int, total_codebooks: int
+    ) -> None:
+        """Zero out residual codebooks beyond the maximum codebook count."""
+        for idx in range(max_codebooks, total_codebooks):
+            codes_buf[idx] = 0
+
     def _generate_code_frames(
         self, stop_event: threading.Event | None = None
     ) -> Iterator[np.ndarray]:
@@ -1275,6 +1310,7 @@ class ZeroTtsGgmlEngine:
                 break
             forbid_eoa = (t < min_frames) or (tail_left >= 0)
             self._execute_frame_step(t, forbid_eoa, codes_buf, is_eoa)
+            self._zero_residual_codebooks(codes_buf, self.max_codebooks, k)
 
             yield np.frombuffer(codes_buf, dtype=np.int32).copy()
 

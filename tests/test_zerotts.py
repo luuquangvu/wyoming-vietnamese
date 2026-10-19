@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import queue
 import re
 import shutil
@@ -18,11 +19,11 @@ import numpy as np
 import pytest
 
 from wyoming_vietnamese.const import (
-    ZEROTTS_CODEC_THREADS,
-    ZEROTTS_GGML_THREADS,
     ZEROTTS_SOURCE_COMMIT,
     TtsEngine,
     ZeroTtsAudio,
+    ZeroTtsCodebook,
+    ZeroTtsEnv,
     ZeroTtsFile,
     ZeroTtsVariant,
 )
@@ -54,8 +55,10 @@ from wyoming_vietnamese.zerotts_engine import (
 @pytest.fixture(autouse=True)
 def _clear_zerotts_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Clear ambient ZeroTTS environment variables before test execution."""
-    monkeypatch.delenv(ZEROTTS_CODEC_THREADS, raising=False)
-    monkeypatch.delenv(ZEROTTS_GGML_THREADS, raising=False)
+    monkeypatch.delenv(ZeroTtsEnv.CODEC_THREADS, raising=False)
+    monkeypatch.delenv(ZeroTtsEnv.GGML_THREADS, raising=False)
+    monkeypatch.delenv(ZeroTtsEnv.MAX_CODEBOOKS, raising=False)
+    monkeypatch.delenv(ZeroTtsEnv.QUALITY, raising=False)
 
 
 @pytest.mark.parametrize("native", [False, True])
@@ -108,6 +111,83 @@ def test_build_zerotts_ggml_lib_success(tmp_path: Path, native: bool) -> None:
         verified_path = Path(mock_cdll.call_args[0][0])
         assert verified_path.name == ZeroTtsFile.LIBZEROTTS_SO
         assert "stage" in verified_path.parts
+
+
+def test_build_zerotts_ggml_lib_missing_local_source_raises(tmp_path: Path) -> None:
+    """Test build fails when local zerotts.cpp is missing."""
+    target_dir = tmp_path / "lib"
+
+    mock_cmake_proc = Mock()
+    mock_cmake_proc.communicate.return_value = (b"", b"")
+    mock_cmake_proc.returncode = 0
+    mock_cmake_proc.pid = 12345
+
+    with (
+        patch("tools.build_zerotts.subprocess.run", return_value=Mock(returncode=0)) as mock_run,
+        patch("tools.build_zerotts.subprocess.Popen", return_value=mock_cmake_proc),
+        patch("tools.build_zerotts.LOCAL_ZEROTTS_SOURCE", tmp_path / "missing_zerotts.cpp"),
+        pytest.raises(FileNotFoundError, match=r"Local ZeroTTS C\+\+ source not found at"),
+    ):
+        _build_zerotts_ggml_lib(target_dir)
+
+    mock_cmake_proc.communicate.assert_not_called()
+    assert all("cmake" not in c.args[0] for c in mock_run.call_args_list)
+    assert all("-shared" not in c.args[0] for c in mock_run.call_args_list)
+    assert not (target_dir / ZeroTtsFile.LIBZEROTTS_SO).exists()
+
+
+def test_build_zerotts_ggml_lib_missing_base_commit_raises(tmp_path: Path) -> None:
+    """Test build fails when local ZEROTTS_BASE_COMMIT is missing."""
+    target_dir = tmp_path / "lib"
+    fake_cpp = tmp_path / "zerotts.cpp"
+    fake_cpp.write_bytes(b"// fake")
+
+    mock_cmake_proc = Mock()
+    mock_cmake_proc.communicate.return_value = (b"", b"")
+    mock_cmake_proc.returncode = 0
+    mock_cmake_proc.pid = 12345
+
+    with (
+        patch("tools.build_zerotts.subprocess.run", return_value=Mock(returncode=0)) as mock_run,
+        patch("tools.build_zerotts.subprocess.Popen", return_value=mock_cmake_proc),
+        patch("tools.build_zerotts.LOCAL_ZEROTTS_SOURCE", fake_cpp),
+        patch("tools.build_zerotts.LOCAL_ZEROTTS_BASE_COMMIT", tmp_path / "missing_commit"),
+        pytest.raises(FileNotFoundError, match="Missing"),
+    ):
+        _build_zerotts_ggml_lib(target_dir)
+
+    mock_cmake_proc.communicate.assert_not_called()
+    assert all("cmake" not in c.args[0] for c in mock_run.call_args_list)
+    assert all("-shared" not in c.args[0] for c in mock_run.call_args_list)
+    assert not (target_dir / ZeroTtsFile.LIBZEROTTS_SO).exists()
+
+
+def test_build_zerotts_ggml_lib_mismatched_base_commit_raises(tmp_path: Path) -> None:
+    """Test build fails when local zerotts base commit mismatches requested commit."""
+    target_dir = tmp_path / "lib"
+    fake_cpp = tmp_path / "zerotts.cpp"
+    fake_cpp.write_bytes(b"// fake")
+    fake_base = tmp_path / "ZEROTTS_BASE_COMMIT"
+    fake_base.write_text("0000000000000000000000000000000000000000\n", encoding="utf-8")
+
+    mock_cmake_proc = Mock()
+    mock_cmake_proc.communicate.return_value = (b"", b"")
+    mock_cmake_proc.returncode = 0
+    mock_cmake_proc.pid = 12345
+
+    with (
+        patch("tools.build_zerotts.subprocess.run", return_value=Mock(returncode=0)) as mock_run,
+        patch("tools.build_zerotts.subprocess.Popen", return_value=mock_cmake_proc),
+        patch("tools.build_zerotts.LOCAL_ZEROTTS_SOURCE", fake_cpp),
+        patch("tools.build_zerotts.LOCAL_ZEROTTS_BASE_COMMIT", fake_base),
+        pytest.raises(RuntimeError, match="does not match requested commit"),
+    ):
+        _build_zerotts_ggml_lib(target_dir)
+
+    mock_cmake_proc.communicate.assert_not_called()
+    assert all("cmake" not in c.args[0] for c in mock_run.call_args_list)
+    assert all("-shared" not in c.args[0] for c in mock_run.call_args_list)
+    assert not (target_dir / ZeroTtsFile.LIBZEROTTS_SO).exists()
 
 
 def test_build_zerotts_ggml_lib_import_error_calls_script(tmp_path: Path) -> None:
@@ -726,6 +806,7 @@ def _setup_engine_fixture(
     codec_int8: bool | None = None,
     opportunistic: bool = True,
     codec_threads: int | None = None,
+    max_codebooks: int | None = None,
 ) -> tuple[ZeroTtsGgmlEngine, MagicMock, MagicMock, Mock]:
     """Helper creating a test ZeroTtsGgmlEngine with mocked dependencies."""
     model_dir, gguf_path = _setup_mock_zerotts_assets(tmp_path)
@@ -769,6 +850,7 @@ def _setup_engine_fixture(
             codec_int8=codec_int8,
             opportunistic=opportunistic,
             codec_threads=codec_threads,
+            max_codebooks=max_codebooks,
         )
 
     return engine, fake_cdll, fake_stream_decoder, fake_tokenizer
@@ -2207,6 +2289,7 @@ def test_build_all_zerotts_variants_success(
 
     target_dir = tmp_path / "lib"
     compiled_variants: list[str] = []
+    compiled_commits: list[object] = []
 
     def fake_compile(
         clone_dest: Path,
@@ -2216,6 +2299,7 @@ def test_build_all_zerotts_variants_success(
         **kwargs: object,
     ) -> None:
         compiled_variants.append(variant)
+        compiled_commits.append(kwargs.get("commit"))
         so_file = staging_dir / ZeroTtsFile.LIBZEROTTS_SO
         so_file.write_bytes(f"ELF_{variant}".encode())
 
@@ -2229,9 +2313,52 @@ def test_build_all_zerotts_variants_success(
         results = build_all_zerotts_variants(target_dir)
         assert set(results.keys()) == set(expected_variants)
         assert compiled_variants == expected_variants
+        assert compiled_commits == [ZEROTTS_SOURCE_COMMIT] * len(expected_variants)
         default_link = target_dir / ZeroTtsFile.LIBZEROTTS_SO
         assert default_link.is_symlink()
         assert default_link.readlink() == Path(ZeroTtsVariant.COMPAT) / ZeroTtsFile.LIBZEROTTS_SO
+
+
+def test_build_all_zerotts_variants_missing_local_source_raises(tmp_path: Path) -> None:
+    """Test build_all_zerotts_variants fails before compilation when local source is missing."""
+    from tools.build_zerotts import build_all_zerotts_variants
+
+    target_dir = tmp_path / "lib"
+    with (
+        patch("tools.build_zerotts._checkout_repo"),
+        patch("tools.build_zerotts.LOCAL_ZEROTTS_SOURCE", tmp_path / "missing_zerotts.cpp"),
+        patch("tools.build_zerotts._is_toolchain_variant_supported", return_value=True),
+        patch("platform.machine", return_value="x86_64"),
+        pytest.raises(FileNotFoundError, match=r"Local ZeroTTS C\+\+ source not found at"),
+    ):
+        build_all_zerotts_variants(target_dir)
+
+    leftovers = list(target_dir.glob("_build_all_*"))
+    assert not leftovers
+
+
+def test_build_all_zerotts_variants_mismatched_base_commit_raises(tmp_path: Path) -> None:
+    """Test build_all_zerotts_variants fails when base commit does not match requested commit."""
+    from tools.build_zerotts import build_all_zerotts_variants
+
+    target_dir = tmp_path / "lib"
+    fake_cpp = tmp_path / "zerotts.cpp"
+    fake_cpp.write_bytes(b"// fake")
+    fake_base = tmp_path / "ZEROTTS_BASE_COMMIT"
+    fake_base.write_text("0000000000000000000000000000000000000000\n", encoding="utf-8")
+
+    with (
+        patch("tools.build_zerotts._checkout_repo"),
+        patch("tools.build_zerotts.LOCAL_ZEROTTS_SOURCE", fake_cpp),
+        patch("tools.build_zerotts.LOCAL_ZEROTTS_BASE_COMMIT", fake_base),
+        patch("tools.build_zerotts._is_toolchain_variant_supported", return_value=True),
+        patch("platform.machine", return_value="x86_64"),
+        pytest.raises(RuntimeError, match="does not match requested commit"),
+    ):
+        build_all_zerotts_variants(target_dir)
+
+    leftovers = list(target_dir.glob("_build_all_*"))
+    assert not leftovers
 
 
 def test_build_all_zerotts_variants_compilation_failure(tmp_path: Path) -> None:
@@ -2720,6 +2847,26 @@ def test_get_variant_build_flags_definitions_and_compiler_options() -> None:
         native_arm_cmake, native_arm_gxx = _get_variant_build_flags(ZeroTtsVariant.NATIVE)
         assert "-DGGML_NATIVE=ON" in native_arm_cmake
         assert "-mcpu=native" in native_arm_gxx
+
+
+def test_get_sse4_helpers_compiler_support_branches() -> None:
+    """Test _get_sse4_arch_flags and _get_sse4_build_flags with compiler support flags."""
+    from tools.build_zerotts import (
+        _FLAG_MPOPCNT,
+        _FLAG_MSSE42,
+        _FLAG_MTUNE_GENERIC,
+        _get_sse4_arch_flags,
+        _get_sse4_build_flags,
+    )
+
+    with patch("tools.build_zerotts._is_compiler_flag_supported", return_value=True):
+        assert _get_sse4_arch_flags() == ["-march=x86-64-v2", _FLAG_MTUNE_GENERIC]
+
+    with patch("tools.build_zerotts._is_compiler_flag_supported", return_value=False):
+        assert _get_sse4_arch_flags() == [_FLAG_MSSE42, _FLAG_MPOPCNT, _FLAG_MTUNE_GENERIC]
+        cmake_flags, gxx_flags = _get_sse4_build_flags()
+        assert "-DGGML_SSE42=ON" in cmake_flags
+        assert all("-flto" not in flag for flag in gxx_flags)
 
 
 def test_get_darwin_cpu_flags_timeout() -> None:
@@ -3516,13 +3663,13 @@ def test_zerotts_engine_dynamic_thread_allocation(
         assert engine_codec.pipelined is True
 
         # Strict budget with explicit ZEROTTS_GGML_THREADS override
-        monkeypatch.setenv(ZEROTTS_GGML_THREADS, "2")
+        monkeypatch.setenv(ZeroTtsEnv.GGML_THREADS, "2")
         engine_ggml, _, _, _ = _setup_engine_fixture(tmp_path, num_threads=0, opportunistic=False)
         assert engine_ggml.total_threads == 4
         assert engine_ggml.threads == 2
         assert engine_ggml.codec_threads == 2
         assert engine_ggml.pipelined is True
-        monkeypatch.delenv(ZEROTTS_GGML_THREADS, raising=False)
+        monkeypatch.delenv(ZeroTtsEnv.GGML_THREADS, raising=False)
 
     # Negative thread count raises ValueError
     with pytest.raises(ValueError, match="configured threads must not be negative"):
@@ -3698,12 +3845,12 @@ def test_resolve_zerotts_thread_budget_ggml_and_env(monkeypatch: pytest.MonkeyPa
     )
 
     # Environment variables (valid and invalid fallbacks)
-    monkeypatch.setenv(ZEROTTS_GGML_THREADS, "3")
-    monkeypatch.setenv(ZEROTTS_CODEC_THREADS, "1")
+    monkeypatch.setenv(ZeroTtsEnv.GGML_THREADS, "3")
+    monkeypatch.setenv(ZeroTtsEnv.CODEC_THREADS, "1")
     assert resolve_zerotts_thread_budget(4, pipelined=True) == (3, 1)
 
-    monkeypatch.setenv(ZEROTTS_GGML_THREADS, "invalid")
-    monkeypatch.setenv(ZEROTTS_CODEC_THREADS, "-5")
+    monkeypatch.setenv(ZeroTtsEnv.GGML_THREADS, "invalid")
+    monkeypatch.setenv(ZeroTtsEnv.CODEC_THREADS, "-5")
     assert resolve_zerotts_thread_budget(4, pipelined=True) == (4, 1)
 
 
@@ -4019,3 +4166,97 @@ def test_zerotts_advance_tail_countdown() -> None:
     tail, should_stop = ZeroTtsGgmlEngine._advance_tail_countdown(1, is_eoa=False, extra_frames=1)
     assert tail == 0
     assert should_stop is True
+
+
+def test_zerotts_resolve_engine_options_max_codebooks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test _resolve_engine_options codebook depth resolution and bounding."""
+    from wyoming_vietnamese.zerotts_engine import _resolve_engine_options
+
+    # Explicit override within range
+    _, _, _, _, cbk = _resolve_engine_options(2, None, None, max_codebooks=10)
+    assert cbk == 10
+
+    # Explicit override clamped to minimum (4) and maximum (16)
+    _, _, _, _, cbk_min = _resolve_engine_options(2, None, None, max_codebooks=1)
+    assert cbk_min == ZeroTtsCodebook.MIN
+    _, _, _, _, cbk_max = _resolve_engine_options(2, None, None, max_codebooks=32)
+    assert cbk_max == ZeroTtsCodebook.MAX
+
+    # Environment variable override
+    monkeypatch.setenv(ZeroTtsEnv.MAX_CODEBOOKS, "8")
+    _, _, _, _, cbk_env = _resolve_engine_options(2, None, None)
+    assert cbk_env == 8
+    monkeypatch.delenv(ZeroTtsEnv.MAX_CODEBOOKS, raising=False)
+
+    # Edge CPU defaults to 12
+    monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.is_zerotts_edge_variant", lambda: True)
+    _, _, _, _, cbk_edge = _resolve_engine_options(2, None, None)
+    assert cbk_edge == ZeroTtsCodebook.MEDIUM
+
+    # Standard/desktop CPU defaults to 16
+    monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.is_zerotts_edge_variant", lambda: False)
+    _, _, _, _, cbk_desktop = _resolve_engine_options(2, None, None)
+    assert cbk_desktop == ZeroTtsCodebook.DEFAULT
+
+    # Quality tier defaults when max_codebooks is not explicitly set
+    monkeypatch.setenv(ZeroTtsEnv.QUALITY, "high")
+    _, _, _, _, cbk_q_high = _resolve_engine_options(2, None, None)
+    assert cbk_q_high == ZeroTtsCodebook.HIGH
+
+    monkeypatch.setenv(ZeroTtsEnv.QUALITY, "medium")
+    _, _, _, _, cbk_q_med = _resolve_engine_options(2, None, None)
+    assert cbk_q_med == ZeroTtsCodebook.MEDIUM
+
+    monkeypatch.setenv(ZeroTtsEnv.QUALITY, "low")
+    _, _, _, _, cbk_q_low = _resolve_engine_options(2, None, None)
+    assert cbk_q_low == ZeroTtsCodebook.LOW
+    monkeypatch.delenv(ZeroTtsEnv.QUALITY, raising=False)
+
+
+@pytest.mark.parametrize(
+    ("max_cbk", "expected"),
+    [
+        (12, [*range(1, 13), 0, 0, 0, 0]),
+        (16, list(range(1, 17))),
+    ],
+)
+def test_zerotts_zero_residual_codebooks(max_cbk: int, expected: list[int]) -> None:
+    """Test _zero_residual_codebooks clears tokens beyond max_codebooks."""
+    from wyoming_vietnamese.zerotts_engine import ZeroTtsGgmlEngine
+
+    buf_type = ctypes.c_int32 * 16
+    buf = buf_type(*range(1, 17))
+    ZeroTtsGgmlEngine._zero_residual_codebooks(buf, max_cbk, 16)
+    assert list(buf) == expected
+
+
+def test_zerotts_engine_initialization_sets_max_codebooks(tmp_path: Path) -> None:
+    """Test engine initialization binds max_codebooks to native library and avoids env pollution."""
+    engine, fake_cdll, _, _ = _setup_engine_fixture(tmp_path, max_codebooks=10)
+    assert engine.max_codebooks == 10
+    fake_cdll.zerotts_set_max_codebooks.assert_called_once_with(123456, 10)
+    # Ensure os.environ is NOT mutated
+    assert os.environ.get(ZeroTtsEnv.MAX_CODEBOOKS) is None
+
+
+def test_zerotts_engine_initialization_without_native_set_max_codebooks(tmp_path: Path) -> None:
+    """Test engine keeps max_codebooks at full depth without native set_max_codebooks."""
+    model_dir, gguf_path = _setup_mock_zerotts_assets(tmp_path)
+    voices = (ZEROTTS_VOICES[0], ZEROTTS_VOICES[1])
+
+    fake_cdll = MagicMock(
+        spec=["zerotts_init_from_file", "zerotts_hparams_of", "zerotts_sampling_defaults"]
+    )
+    fake_cdll.zerotts_init_from_file.return_value = 123456
+    dummy_hp = _ZeroTtsHParams(d_model=64, n_voice_queries=32, num_codebooks=8)
+    fake_cdll.zerotts_hparams_of.return_value = ctypes.pointer(dummy_hp)
+
+    with (
+        patch("wyoming_vietnamese.zerotts_engine.resolve_zerotts_ggml_lib", return_value=fake_cdll),
+        patch("zerotts.tokenizer.load_tokenizer", return_value=Mock(return_value=[1, 2, 3])),
+        patch("zerotts.codec.MossCodecDecoder", return_value=MagicMock()),
+    ):
+        engine = ZeroTtsGgmlEngine(
+            model_dir=model_dir, gguf_path=gguf_path, voices=voices, max_codebooks=4
+        )
+        assert engine.max_codebooks == 8

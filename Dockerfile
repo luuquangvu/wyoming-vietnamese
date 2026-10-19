@@ -10,6 +10,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 COPY wyoming_vietnamese/__init__.py wyoming_vietnamese/const.py wyoming_vietnamese/cpu.py ./wyoming_vietnamese/
 COPY tools/build_zerotts.py ./tools/build_zerotts.py
+COPY tools/src/ ./tools/src/
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/var/cache/apt,id=apt,sharing=locked \

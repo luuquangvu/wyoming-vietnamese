@@ -12,6 +12,7 @@ import sys
 from concurrent.futures import Executor
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 if __name__ == "__main__" and not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -32,6 +33,7 @@ from .const import (
     TtsCacheFile,
     TtsEngine,
     TtsProvider,
+    ZeroTtsCodebook,
 )
 from .cpu import resolve_cpu_threads
 from .download import ModelDownloadResult, download_models
@@ -55,6 +57,8 @@ from .tts_model import (
     NghiTtsVoiceSpec,
     ZeroTtsModelResolution,
     ZeroTtsVoiceSpec,
+    is_zerotts_edge_variant,
+    resolve_quality_codebooks,
     resolve_zerotts_model,
 )
 from .voice_usage import RecentVoiceStore
@@ -65,6 +69,7 @@ _LOGGER = logging.getLogger(PROGRAM_NAME)
 def configure_process_environment() -> None:
     """Set process-wide environment defaults before initializing native runtimes."""
     os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+    os.environ.setdefault("GOMP_SPINCOUNT", "1000")
 
 
 configure_process_environment()
@@ -153,6 +158,7 @@ def _init_zerotts_from_config(
     *,
     zerotts_resolution: ZeroTtsModelResolution | None = None,
     opportunistic: bool | None = None,
+    max_codebooks: int | None = None,
 ) -> TTSEngine:
     """Initialize ZeroTTS engine respecting server configuration and thread policies.
 
@@ -163,41 +169,35 @@ def _init_zerotts_from_config(
         voices: Configured ZeroTTS voices.
         zerotts_resolution: Optional resolved model resolution structure.
         opportunistic: Optional explicit override for opportunistic thread budgeting.
+        max_codebooks: Optional explicit override for maximum acoustic codebooks.
 
     Returns:
         Configured TTSEngine instance.
     """
     opt_override = server_config.zerotts_opportunistic if opportunistic is None else opportunistic
+    cbk_override = server_config.zerotts_max_codebooks if max_codebooks is None else max_codebooks
+    extra_kwargs: dict[str, Any] = {}
+    if opportunistic is not None or not opt_override:
+        extra_kwargs["opportunistic"] = opt_override
+    if cbk_override is not None:
+        extra_kwargs["max_codebooks"] = cbk_override
+
     if zerotts_resolution is not None:
-        if opportunistic is not None or not opt_override:
-            return initialize_zerotts(
-                tts_path,
-                voices,
-                cpu_threads,
-                resolution=zerotts_resolution,
-                opportunistic=opt_override,
-            )
         return initialize_zerotts(
             tts_path,
             voices,
             cpu_threads,
             resolution=zerotts_resolution,
+            **extra_kwargs,
         )
 
     _, gguf_path = resolve_zerotts_model(tts_path, server_config.zerotts_model)
-    if opportunistic is not None or not opt_override:
-        return initialize_zerotts(
-            tts_path,
-            voices,
-            cpu_threads,
-            gguf_path=gguf_path,
-            opportunistic=opt_override,
-        )
     return initialize_zerotts(
         tts_path,
         voices,
         cpu_threads,
         gguf_path=gguf_path,
+        **extra_kwargs,
     )
 
 
@@ -277,17 +277,57 @@ def _select_loaded_voices(
     return _select_startup_voices(configured, recent_names, max_voices)
 
 
+def _resolve_effective_zerotts_codebooks(
+    server_config: ServerConfig,
+    tts_engine: TTSEngine | None = None,
+) -> int:
+    """Resolve effective codebook count from initialized engine or server configuration.
+
+    Args:
+        server_config: Process configuration containing ZeroTTS quality and codebook settings.
+        tts_engine: Optional initialized TTS engine instance.
+
+    Returns:
+        Effective codebook depth clamped within supported bounds.
+    """
+    engine_cbks = getattr(tts_engine, "max_codebooks", None)
+    if isinstance(engine_cbks, int):
+        return max(ZeroTtsCodebook.MIN, min(ZeroTtsCodebook.MAX, engine_cbks))
+    if server_config.zerotts_max_codebooks is not None:
+        return max(
+            ZeroTtsCodebook.MIN,
+            min(ZeroTtsCodebook.MAX, server_config.zerotts_max_codebooks),
+        )
+    return resolve_quality_codebooks(
+        server_config.zerotts_quality,
+        is_edge=is_zerotts_edge_variant(),
+    )
+
+
 def _tts_cache_namespace(
     server_config: ServerConfig,
     voices: tuple[NghiTtsVoiceSpec | ZeroTtsVoiceSpec, ...],
     zerotts_model_identity: str | None = None,
+    tts_engine: TTSEngine | None = None,
 ) -> bytes:
-    """Fingerprint engine, sentence silence, voice artifacts, and ZeroTTS model for cache safety."""
+    """Fingerprint engine, sentence silence, voice artifacts, and ZeroTTS model for cache safety.
+
+    Args:
+        server_config: Server runtime configuration.
+        voices: Configured voice specifications.
+        zerotts_model_identity: Optional cryptographic fingerprint of the active ZeroTTS model.
+        tts_engine: Optional initialized TTS engine instance.
+
+    Returns:
+        Deterministic SHA-256 digest bytes identifying the cache namespace.
+    """
     digest = hashlib.sha256(server_config.tts_engine.encode("utf-8"))
     if server_config.tts_engine == TtsEngine.ZEROTTS:
         digest.update(ZEROTTS_MODEL.revision.encode("ascii"))
         if zerotts_model_identity:
             digest.update(zerotts_model_identity.encode("utf-8"))
+        effective_cbks = _resolve_effective_zerotts_codebooks(server_config, tts_engine)
+        digest.update(b"cbk" + effective_cbks.to_bytes(1, "big"))
     digest.update(server_config.tts_sentence_silence_ms.to_bytes(4, "big"))
     for voice in sorted(voices, key=lambda v: v.id):
         digest.update(voice.id.encode("utf-8"))
@@ -684,6 +724,7 @@ async def run_server(
         server_config,
         server_config.tts_voices,
         zerotts_model_identity=zerotts_model_identity,
+        tts_engine=tts_engine,
     )
     tts_result_cache = _initialize_tts_cache(
         server_config,

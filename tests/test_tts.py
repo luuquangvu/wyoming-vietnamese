@@ -33,7 +33,6 @@ from wyoming_vietnamese.const import (
     PROGRAM_NAME,
     TTS_DIR,
     VIETNAMESE_LANGUAGE,
-    ZEROTTS_MODEL,
     NghiTtsAudio,
     NghiTtsFile,
     TtsAudio,
@@ -41,6 +40,7 @@ from wyoming_vietnamese.const import (
     TtsProvider,
     ZeroTtsAudio,
     ZeroTtsDirectory,
+    ZeroTtsEnv,
     ZeroTtsFile,
     ZeroTtsVariant,
 )
@@ -1228,7 +1228,7 @@ def test_initialize_zerotts_env_model_path(tmp_path: Path, monkeypatch: pytest.M
     engine_cls = Mock(return_value=fake_engine)
     monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
     custom_path = tmp_path / "custom-model.gguf"
-    monkeypatch.setenv(ZEROTTS_MODEL, str(custom_path))
+    monkeypatch.setenv(ZeroTtsEnv.MODEL, str(custom_path))
 
     initialize_zerotts(tmp_path, (DEFAULT_ZEROTTS_VOICE,), num_threads=2)
     engine_cls.assert_called_once_with(
@@ -1240,12 +1240,38 @@ def test_initialize_zerotts_env_model_path(tmp_path: Path, monkeypatch: pytest.M
     )
 
 
+def test_initialize_zerotts_max_codebooks_forwarding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test initialize_zerotts forwards explicit max_codebooks to ZeroTtsGgmlEngine."""
+    fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
+    engine_cls = Mock(return_value=fake_engine)
+    monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
+    custom_path = tmp_path / "custom-model.gguf"
+
+    initialize_zerotts(
+        tmp_path,
+        (DEFAULT_ZEROTTS_VOICE,),
+        num_threads=2,
+        gguf_path=custom_path,
+        max_codebooks=10,
+    )
+    engine_cls.assert_called_once_with(
+        model_dir=tmp_path,
+        gguf_path=custom_path,
+        voices=(DEFAULT_ZEROTTS_VOICE,),
+        num_threads=2,
+        custom_lib_path=None,
+        max_codebooks=10,
+    )
+
+
 def test_initialize_zerotts_missing_custom_gguf_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Test initialize_zerotts raises FileNotFoundError when custom GGUF path does not exist."""
     custom_path = tmp_path / "nonexistent-model.gguf"
-    monkeypatch.setenv(ZEROTTS_MODEL, str(custom_path))
+    monkeypatch.setenv(ZeroTtsEnv.MODEL, str(custom_path))
     received_paths: list[Path] = []
 
     def validating_engine(*args: Any, gguf_path: Path, **kwargs: Any) -> Any:
@@ -1268,7 +1294,7 @@ def test_initialize_zerotts_env_model_alias(
     fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
     engine_cls = Mock(return_value=fake_engine)
     monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
-    monkeypatch.setenv(ZEROTTS_MODEL, "q4_hybrid")
+    monkeypatch.setenv(ZeroTtsEnv.MODEL, "q4_hybrid")
 
     initialize_zerotts(tmp_path, (DEFAULT_ZEROTTS_VOICE,), num_threads=2)
     engine_cls.assert_called_once_with(
@@ -1284,7 +1310,7 @@ def test_initialize_zerotts_env_model_invalid_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Test initialize_zerotts raises ValueError for unsupported model names."""
-    monkeypatch.setenv(ZEROTTS_MODEL, "missing.gguf")
+    monkeypatch.setenv(ZeroTtsEnv.MODEL, "missing.gguf")
     with pytest.raises(ValueError, match=r"ZEROTTS_MODEL is invalid: 'missing\.gguf'"):
         initialize_zerotts(tmp_path, (DEFAULT_ZEROTTS_VOICE,), num_threads=2)
 
@@ -1296,7 +1322,7 @@ def test_initialize_zerotts_q4_fallback_when_q8_missing(
     fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
     engine_cls = Mock(return_value=fake_engine)
     monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
-    monkeypatch.delenv(ZEROTTS_MODEL, raising=False)
+    monkeypatch.delenv(ZeroTtsEnv.MODEL, raising=False)
 
     gguf_dir = tmp_path / ZeroTtsDirectory.GGUF
     gguf_dir.mkdir(parents=True, exist_ok=True)
@@ -1320,7 +1346,7 @@ def test_initialize_zerotts_auto_edge_processor(
     fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
     engine_cls = Mock(return_value=fake_engine)
     monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
-    monkeypatch.setenv(ZEROTTS_MODEL, "auto")
+    monkeypatch.setenv(ZeroTtsEnv.MODEL, "auto")
     monkeypatch.setattr(
         "wyoming_vietnamese.tts_model.detect_cpu_variant", lambda: ZeroTtsVariant.SSE4
     )
@@ -1342,7 +1368,7 @@ def test_initialize_zerotts_auto_compat_edge_processor(
     fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
     engine_cls = Mock(return_value=fake_engine)
     monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
-    monkeypatch.setenv(ZEROTTS_MODEL, "auto")
+    monkeypatch.setenv(ZeroTtsEnv.MODEL, "auto")
     monkeypatch.setattr(
         "wyoming_vietnamese.tts_model.detect_cpu_variant", lambda: ZeroTtsVariant.COMPAT
     )
@@ -1364,7 +1390,7 @@ def test_initialize_zerotts_auto_avx_edge_processor(
     fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
     engine_cls = Mock(return_value=fake_engine)
     monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
-    monkeypatch.setenv(ZEROTTS_MODEL, "auto")
+    monkeypatch.setenv(ZeroTtsEnv.MODEL, "auto")
     monkeypatch.setattr(
         "wyoming_vietnamese.tts_model.detect_cpu_variant", lambda: ZeroTtsVariant.AVX
     )
@@ -1386,7 +1412,7 @@ def test_initialize_zerotts_auto_arm_dotprod_processor(
     fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
     engine_cls = Mock(return_value=fake_engine)
     monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
-    monkeypatch.setenv(ZEROTTS_MODEL, "auto")
+    monkeypatch.setenv(ZeroTtsEnv.MODEL, "auto")
     monkeypatch.setattr(
         "wyoming_vietnamese.tts_model.detect_cpu_variant", lambda: ZeroTtsVariant.ARM_DOTPROD
     )
@@ -1438,7 +1464,7 @@ def test_initialize_zerotts_explicit_gguf_path_overrides_env(
 
     custom_explicit_path = tmp_path / "explicit-model.gguf"
     env_path = tmp_path / "env-model.gguf"
-    monkeypatch.setenv(ZEROTTS_MODEL, str(env_path))
+    monkeypatch.setenv(ZeroTtsEnv.MODEL, str(env_path))
 
     initialize_zerotts(
         tmp_path,
@@ -1462,7 +1488,7 @@ def test_initialize_zerotts_q8_fallback_when_q4_missing_on_edge_processor(
     fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
     engine_cls = Mock(return_value=fake_engine)
     monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
-    monkeypatch.delenv(ZEROTTS_MODEL, raising=False)
+    monkeypatch.delenv(ZeroTtsEnv.MODEL, raising=False)
     monkeypatch.setattr(
         "wyoming_vietnamese.tts_model.detect_cpu_variant", lambda: ZeroTtsVariant.SSE4
     )
@@ -1489,7 +1515,7 @@ def test_initialize_zerotts_neither_model_exists_path_and_failure(
     fake_engine = FakeTTS(sample_rate=ZeroTtsAudio.SAMPLE_RATE)
     engine_cls = Mock(return_value=fake_engine)
     monkeypatch.setattr("wyoming_vietnamese.zerotts_engine.ZeroTtsGgmlEngine", engine_cls)
-    monkeypatch.delenv(ZEROTTS_MODEL, raising=False)
+    monkeypatch.delenv(ZeroTtsEnv.MODEL, raising=False)
     monkeypatch.setattr(
         "wyoming_vietnamese.tts_model.detect_cpu_variant", lambda: ZeroTtsVariant.AVX2
     )

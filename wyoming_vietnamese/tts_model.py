@@ -21,8 +21,10 @@ from .const import (
     ZEROTTS_REPO_ID,
     NghiTtsFile,
     TtsEngine,
+    ZeroTtsCodebook,
     ZeroTtsDirectory,
     ZeroTtsFile,
+    ZeroTtsQuality,
     ZeroTtsVariant,
 )
 from .cpu import detect_cpu_variant
@@ -492,6 +494,45 @@ def resolve_zerotts_model_spec(
     if normalized is not None and Path(normalized).is_absolute():
         return ZEROTTS_BASE_MODEL
     return ZEROTTS_Q4_MODEL if normalized == ZeroTtsFile.Q4_HYBRID_GGUF_MODEL else ZEROTTS_MODEL
+
+
+def resolve_quality_zerotts_model(quality: str = ZeroTtsQuality.AUTO) -> str:
+    """Return the default ZeroTTS model filename for a given quality tier.
+
+    Args:
+        quality: Quality tier string ('high', 'medium', 'low', or 'auto').
+
+    Returns:
+        GGUF model filename or 'auto'.
+    """
+    if quality == ZeroTtsQuality.HIGH:
+        return ZeroTtsFile.Q8_0_GGUF_MODEL
+    if quality in (ZeroTtsQuality.MEDIUM, ZeroTtsQuality.LOW):
+        return ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+    return DEFAULT_ZEROTTS_AUTO
+
+
+def resolve_quality_codebooks(
+    quality: str = ZeroTtsQuality.AUTO,
+    *,
+    is_edge: bool = False,
+) -> int:
+    """Return the maximum codebook count for a given quality tier and hardware profile.
+
+    Args:
+        quality: Quality tier string ('high', 'medium', 'low', or 'auto').
+        is_edge: True if host processor is an edge device with limited AVX2 capabilities.
+
+    Returns:
+        Integer maximum codebook count.
+    """
+    if quality == ZeroTtsQuality.HIGH:
+        return ZeroTtsCodebook.HIGH
+    if quality == ZeroTtsQuality.MEDIUM:
+        return ZeroTtsCodebook.MEDIUM
+    if quality == ZeroTtsQuality.LOW:
+        return ZeroTtsCodebook.LOW
+    return ZeroTtsCodebook.MEDIUM if is_edge else ZeroTtsCodebook.DEFAULT
 
 
 class ZeroTtsModelResolution(NamedTuple):
