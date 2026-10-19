@@ -13,11 +13,13 @@ from wyoming_vietnamese.const import (
     DEFAULT_PORT,
     DEFAULT_STT_ENGINE,
     DEFAULT_TTS_ENGINE,
-    ZEROTTS_MODEL,
     SttEngine,
     TtsEngine,
     TtsSilenceMs,
+    ZeroTtsCodebook,
+    ZeroTtsEnv,
     ZeroTtsFile,
+    ZeroTtsQuality,
 )
 from wyoming_vietnamese.tts_model import DEFAULT_NGHITTS_VOICE_ID
 
@@ -278,38 +280,127 @@ def test_server_config_zerotts_model_default() -> None:
 
 def test_server_config_zerotts_model_explicit() -> None:
     """Test server config parses explicit ZEROTTS_MODEL filename."""
-    config = ServerConfig.from_env({ZEROTTS_MODEL: ZeroTtsFile.Q4_HYBRID_GGUF_MODEL})
+    config = ServerConfig.from_env({ZeroTtsEnv.MODEL: ZeroTtsFile.Q4_HYBRID_GGUF_MODEL})
     assert config.zerotts_model == ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
 
 
 def test_server_config_zerotts_model_auto_preserved() -> None:
     """Test server config preserves auto and default selectors without early resolution."""
-    config_auto = ServerConfig.from_env({ZEROTTS_MODEL: "auto"})
+    config_auto = ServerConfig.from_env({ZeroTtsEnv.MODEL: "auto"})
     assert config_auto.zerotts_model == "auto"
 
-    config_default = ServerConfig.from_env({ZEROTTS_MODEL: "default"})
+    config_default = ServerConfig.from_env({ZeroTtsEnv.MODEL: "default"})
     assert config_default.zerotts_model == "auto"
 
 
 def test_server_config_zerotts_model_shorthands() -> None:
     """Test server config normalizes shorthand names for hybrid, q4, and q8 models."""
-    config_hybrid = ServerConfig.from_env({ZEROTTS_MODEL: "q4_hybrid"})
+    config_hybrid = ServerConfig.from_env({ZeroTtsEnv.MODEL: "q4_hybrid"})
     assert config_hybrid.zerotts_model == ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
 
-    config_q4 = ServerConfig.from_env({ZEROTTS_MODEL: "q4"})
+    config_q4 = ServerConfig.from_env({ZeroTtsEnv.MODEL: "q4"})
     assert config_q4.zerotts_model == ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
 
-    config_q8 = ServerConfig.from_env({ZEROTTS_MODEL: "q8"})
+    config_q8 = ServerConfig.from_env({ZeroTtsEnv.MODEL: "q8"})
     assert config_q8.zerotts_model == ZeroTtsFile.Q8_0_GGUF_MODEL
 
 
 def test_server_config_zerotts_model_invalid() -> None:
     """Test server config rejects unsupported ZeroTTS model names."""
     with pytest.raises(ValueError, match=r"ZEROTTS_MODEL is invalid: 'missing\.gguf'"):
-        ServerConfig.from_env({ZEROTTS_MODEL: "missing.gguf"})
+        ServerConfig.from_env({ZeroTtsEnv.MODEL: "missing.gguf"})
 
 
 def test_server_config_zerotts_model_absolute_path() -> None:
     """Test server config accepts valid absolute path for custom model."""
-    config = ServerConfig.from_env({ZEROTTS_MODEL: "/models/custom.gguf"})
+    config = ServerConfig.from_env({ZeroTtsEnv.MODEL: "/models/custom.gguf"})
     assert config.zerotts_model == "/models/custom.gguf"
+
+
+def test_server_config_zerotts_max_codebooks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test server config parses and bounds ZEROTTS_MAX_CODEBOOKS."""
+    # Standard desktop/server architecture defaults to 16
+    monkeypatch.setattr("wyoming_vietnamese.config.is_zerotts_edge_variant", lambda: False)
+    config_default = ServerConfig.from_env({})
+    assert config_default.zerotts_max_codebooks == ZeroTtsCodebook.DEFAULT
+
+    # Edge CPU architecture defaults to 12
+    monkeypatch.setattr("wyoming_vietnamese.config.is_zerotts_edge_variant", lambda: True)
+    config_edge = ServerConfig.from_env({})
+    assert config_edge.zerotts_max_codebooks == ZeroTtsCodebook.MEDIUM
+
+    # Explicit override takes precedence
+    config_custom = ServerConfig.from_env({ZeroTtsEnv.MAX_CODEBOOKS: "10"})
+    assert config_custom.zerotts_max_codebooks == 10
+
+    # Whitespace-only string uses default
+    config_ws = ServerConfig.from_env({ZeroTtsEnv.MAX_CODEBOOKS: "   "})
+    assert config_ws.zerotts_max_codebooks == ZeroTtsCodebook.MEDIUM
+
+    monkeypatch.setattr("wyoming_vietnamese.config.is_zerotts_edge_variant", lambda: False)
+    config_ws_default = ServerConfig.from_env({ZeroTtsEnv.MAX_CODEBOOKS: "   "})
+    assert config_ws_default.zerotts_max_codebooks == ZeroTtsCodebook.DEFAULT
+
+    # Positive signed integer is accepted
+    config_signed_pos = ServerConfig.from_env({ZeroTtsEnv.MAX_CODEBOOKS: "+8"})
+    assert config_signed_pos.zerotts_max_codebooks == 8
+
+    # Non-numeric string is rejected
+    with pytest.raises(ValueError, match="ZEROTTS_MAX_CODEBOOKS must be an integer"):
+        ServerConfig.from_env({ZeroTtsEnv.MAX_CODEBOOKS: "abc"})
+
+    # Negative signed integer below minimum is rejected
+    with pytest.raises(ValueError, match="ZEROTTS_MAX_CODEBOOKS must be at least 4 and at most 16"):
+        ServerConfig.from_env({ZeroTtsEnv.MAX_CODEBOOKS: "-5"})
+
+    with pytest.raises(ValueError, match="ZEROTTS_MAX_CODEBOOKS must be at least 4 and at most 16"):
+        ServerConfig.from_env({ZeroTtsEnv.MAX_CODEBOOKS: "2"})
+
+    with pytest.raises(ValueError, match="ZEROTTS_MAX_CODEBOOKS must be at least 4 and at most 16"):
+        ServerConfig.from_env({ZeroTtsEnv.MAX_CODEBOOKS: "32"})
+
+
+def test_server_config_zerotts_quality() -> None:
+    """Test server config parses ZEROTTS_QUALITY and configures model and codebooks."""
+    # Default (unset) resolves to auto
+    config_default = ServerConfig.from_env({})
+    assert config_default.zerotts_quality == ZeroTtsQuality.AUTO
+
+    # Explicit auto
+    config_auto = ServerConfig.from_env({ZeroTtsEnv.QUALITY: "auto"})
+    assert config_auto.zerotts_quality == ZeroTtsQuality.AUTO
+
+    # High quality: q8_0 model and 16 codebooks
+    config_high = ServerConfig.from_env({ZeroTtsEnv.QUALITY: "high"})
+    assert config_high.zerotts_quality == ZeroTtsQuality.HIGH
+    assert config_high.zerotts_model == ZeroTtsFile.Q8_0_GGUF_MODEL
+    assert config_high.zerotts_max_codebooks == ZeroTtsCodebook.HIGH
+
+    # Medium quality: q4-hybrid model and 12 codebooks
+    config_med = ServerConfig.from_env({ZeroTtsEnv.QUALITY: "medium"})
+    assert config_med.zerotts_quality == ZeroTtsQuality.MEDIUM
+    assert config_med.zerotts_model == ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+    assert config_med.zerotts_max_codebooks == ZeroTtsCodebook.MEDIUM
+
+    # Low quality: q4-hybrid model and 10 codebooks
+    config_low = ServerConfig.from_env({ZeroTtsEnv.QUALITY: "low"})
+    assert config_low.zerotts_quality == ZeroTtsQuality.LOW
+    assert config_low.zerotts_model == ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+    assert config_low.zerotts_max_codebooks == ZeroTtsCodebook.LOW
+
+    # Granular overrides take precedence over quality tier
+    config_override = ServerConfig.from_env(
+        {
+            ZeroTtsEnv.QUALITY: "high",
+            ZeroTtsEnv.MODEL: "q4_hybrid",
+            ZeroTtsEnv.MAX_CODEBOOKS: "8",
+        }
+    )
+    assert config_override.zerotts_quality == ZeroTtsQuality.HIGH
+    assert config_override.zerotts_model == ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+    assert config_override.zerotts_max_codebooks == 8
+
+    # Strictly reject non-standard aliases and invalid tiers
+    for invalid in ("studio", "med", "balanced", "fast", "edge", "ultra", "invalid"):
+        with pytest.raises(ValueError, match="ZEROTTS_QUALITY is invalid"):
+            ServerConfig.from_env({ZeroTtsEnv.QUALITY: invalid})

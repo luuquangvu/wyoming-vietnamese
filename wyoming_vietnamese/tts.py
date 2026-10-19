@@ -40,7 +40,6 @@ from .const import (
     NGHITTS_REPO_URL,
     PROGRAM_NAME,
     VIETNAMESE_LANGUAGE,
-    ZEROTTS_MODEL,
     ZEROTTS_REPO_URL,
     NghiTtsAudio,
     NghiTtsFile,
@@ -49,6 +48,7 @@ from .const import (
     TtsEngine,
     TtsProvider,
     TtsSilenceMs,
+    ZeroTtsEnv,
     ZeroTtsFile,
     ZeroTtsVariant,
 )
@@ -2037,6 +2037,7 @@ def initialize_zerotts(
     pipelined: bool | None = None,
     codec_int8: bool | None = None,
     opportunistic: bool | None = None,
+    max_codebooks: int | None = None,
 ) -> ZeroTtsGgmlEngine:
     """Initialize ZeroTTS using default GGUF and runtime paths unless overridden.
 
@@ -2051,6 +2052,7 @@ def initialize_zerotts(
         pipelined: Optional override for pipelined streaming execution.
         codec_int8: Optional override for MOSS neural codec INT8 precision.
         opportunistic: Optional override for opportunistic thread budgeting.
+        max_codebooks: Optional upper bound on generated acoustic codebooks.
 
     Returns:
         Configured ZeroTtsGgmlEngine instance.
@@ -2064,7 +2066,7 @@ def initialize_zerotts(
     elif gguf_path is not None:
         actual_gguf_path = Path(gguf_path)
     else:
-        env_model = os.environ.get(ZEROTTS_MODEL, "").strip() or None
+        env_model = os.environ.get(ZeroTtsEnv.MODEL, "").strip() or None
         _, actual_gguf_path = resolve_zerotts_model(model_dir, env_model, cpu_variant=variant)
     if variant in ZEROTTS_EDGE_VARIANTS:
         if any(m in actual_gguf_path.name for m in ("q4", "hybrid")):
@@ -2077,7 +2079,7 @@ def initialize_zerotts(
             _LOGGER.info(
                 "Running Q8 model on edge processor (%s). Tip: set %s=%s for ~2x faster inference.",
                 variant,
-                ZEROTTS_MODEL,
+                ZeroTtsEnv.MODEL,
                 ZeroTtsFile.Q4_HYBRID_GGUF_MODEL,
             )
 
@@ -2095,6 +2097,8 @@ def initialize_zerotts(
         engine_kwargs["codec_int8"] = codec_int8
     if opportunistic is not None:
         engine_kwargs["opportunistic"] = opportunistic
+    if max_codebooks is not None:
+        engine_kwargs["max_codebooks"] = max_codebooks
 
     engine = ZeroTtsGgmlEngine(
         model_dir=model_dir,

@@ -62,6 +62,12 @@ _CMAKE_BUILD_TIMEOUT_SECONDS: Final[float] = 600.0
 _GXX_LINK_TIMEOUT_SECONDS: Final[float] = 180.0
 _PROCESS_TERMINATION_TIMEOUT_SECONDS: Final[float] = 5.0
 _MAX_CMAKE_TEARDOWN_SECONDS: Final[float] = 10.0
+_ZEROTTS_CPP_FILENAME: Final = "zerotts.cpp"
+_ZEROTTS_BASE_COMMIT_FILENAME: Final = "ZEROTTS_BASE_COMMIT"
+LOCAL_ZEROTTS_SOURCE: Final[Path] = Path(__file__).resolve().parent / "src" / _ZEROTTS_CPP_FILENAME
+LOCAL_ZEROTTS_BASE_COMMIT: Final[Path] = (
+    Path(__file__).resolve().parent / "src" / _ZEROTTS_BASE_COMMIT_FILENAME
+)
 
 
 def _validate_git_argument(value: str, pattern: re.Pattern[str], param_name: str) -> str:
@@ -154,6 +160,9 @@ _ENABLE_AVX2_FAMILY: Final = [
     "-DGGML_F16C=ON",
     "-DGGML_BMI2=ON",
 ]
+_FLAG_MSSE42: Final = "-msse4.2"
+_FLAG_MPOPCNT: Final = "-mpopcnt"
+_FLAG_MTUNE_GENERIC: Final = "-mtune=generic"
 
 
 def _is_compiler_flag_supported(flag: str) -> bool:
@@ -175,6 +184,49 @@ def _is_compiler_flag_supported(flag: str) -> bool:
         return res.returncode == 0
     except OSError, subprocess.SubprocessError:
         return False
+
+
+def _get_sse4_arch_flags() -> list[str]:
+    """Return architecture and tuning compiler flags for the SSE4 variant.
+
+    Returns:
+        List of architecture and tuning compiler option flags.
+    """
+    if _is_compiler_flag_supported("-march=x86-64-v2"):
+        return ["-march=x86-64-v2", _FLAG_MTUNE_GENERIC]
+    return [_FLAG_MSSE42, _FLAG_MPOPCNT, _FLAG_MTUNE_GENERIC]
+
+
+def _get_sse4_build_flags() -> tuple[list[str], list[str]]:
+    """Return CMake definitions and G++ compiler flags for the SSE4 variant.
+
+    Returns:
+        Tuple containing (cmake_definitions, gxx_extra_flags).
+    """
+    sse4_arch_flags = _get_sse4_arch_flags()
+    lto_flags = ["-flto"] if _is_compiler_flag_supported("-flto") else []
+    c_flags = [
+        *sse4_arch_flags,
+        _FLAG_MSSE42,
+        _FLAG_MPOPCNT,
+        "-O3",
+        "-fno-math-errno",
+        "-fno-trapping-math",
+        *lto_flags,
+    ]
+    flags_str = " ".join(c_flags)
+    cmake_flags = [
+        *_COMMON_DISABLED_CMAKE_FLAGS,
+        "-DGGML_OPENMP=ON",
+        _ENABLE_SSE42,
+        "-DGGML_AVX=OFF",
+        *_DISABLE_AVX2_FAMILY,
+        *_DISABLE_AVX512_FAMILY,
+        f"-DCMAKE_C_FLAGS={flags_str}",
+        f"-DCMAKE_CXX_FLAGS={flags_str}",
+    ]
+    gxx_flags = [*sse4_arch_flags, _FLAG_MSSE42, _FLAG_MPOPCNT, "-fno-math-errno", *lto_flags]
+    return (cmake_flags, gxx_flags)
 
 
 def _get_variant_build_flags(variant: str) -> tuple[list[str], list[str]]:
@@ -242,34 +294,7 @@ def _get_variant_build_flags(variant: str) -> tuple[list[str], list[str]]:
         return (cmake_flags, gxx_flags)
 
     if variant == ZeroTtsVariant.SSE4:
-        sse4_arch_flags: list[str] = (
-            ["-march=x86-64-v2", "-mtune=generic"]
-            if _is_compiler_flag_supported("-march=x86-64-v2")
-            else ["-msse4.2", "-mpopcnt", "-mtune=generic"]
-        )
-        lto_flags = ["-flto"] if _is_compiler_flag_supported("-flto") else []
-        c_flags = [
-            *sse4_arch_flags,
-            "-msse4.2",
-            "-mpopcnt",
-            "-O3",
-            "-fno-math-errno",
-            "-fno-trapping-math",
-            *lto_flags,
-        ]
-        flags_str = " ".join(c_flags)
-        cmake_flags = [
-            *_COMMON_DISABLED_CMAKE_FLAGS,
-            "-DGGML_OPENMP=ON",
-            _ENABLE_SSE42,
-            "-DGGML_AVX=OFF",
-            *_DISABLE_AVX2_FAMILY,
-            *_DISABLE_AVX512_FAMILY,
-            f"-DCMAKE_C_FLAGS={flags_str}",
-            f"-DCMAKE_CXX_FLAGS={flags_str}",
-        ]
-        gxx_flags = [*sse4_arch_flags, "-msse4.2", "-mpopcnt", "-fno-math-errno", *lto_flags]
-        return (cmake_flags, gxx_flags)
+        return _get_sse4_build_flags()
 
     # COMPAT baseline
     cmake_flags = [
@@ -459,6 +484,7 @@ def _compile_libraries(
     *,
     variant: str = ZeroTtsVariant.COMPAT,
     native: bool = False,
+    commit: str = ZEROTTS_SOURCE_COMMIT,
 ) -> None:
     """Build GGML vendor dependencies and compile libzerotts.so into staging directory.
 
@@ -468,6 +494,7 @@ def _compile_libraries(
         variant: CPU architecture optimization variant.
         native: Whether to optimize for host processor architecture (native=True)
             or target a portable instruction set baseline (native=False).
+        commit: Target Git commit hash to checkout and compile against.
     """
     actual_variant = ZeroTtsVariant.NATIVE if native else variant
     cmake_build_dir = clone_dest / "cpp" / f"build_{actual_variant}"
@@ -498,6 +525,25 @@ def _compile_libraries(
         timeout=_CMAKE_BUILD_TIMEOUT_SECONDS,
     )
 
+    cpp_source = clone_dest / "cpp" / "src" / _ZEROTTS_CPP_FILENAME
+    if LOCAL_ZEROTTS_SOURCE.is_file():
+        if LOCAL_ZEROTTS_BASE_COMMIT.is_file():
+            base_commit = LOCAL_ZEROTTS_BASE_COMMIT.read_text(encoding="utf-8").strip()
+            if base_commit != commit:
+                _LOGGER.warning(
+                    "Local ZeroTTS C++ source forked from %s does not match requested commit %s",
+                    base_commit,
+                    commit,
+                )
+        cpp_source.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(LOCAL_ZEROTTS_SOURCE, cpp_source)
+    else:
+        _LOGGER.warning(
+            "Local ZeroTTS C++ source not found at %s; "
+            "building upstream source which lacks codebook-limit support",
+            LOCAL_ZEROTTS_SOURCE,
+        )
+
     gxx_cmd = [
         "g++",
         "-O3",
@@ -508,7 +554,7 @@ def _compile_libraries(
         f"-I{clone_dest / 'cpp' / 'vendor-ggml' / 'include'}",
         f"-I{clone_dest / 'cpp' / 'vendor-ggml' / 'src'}",
         f"-I{clone_dest / 'cpp' / 'vendor-ggml' / 'src' / 'ggml-cpu'}",
-        str(clone_dest / "cpp" / "src" / "zerotts.cpp"),
+        str(cpp_source),
         f"-L{cmake_build_dir / 'vendor-ggml' / 'src'}",
         "-lggml",
         "-lggml-base",
@@ -808,7 +854,9 @@ def build_zerotts_ggml_lib(
             f"into {destination_dir} (commit {commit})..."
         )
         _checkout_repo(clone_dest, repo_url, commit)
-        _compile_libraries(clone_dest, staging_dir, variant=actual_variant, native=native)
+        _compile_libraries(
+            clone_dest, staging_dir, variant=actual_variant, native=native, commit=commit
+        )
 
         staged_candidate = staging_dir / ZeroTtsFile.LIBZEROTTS_SO
         if not staged_candidate.is_file():

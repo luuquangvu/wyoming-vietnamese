@@ -5,10 +5,13 @@ from pathlib import Path
 import pytest
 
 from wyoming_vietnamese.const import (
+    DEFAULT_ZEROTTS_AUTO,
     NghiTtsFile,
     TtsEngine,
+    ZeroTtsCodebook,
     ZeroTtsDirectory,
     ZeroTtsFile,
+    ZeroTtsQuality,
     ZeroTtsVariant,
 )
 from wyoming_vietnamese.tts_model import (
@@ -34,6 +37,8 @@ from wyoming_vietnamese.tts_model import (
     is_zerotts_edge_variant,
     normalize_zerotts_model,
     reset_zerotts_cpu_variant,
+    resolve_quality_codebooks,
+    resolve_quality_zerotts_model,
     resolve_zerotts_codec_int8,
     resolve_zerotts_cpu_variant,
     resolve_zerotts_model,
@@ -350,3 +355,32 @@ def test_normalize_zerotts_model_preserve_auto() -> None:
     )
     assert normalize_zerotts_model("q8_0", preserve_auto=True) == ZeroTtsFile.Q8_0_GGUF_MODEL
     assert normalize_zerotts_model(None, preserve_auto=True) is None
+
+
+def test_resolve_quality_zerotts_model() -> None:
+    """Test resolve_quality_zerotts_model maps quality tiers to model filenames."""
+    assert resolve_quality_zerotts_model(ZeroTtsQuality.HIGH) == ZeroTtsFile.Q8_0_GGUF_MODEL
+    assert resolve_quality_zerotts_model(ZeroTtsQuality.MEDIUM) == ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+    assert resolve_quality_zerotts_model(ZeroTtsQuality.LOW) == ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+    assert resolve_quality_zerotts_model(ZeroTtsQuality.AUTO) == DEFAULT_ZEROTTS_AUTO
+    assert resolve_quality_zerotts_model() == DEFAULT_ZEROTTS_AUTO
+    assert resolve_quality_zerotts_model("unknown") == DEFAULT_ZEROTTS_AUTO
+
+
+def test_resolve_quality_codebooks() -> None:
+    """Test resolve_quality_codebooks maps quality tiers and edge hardware to codebook counts."""
+    # Explicit quality tiers are invariant to edge hardware
+    assert resolve_quality_codebooks(ZeroTtsQuality.HIGH, is_edge=False) == ZeroTtsCodebook.HIGH
+    assert resolve_quality_codebooks(ZeroTtsQuality.HIGH, is_edge=True) == ZeroTtsCodebook.HIGH
+    assert resolve_quality_codebooks(ZeroTtsQuality.MEDIUM, is_edge=False) == ZeroTtsCodebook.MEDIUM
+    assert resolve_quality_codebooks(ZeroTtsQuality.MEDIUM, is_edge=True) == ZeroTtsCodebook.MEDIUM
+    assert resolve_quality_codebooks(ZeroTtsQuality.LOW, is_edge=False) == ZeroTtsCodebook.LOW
+    assert resolve_quality_codebooks(ZeroTtsQuality.LOW, is_edge=True) == ZeroTtsCodebook.LOW
+
+    # Auto and default depend on edge hardware
+    assert resolve_quality_codebooks(ZeroTtsQuality.AUTO, is_edge=False) == ZeroTtsCodebook.DEFAULT
+    assert resolve_quality_codebooks(ZeroTtsQuality.AUTO, is_edge=True) == ZeroTtsCodebook.MEDIUM
+    assert resolve_quality_codebooks(is_edge=False) == ZeroTtsCodebook.DEFAULT
+    assert resolve_quality_codebooks(is_edge=True) == ZeroTtsCodebook.MEDIUM
+    assert resolve_quality_codebooks("unknown", is_edge=False) == ZeroTtsCodebook.DEFAULT
+    assert resolve_quality_codebooks("unknown", is_edge=True) == ZeroTtsCodebook.MEDIUM

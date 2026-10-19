@@ -48,6 +48,7 @@ from wyoming_vietnamese.const import (
     TTS_DIR,
     SttEngine,
     TtsEngine,
+    ZeroTtsEnv,
     ZeroTtsFile,
     ZeroTtsVariant,
 )
@@ -151,6 +152,55 @@ def test_tts_cache_namespace_tracks_engine_and_voice_artifact_revision(
     )
     assert zerotts_q4_ns != zerotts_q8_ns
     assert zerotts_q4_ns != zerotts_default_ns
+
+    # ZeroTTS namespace changes when zerotts_max_codebooks changes
+    zerotts_med_ns = _tts_cache_namespace(
+        replace(zerotts_config, zerotts_max_codebooks=8),
+        (DEFAULT_ZEROTTS_VOICE,),
+    )
+    zerotts_low_ns = _tts_cache_namespace(
+        replace(zerotts_config, zerotts_max_codebooks=4),
+        (DEFAULT_ZEROTTS_VOICE,),
+    )
+    assert zerotts_med_ns != zerotts_low_ns
+
+    # Initialized engine's max_codebooks takes precedence over config
+    engine_mock = Mock()
+    engine_mock.max_codebooks = 12
+    engine_ns = _tts_cache_namespace(
+        replace(zerotts_config, zerotts_max_codebooks=16),
+        (DEFAULT_ZEROTTS_VOICE,),
+        tts_engine=engine_mock,
+    )
+    expected_12_ns = _tts_cache_namespace(
+        replace(zerotts_config, zerotts_max_codebooks=12),
+        (DEFAULT_ZEROTTS_VOICE,),
+    )
+    assert engine_ns == expected_12_ns
+
+    # Out of bounds zerotts_max_codebooks are clamped
+    clamped_low_ns = _tts_cache_namespace(
+        replace(zerotts_config, zerotts_max_codebooks=1),
+        (DEFAULT_ZEROTTS_VOICE,),
+    )
+    assert clamped_low_ns == zerotts_low_ns
+
+    clamped_high_ns = _tts_cache_namespace(
+        replace(zerotts_config, zerotts_max_codebooks=32),
+        (DEFAULT_ZEROTTS_VOICE,),
+    )
+    assert clamped_high_ns == zerotts_default_ns
+
+    # Unset max_codebooks falls back to quality resolution
+    quality_low_ns = _tts_cache_namespace(
+        replace(zerotts_config, zerotts_max_codebooks=None, zerotts_quality="low"),
+        (DEFAULT_ZEROTTS_VOICE,),
+    )
+    explicit_low_ns = _tts_cache_namespace(
+        replace(zerotts_config, zerotts_max_codebooks=10),
+        (DEFAULT_ZEROTTS_VOICE,),
+    )
+    assert quality_low_ns == explicit_low_ns
 
     # Non-ZeroTTS engines ignore zerotts_model_identity
     nghitts_with_id = _tts_cache_namespace(
@@ -678,10 +728,12 @@ def test_download_configured_models_branches(
 
 
 def test_configure_process_environment_sets_passive(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Test configure_process_environment sets OMP_WAIT_POLICY to PASSIVE if unset."""
+    """Test configure_process_environment sets OMP_WAIT_POLICY and GOMP_SPINCOUNT if unset."""
     monkeypatch.delenv("OMP_WAIT_POLICY", raising=False)
+    monkeypatch.delenv("GOMP_SPINCOUNT", raising=False)
     configure_process_environment()
     assert os.environ.get("OMP_WAIT_POLICY") == "PASSIVE"
+    assert os.environ.get("GOMP_SPINCOUNT") == "1000"
 
 
 @pytest.mark.parametrize("existing_val", ["ACTIVE", "active", "PASSIVE", "passive", ""])
@@ -865,6 +917,7 @@ async def test_run_server_starts_zerotts_engine(
         (DEFAULT_ZEROTTS_VOICE,),
         resolve_cpu_threads(0),
         gguf_path=tmp_path / TTS_DIR / "gguf" / ZeroTtsFile.DEFAULT_GGUF_MODEL,
+        max_codebooks=config.zerotts_max_codebooks,
     )
     init_nghitts.assert_not_called()
     warm_up.assert_called_once_with(tts, (DEFAULT_ZEROTTS_VOICE,), TtsEngine.ZEROTTS)
@@ -941,6 +994,7 @@ async def test_run_server_forwards_custom_zerotts_model_selection(
         (DEFAULT_ZEROTTS_VOICE,),
         resolve_cpu_threads(0),
         gguf_path=custom_gguf,
+        max_codebooks=config.zerotts_max_codebooks,
     )
 
 
@@ -952,7 +1006,7 @@ async def test_run_server_auto_selects_zerotts_q4_on_edge_processor(
     monkeypatch.setattr(
         "wyoming_vietnamese.tts_model.detect_cpu_variant", lambda: ZeroTtsVariant.SSE4
     )
-    _server, _tts, init_zerotts, _download, _config = await _run_configured_zerotts_server(
+    _server, _tts, init_zerotts, _download, config = await _run_configured_zerotts_server(
         tmp_path,
         monkeypatch,
         download_ret,
@@ -962,6 +1016,7 @@ async def test_run_server_auto_selects_zerotts_q4_on_edge_processor(
         (DEFAULT_ZEROTTS_VOICE,),
         resolve_cpu_threads(0),
         gguf_path=tmp_path / TTS_DIR / "gguf" / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL,
+        max_codebooks=config.zerotts_max_codebooks,
     )
 
 
@@ -991,6 +1046,7 @@ async def test_run_server_incorporates_zerotts_resolution_in_cache_namespace(
         (DEFAULT_ZEROTTS_VOICE,),
         resolve_cpu_threads(0),
         resolution=res,
+        max_codebooks=config.zerotts_max_codebooks,
     )
 
     handler_factory = server.factory
@@ -1014,11 +1070,11 @@ async def test_run_server_forwards_zerotts_opportunistic_setting(
 ) -> None:
     """Test run server forwards zerotts_opportunistic=False to initialize_zerotts."""
     download_ret = {STT_DIR: tmp_path / STT_DIR, TTS_DIR: tmp_path / TTS_DIR}
-    _server, _tts, init_zerotts, _download, _config = await _run_configured_zerotts_server(
+    _server, _tts, init_zerotts, _download, config = await _run_configured_zerotts_server(
         tmp_path,
         monkeypatch,
         download_ret,
-        env_overrides={"ZEROTTS_OPPORTUNISTIC": "false"},
+        env_overrides={ZeroTtsEnv.OPPORTUNISTIC: "false"},
     )
     init_zerotts.assert_called_once_with(
         tmp_path / TTS_DIR,
@@ -1026,6 +1082,27 @@ async def test_run_server_forwards_zerotts_opportunistic_setting(
         resolve_cpu_threads(0),
         gguf_path=tmp_path / TTS_DIR / "gguf" / ZeroTtsFile.DEFAULT_GGUF_MODEL,
         opportunistic=False,
+        max_codebooks=config.zerotts_max_codebooks,
+    )
+
+
+async def test_run_server_forwards_zerotts_max_codebooks_setting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test run server forwards zerotts_max_codebooks setting to initialize_zerotts."""
+    download_ret = {STT_DIR: tmp_path / STT_DIR, TTS_DIR: tmp_path / TTS_DIR}
+    _server, _tts, init_zerotts, _download, _config = await _run_configured_zerotts_server(
+        tmp_path,
+        monkeypatch,
+        download_ret,
+        env_overrides={ZeroTtsEnv.MAX_CODEBOOKS: "10"},
+    )
+    init_zerotts.assert_called_once_with(
+        tmp_path / TTS_DIR,
+        (DEFAULT_ZEROTTS_VOICE,),
+        resolve_cpu_threads(0),
+        gguf_path=tmp_path / TTS_DIR / "gguf" / ZeroTtsFile.DEFAULT_GGUF_MODEL,
+        max_codebooks=10,
     )
 
 

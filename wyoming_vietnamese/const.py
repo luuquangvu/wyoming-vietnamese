@@ -88,10 +88,37 @@ class ZeroTtsFile(StrEnum):
 
 
 DEFAULT_ZEROTTS_AUTO = "auto"
-ZEROTTS_MODEL = "ZEROTTS_MODEL"
-ZEROTTS_GGML_THREADS = "ZEROTTS_GGML_THREADS"
-ZEROTTS_CODEC_THREADS = "ZEROTTS_CODEC_THREADS"
-ZEROTTS_OPPORTUNISTIC = "ZEROTTS_OPPORTUNISTIC"
+
+
+class ZeroTtsEnv(StrEnum):
+    """Environment variable names for ZeroTTS runtime and model configuration."""
+
+    MODEL = "ZEROTTS_MODEL"
+    GGML_THREADS = "ZEROTTS_GGML_THREADS"
+    CODEC_THREADS = "ZEROTTS_CODEC_THREADS"
+    OPPORTUNISTIC = "ZEROTTS_OPPORTUNISTIC"
+    MAX_CODEBOOKS = "ZEROTTS_MAX_CODEBOOKS"
+    QUALITY = "ZEROTTS_QUALITY"
+
+
+class ZeroTtsQuality(StrEnum):
+    """Quality tiers for ZeroTTS speech synthesis."""
+
+    AUTO = "auto"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+class ZeroTtsCodebook(IntEnum):
+    """Codebook bounds and defaults for ZeroTTS speech synthesis."""
+
+    DEFAULT = 16
+    HIGH = 16
+    MEDIUM = 12
+    LOW = 10
+    MIN = 4
+    MAX = 16
 
 
 class ZeroTtsDirectory(StrEnum):

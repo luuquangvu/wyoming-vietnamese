@@ -20,13 +20,14 @@ from .const import (
     DEFAULT_STT_ENGINE,
     DEFAULT_TTS_ENGINE,
     DEFAULT_ZEROTTS_AUTO,
-    ZEROTTS_MODEL,
-    ZEROTTS_OPPORTUNISTIC,
     ConnectionLimit,
     SttEngine,
     Timeout,
     TtsEngine,
     TtsSilenceMs,
+    ZeroTtsCodebook,
+    ZeroTtsEnv,
+    ZeroTtsQuality,
 )
 from .tts_model import (
     DEFAULT_NGHITTS_VOICE_ID,
@@ -34,7 +35,10 @@ from .tts_model import (
     NghiTtsVoiceSpec,
     ZeroTtsVoiceSpec,
     get_voice,
+    is_zerotts_edge_variant,
     normalize_zerotts_model,
+    resolve_quality_codebooks,
+    resolve_quality_zerotts_model,
 )
 
 AnyVoiceSpec = NghiTtsVoiceSpec | ZeroTtsVoiceSpec
@@ -187,11 +191,45 @@ def _get_tts_voices(
     return tuple(get_voice(voice_id, engine=tts_engine) for voice_id in voice_ids)
 
 
-def _get_zerotts_model(environ: Mapping[str, str]) -> str:
-    """Read and validate the ZeroTTS model filename or auto-selector (always 'auto' if unset)."""
-    raw_value = environ.get(ZEROTTS_MODEL, "").strip() or DEFAULT_ZEROTTS_AUTO
-    normalized = normalize_zerotts_model(raw_value, preserve_auto=True)
-    return normalized or DEFAULT_ZEROTTS_AUTO
+def _get_zerotts_quality(environ: Mapping[str, str]) -> str:
+    """Read and validate the ZeroTTS quality tier (auto, high, medium, low)."""
+    raw_val = environ.get(ZeroTtsEnv.QUALITY, ZeroTtsQuality.AUTO).strip().lower()
+    if not raw_val or raw_val == ZeroTtsQuality.AUTO:
+        return ZeroTtsQuality.AUTO
+    if raw_val in (ZeroTtsQuality.HIGH, ZeroTtsQuality.MEDIUM, ZeroTtsQuality.LOW):
+        return raw_val
+    raise ValueError(
+        f"{ZeroTtsEnv.QUALITY} is invalid: {raw_val!r}. "
+        "Expected 'auto', 'high', 'medium', or 'low'."
+    )
+
+
+def _get_zerotts_model(
+    environ: Mapping[str, str],
+    quality: str = ZeroTtsQuality.AUTO,
+) -> str:
+    """Read and validate the ZeroTTS model filename, quality tier default, or auto-selector."""
+    if raw_value := environ.get(ZeroTtsEnv.MODEL, "").strip():
+        normalized = normalize_zerotts_model(raw_value, preserve_auto=True)
+        return normalized or DEFAULT_ZEROTTS_AUTO
+    return resolve_quality_zerotts_model(quality)
+
+
+def _get_zerotts_max_codebooks(
+    environ: Mapping[str, str],
+    quality: str = ZeroTtsQuality.AUTO,
+    *,
+    is_edge: bool = False,
+) -> int:
+    """Read and validate the maximum codebooks count for ZeroTTS generation."""
+    default = resolve_quality_codebooks(quality, is_edge=is_edge)
+    return _get_int(
+        environ,
+        ZeroTtsEnv.MAX_CODEBOOKS,
+        default,
+        minimum=ZeroTtsCodebook.MIN,
+        maximum=ZeroTtsCodebook.MAX,
+    )
 
 
 def _get_log_level(environ: Mapping[str, str]) -> str:
@@ -228,6 +266,8 @@ class ServerConfig:
     stt_engine: str = DEFAULT_STT_ENGINE
     zerotts_model: str = DEFAULT_ZEROTTS_AUTO
     zerotts_opportunistic: bool = True
+    zerotts_max_codebooks: int | None = None
+    zerotts_quality: str = ZeroTtsQuality.AUTO
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> ServerConfig:
@@ -248,7 +288,8 @@ class ServerConfig:
 
         tts_engine = _get_tts_engine(env)
         stt_engine = _get_stt_engine(env)
-        zerotts_model = _get_zerotts_model(env)
+        zerotts_quality = _get_zerotts_quality(env)
+        zerotts_model = _get_zerotts_model(env, quality=zerotts_quality)
         return cls(
             port=_get_int(env, "WYOMING_PORT", DEFAULT_PORT, minimum=1, maximum=65535),
             stt_engine=stt_engine,
@@ -329,6 +370,10 @@ class ServerConfig:
                 * 1024
             ),
             tts_cache_enabled=get_env_bool("TTS_CACHE_ENABLED", True, env),
+            zerotts_quality=zerotts_quality,
             zerotts_model=zerotts_model,
-            zerotts_opportunistic=get_env_bool(ZEROTTS_OPPORTUNISTIC, True, env),
+            zerotts_opportunistic=get_env_bool(ZeroTtsEnv.OPPORTUNISTIC, True, env),
+            zerotts_max_codebooks=_get_zerotts_max_codebooks(
+                env, quality=zerotts_quality, is_edge=is_zerotts_edge_variant()
+            ),
         )

@@ -26,6 +26,7 @@ from wyoming_vietnamese.const import (
     SttEngine,
     TtsEngine,
     ZeroTtsDirectory,
+    ZeroTtsEnv,
     ZeroTtsFile,
     ZeroTtsVariant,
 )
@@ -1134,7 +1135,7 @@ def _execute_zerotts_download(
     tts_snapshot: Path,
     test_voice: ZeroTtsVoiceSpec,
     *,
-    zerotts_quant: str = "auto",
+    zerotts_quant: str | None = None,
 ) -> tuple[ModelDownloadResult, Mock]:
     """Execute download_models for ZeroTTS and return result paths and sync mock."""
     sync = Mock(side_effect=[stt, tts_snapshot])
@@ -1578,6 +1579,122 @@ def test_download_models_zerotts_custom_absolute_path_skips_gguf_sync(
     assert resolution.spec.gguf_model is None
     assert custom_gguf.is_file()
     assert custom_gguf.read_bytes() == b"CUSTOM_GGUF_DATA"
+
+
+def test_download_models_zerotts_quality_env_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test download_models honors ZEROTTS_QUALITY when zerotts_quant is unset."""
+    stt, tts_snapshot, tts_spec, test_voice = _setup_zerotts_download_test(tmp_path, monkeypatch)
+    q4_spec = _write_q4_hybrid_snapshot_artifact(tts_snapshot, tts_spec)
+    monkeypatch.setattr(
+        "wyoming_vietnamese.download.resolve_zerotts_model_spec",
+        lambda quant, **kw: q4_spec if quant and ("q4" in quant or "hybrid" in quant) else tts_spec,
+    )
+
+    # ZEROTTS_QUALITY="high" downloads Q8 model
+    monkeypatch.setenv(ZeroTtsEnv.QUALITY, "high")
+    paths_high, _ = _execute_zerotts_download(
+        tmp_path / "run_high", monkeypatch, stt, tts_snapshot, test_voice
+    )
+    assert paths_high.zerotts_resolution is not None
+    assert paths_high.zerotts_resolution.spec is tts_spec
+
+    # ZEROTTS_QUALITY="medium" downloads Q4-Hybrid model
+    monkeypatch.setenv(ZeroTtsEnv.QUALITY, "medium")
+    paths_med, _ = _execute_zerotts_download(
+        tmp_path / "run_med", monkeypatch, stt, tts_snapshot, test_voice
+    )
+    assert paths_med.zerotts_resolution is not None
+    assert paths_med.zerotts_resolution.spec is q4_spec
+
+    # ZEROTTS_QUALITY="low" downloads Q4-Hybrid model
+    monkeypatch.setenv(ZeroTtsEnv.QUALITY, "low")
+    paths_low, _ = _execute_zerotts_download(
+        tmp_path / "run_low", monkeypatch, stt, tts_snapshot, test_voice
+    )
+    assert paths_low.zerotts_resolution is not None
+    assert paths_low.zerotts_resolution.spec is q4_spec
+    monkeypatch.delenv(ZeroTtsEnv.QUALITY, raising=False)
+
+
+def test_download_models_zerotts_fallback_to_existing_when_download_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test download_models gracefully falls back to verified existing model when download fails."""
+    stt, tts_snapshot, tts_spec, test_voice = _setup_zerotts_download_test(tmp_path, monkeypatch)
+    int8_art = _configure_zerotts_int8_spec(
+        monkeypatch, tts_spec, test_voice, ZEROTTS_CODEC_INT8_ARTIFACT.sha256
+    )
+
+    # Pre-populate fully verified local model in destination directory (without INT8 codec)
+    tts_dest = tmp_path / "models" / TTS_DIR / TtsEngine.ZEROTTS
+    _structure_zerotts_files(tts_snapshot, tts_dest, (test_voice,), tts_spec)
+    existing_q8 = tts_dest / ZeroTtsDirectory.GGUF / ZeroTtsFile.DEFAULT_GGUF_MODEL
+    assert not (tts_dest / int8_art.local_name).exists()
+
+    # Simulate network failure during ZeroTTS snapshot download
+    sync = Mock(side_effect=[stt, RuntimeError("Hugging Face network failure")])
+    monkeypatch.setattr("wyoming_vietnamese.download._sync_repo", sync)
+    monkeypatch.setattr("wyoming_vietnamese.download.setup_hf_environment", Mock())
+
+    paths = download_models(
+        tmp_path / "cache",
+        tmp_path / "models",
+        (test_voice,),
+        tts_engine=TtsEngine.ZEROTTS,
+        zerotts_quant=ZeroTtsFile.Q4_HYBRID_GGUF_MODEL,
+    )
+
+    assert paths.zerotts_resolution is not None
+    assert paths.zerotts_resolution.gguf_path == existing_q8
+
+
+def test_download_models_zerotts_fallback_fails_when_existing_model_corrupted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test download_models re-raises error when existing model fails digest verification."""
+    stt, tts_snapshot, tts_spec, test_voice = _setup_zerotts_download_test(tmp_path, monkeypatch)
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec)
+
+    # Pre-populate local model but corrupt the GGUF model bytes
+    tts_dest = tmp_path / "models" / TTS_DIR / TtsEngine.ZEROTTS
+    _structure_zerotts_files(tts_snapshot, tts_dest, (test_voice,), tts_spec)
+    existing_q8 = tts_dest / ZeroTtsDirectory.GGUF / ZeroTtsFile.DEFAULT_GGUF_MODEL
+    existing_q8.write_bytes(b"CORRUPTED_GGUF_BYTES")
+
+    sync = Mock(side_effect=[stt, RuntimeError("Hugging Face network failure")])
+    monkeypatch.setattr("wyoming_vietnamese.download._sync_repo", sync)
+    monkeypatch.setattr("wyoming_vietnamese.download.setup_hf_environment", Mock())
+
+    with pytest.raises(RuntimeError, match="Hugging Face network failure"):
+        download_models(
+            tmp_path / "cache",
+            tmp_path / "models",
+            (test_voice,),
+            tts_engine=TtsEngine.ZEROTTS,
+            zerotts_quant=ZeroTtsFile.Q4_HYBRID_GGUF_MODEL,
+        )
+
+
+def test_download_models_zerotts_fails_when_no_existing_model_and_download_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test download_models raises error when download fails and no existing model is present."""
+    stt, _, _, test_voice = _setup_zerotts_download_test(tmp_path, monkeypatch)
+
+    sync = Mock(side_effect=[stt, RuntimeError("Download failed completely")])
+    monkeypatch.setattr("wyoming_vietnamese.download._sync_repo", sync)
+    monkeypatch.setattr("wyoming_vietnamese.download.setup_hf_environment", Mock())
+
+    with pytest.raises(RuntimeError, match="Download failed completely"):
+        download_models(
+            tmp_path / "cache",
+            tmp_path / "models",
+            (test_voice,),
+            tts_engine=TtsEngine.ZEROTTS,
+            zerotts_quant="q4_hybrid",
+        )
 
 
 def test_structure_zerotts_files_corrupted_destination_voice(
@@ -2533,3 +2650,144 @@ def test_create_q4_hybrid_cli_tool(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
     run_hybrid_cli(["--input", str(src), "--output", str(dst)], dst)
     run_hybrid_cli(["--input", str(src)], src.parent / "zerotts-q4-hybrid.gguf")
+
+
+def test_find_existing_zerotts_fallback_skips_checked_pinned_and_finds_custom(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test fallback skips already checked pinned models and accepts valid custom GGUFs."""
+    from wyoming_vietnamese.download import _find_existing_zerotts_fallback
+    from wyoming_vietnamese.tts_model import ZEROTTS_BASE_MODEL, ZEROTTS_MODEL
+
+    dest_dir = tmp_path / "zerotts"
+    gguf_dir = dest_dir / ZeroTtsDirectory.GGUF
+    gguf_dir.mkdir(parents=True, exist_ok=True)
+
+    # Corrupted pinned model: exists on disk but fails checksum
+    corrupted_pinned = gguf_dir / ZeroTtsFile.DEFAULT_GGUF_MODEL
+    corrupted_pinned.write_bytes(b"CORRUPTED_GGUF")
+
+    # Mock non-GGUF artifacts and voices as valid
+    monkeypatch.setattr("wyoming_vietnamese.download._verify_candidate_artifacts", lambda *_: True)
+    monkeypatch.setattr("wyoming_vietnamese.download._verify_candidate_voices", lambda *_: True)
+
+    # Confirm ZEROTTS_BASE_MODEL is unpinned
+    assert ZEROTTS_BASE_MODEL.gguf_model is None
+
+    # Fallback loop skips zerotts-q8_0.gguf because it is in checked_filenames
+    res = _find_existing_zerotts_fallback(dest_dir, ZEROTTS_MODEL)
+    assert res is None
+
+    # Now add a valid custom GGUF
+    custom_gguf = gguf_dir / "custom-zerotts.gguf"
+    custom_gguf.write_bytes(b"CUSTOM_GGUF")
+
+    res_custom = _find_existing_zerotts_fallback(dest_dir, ZEROTTS_MODEL)
+    assert res_custom is not None
+    assert res_custom.spec == ZEROTTS_BASE_MODEL
+    assert res_custom.gguf_path == custom_gguf
+
+
+def test_find_existing_zerotts_fallback_skips_reverifying_target_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test candidate loop skips model files already checked in target_spec check."""
+    from collections.abc import Sequence
+
+    from wyoming_vietnamese.download import AnyVoiceSpec, _find_existing_zerotts_fallback
+    from wyoming_vietnamese.tts_model import ZEROTTS_Q4_MODEL
+
+    dest_dir = tmp_path / "zerotts"
+    gguf_dir = dest_dir / ZeroTtsDirectory.GGUF
+    gguf_dir.mkdir(parents=True, exist_ok=True)
+
+    verified_paths: list[Path] = []
+
+    def tracking_verify(
+        dest: Path,
+        spec: ZeroTtsModelSpec,
+        gguf_p: Path,
+        voices: Sequence[AnyVoiceSpec] | None = None,
+    ) -> bool:
+        verified_paths.append(gguf_p)
+        return False
+
+    monkeypatch.setattr(
+        "wyoming_vietnamese.download._verify_existing_zerotts_candidate", tracking_verify
+    )
+
+    res = _find_existing_zerotts_fallback(dest_dir, ZEROTTS_Q4_MODEL)
+    assert res is None
+
+    q4_filename = ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+    q8_filename = ZeroTtsFile.DEFAULT_GGUF_MODEL
+
+    q4_checks = [p for p in verified_paths if p.name == q4_filename]
+    q8_checks = [p for p in verified_paths if p.name == q8_filename]
+
+    assert len(q4_checks) == 1
+    assert len(q8_checks) == 1
+
+
+def test_find_existing_zerotts_fallback_unpinned_resolved_path_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test unpinned target spec checks resolved_gguf_path first before pinned candidates."""
+    from wyoming_vietnamese.download import _find_existing_zerotts_fallback
+    from wyoming_vietnamese.tts_model import ZEROTTS_BASE_MODEL
+
+    dest_dir = tmp_path / "zerotts"
+    gguf_dir = dest_dir / ZeroTtsDirectory.GGUF
+    gguf_dir.mkdir(parents=True, exist_ok=True)
+
+    # Valid custom GGUF at resolved path
+    custom_gguf = dest_dir / "custom-edge.gguf"
+    custom_gguf.write_bytes(b"CUSTOM_GGUF_BYTES")
+
+    # Also a valid pinned candidate in gguf_dir
+    pinned_q8 = gguf_dir / ZeroTtsFile.DEFAULT_GGUF_MODEL
+    pinned_q8.write_bytes(b"PINNED_Q8_BYTES")
+
+    monkeypatch.setattr("wyoming_vietnamese.download._verify_candidate_artifacts", lambda *_: True)
+    monkeypatch.setattr("wyoming_vietnamese.download._verify_candidate_voices", lambda *_: True)
+
+    assert ZEROTTS_BASE_MODEL.gguf_model is None
+    res = _find_existing_zerotts_fallback(
+        dest_dir, ZEROTTS_BASE_MODEL, resolved_gguf_path=custom_gguf
+    )
+    assert res is not None
+    assert res.spec == ZEROTTS_BASE_MODEL
+    assert res.gguf_path == custom_gguf
+
+
+def test_find_existing_zerotts_fallback_unpinned_resolved_path_rejected_falls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test rejected unpinned resolved_gguf_path falls back to pinned candidates."""
+    from wyoming_vietnamese.download import _find_existing_zerotts_fallback
+    from wyoming_vietnamese.tts_model import ZEROTTS_BASE_MODEL, ZEROTTS_MODEL
+
+    dest_dir = tmp_path / "zerotts"
+    gguf_dir = dest_dir / ZeroTtsDirectory.GGUF
+    gguf_dir.mkdir(parents=True, exist_ok=True)
+
+    # Missing custom GGUF
+    missing_custom = dest_dir / "missing-custom.gguf"
+
+    # Valid pinned candidate in gguf_dir
+    pinned_q8 = gguf_dir / ZeroTtsFile.DEFAULT_GGUF_MODEL
+    pinned_q8.write_bytes(b"PINNED_Q8_BYTES")
+
+    # Mock candidate verification so pinned_q8 verifies but missing_custom does not
+    monkeypatch.setattr("wyoming_vietnamese.download._verify_candidate_artifacts", lambda *_: True)
+    monkeypatch.setattr("wyoming_vietnamese.download._verify_candidate_voices", lambda *_: True)
+    monkeypatch.setattr(
+        "wyoming_vietnamese.download._is_verified_file", lambda path, sha: path.is_file()
+    )
+
+    res = _find_existing_zerotts_fallback(
+        dest_dir, ZEROTTS_BASE_MODEL, resolved_gguf_path=missing_custom
+    )
+    assert res is not None
+    assert res.spec == ZEROTTS_MODEL
+    assert res.gguf_path == pinned_q8
