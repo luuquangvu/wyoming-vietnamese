@@ -113,18 +113,9 @@ def test_build_zerotts_ggml_lib_success(tmp_path: Path, native: bool) -> None:
         assert "stage" in verified_path.parts
 
 
-def test_build_zerotts_ggml_lib_missing_local_source_logs_warning(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Test warning is logged when local zerotts.cpp is missing during build."""
+def test_build_zerotts_ggml_lib_missing_local_source_raises(tmp_path: Path) -> None:
+    """Test build fails when local zerotts.cpp is missing."""
     target_dir = tmp_path / "lib"
-
-    def fake_subprocess_run(cmd: list[str], **kwargs: object) -> Mock:
-        if "g++" in cmd[0]:
-            out_file = Path(cmd[cmd.index("-o") + 1])
-            out_file.parent.mkdir(parents=True, exist_ok=True)
-            out_file.write_bytes(b"ELF_FAKE")
-        return Mock(returncode=0)
 
     mock_cmake_proc = Mock()
     mock_cmake_proc.communicate.return_value = (b"", b"")
@@ -132,52 +123,71 @@ def test_build_zerotts_ggml_lib_missing_local_source_logs_warning(
     mock_cmake_proc.pid = 12345
 
     with (
-        patch("tools.build_zerotts.subprocess.run", side_effect=fake_subprocess_run),
+        patch("tools.build_zerotts.subprocess.run", return_value=Mock(returncode=0)) as mock_run,
         patch("tools.build_zerotts.subprocess.Popen", return_value=mock_cmake_proc),
-        patch("tools.build_zerotts.ctypes.CDLL"),
         patch("tools.build_zerotts.LOCAL_ZEROTTS_SOURCE", tmp_path / "missing_zerotts.cpp"),
-        caplog.at_level("WARNING", logger="tools.build_zerotts"),
+        pytest.raises(FileNotFoundError, match=r"Local ZeroTTS C\+\+ source not found at"),
     ):
-        result = _build_zerotts_ggml_lib(target_dir)
-        assert result.is_file()
-        assert "Local ZeroTTS C++ source not found at" in caplog.text
-        assert "lacks codebook-limit support" in caplog.text
+        _build_zerotts_ggml_lib(target_dir)
+
+    mock_cmake_proc.communicate.assert_not_called()
+    assert all("cmake" not in c.args[0] for c in mock_run.call_args_list)
+    assert all("-shared" not in c.args[0] for c in mock_run.call_args_list)
+    assert not (target_dir / ZeroTtsFile.LIBZEROTTS_SO).exists()
 
 
-def test_build_zerotts_ggml_lib_mismatched_base_commit_logs_warning(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Test warning is logged when local zerotts base commit mismatches requested commit."""
+def test_build_zerotts_ggml_lib_missing_base_commit_raises(tmp_path: Path) -> None:
+    """Test build fails when local ZEROTTS_BASE_COMMIT is missing."""
+    target_dir = tmp_path / "lib"
+    fake_cpp = tmp_path / "zerotts.cpp"
+    fake_cpp.write_bytes(b"// fake")
+
+    mock_cmake_proc = Mock()
+    mock_cmake_proc.communicate.return_value = (b"", b"")
+    mock_cmake_proc.returncode = 0
+    mock_cmake_proc.pid = 12345
+
+    with (
+        patch("tools.build_zerotts.subprocess.run", return_value=Mock(returncode=0)) as mock_run,
+        patch("tools.build_zerotts.subprocess.Popen", return_value=mock_cmake_proc),
+        patch("tools.build_zerotts.LOCAL_ZEROTTS_SOURCE", fake_cpp),
+        patch("tools.build_zerotts.LOCAL_ZEROTTS_BASE_COMMIT", tmp_path / "missing_commit"),
+        pytest.raises(FileNotFoundError, match="Missing"),
+    ):
+        _build_zerotts_ggml_lib(target_dir)
+
+    mock_cmake_proc.communicate.assert_not_called()
+    assert all("cmake" not in c.args[0] for c in mock_run.call_args_list)
+    assert all("-shared" not in c.args[0] for c in mock_run.call_args_list)
+    assert not (target_dir / ZeroTtsFile.LIBZEROTTS_SO).exists()
+
+
+def test_build_zerotts_ggml_lib_mismatched_base_commit_raises(tmp_path: Path) -> None:
+    """Test build fails when local zerotts base commit mismatches requested commit."""
     target_dir = tmp_path / "lib"
     fake_cpp = tmp_path / "zerotts.cpp"
     fake_cpp.write_bytes(b"// fake")
     fake_base = tmp_path / "ZEROTTS_BASE_COMMIT"
     fake_base.write_text("0000000000000000000000000000000000000000\n", encoding="utf-8")
 
-    def fake_subprocess_run(cmd: list[str], **kwargs: object) -> Mock:
-        if "g++" in cmd[0]:
-            out_file = Path(cmd[cmd.index("-o") + 1])
-            out_file.parent.mkdir(parents=True, exist_ok=True)
-            out_file.write_bytes(b"ELF_FAKE")
-        return Mock(returncode=0)
-
     mock_cmake_proc = Mock()
     mock_cmake_proc.communicate.return_value = (b"", b"")
     mock_cmake_proc.returncode = 0
     mock_cmake_proc.pid = 12345
 
     with (
-        patch("tools.build_zerotts.subprocess.run", side_effect=fake_subprocess_run),
+        patch("tools.build_zerotts.subprocess.run", return_value=Mock(returncode=0)) as mock_run,
         patch("tools.build_zerotts.subprocess.Popen", return_value=mock_cmake_proc),
-        patch("tools.build_zerotts.ctypes.CDLL"),
         patch("tools.build_zerotts.LOCAL_ZEROTTS_SOURCE", fake_cpp),
         patch("tools.build_zerotts.LOCAL_ZEROTTS_BASE_COMMIT", fake_base),
-        caplog.at_level("WARNING", logger="tools.build_zerotts"),
+        pytest.raises(RuntimeError, match="does not match requested commit"),
     ):
-        result = _build_zerotts_ggml_lib(target_dir)
-        assert result.is_file()
-        assert "Local ZeroTTS C++ source forked from" in caplog.text
-        assert "does not match requested commit" in caplog.text
+        _build_zerotts_ggml_lib(target_dir)
+
+    mock_cmake_proc.communicate.assert_not_called()
+    assert all("cmake" not in c.args[0] for c in mock_run.call_args_list)
+    assert all("-shared" not in c.args[0] for c in mock_run.call_args_list)
+    assert not (target_dir / ZeroTtsFile.LIBZEROTTS_SO).exists()
 
 
 def test_build_zerotts_ggml_lib_import_error_calls_script(tmp_path: Path) -> None:
@@ -2279,6 +2289,7 @@ def test_build_all_zerotts_variants_success(
 
     target_dir = tmp_path / "lib"
     compiled_variants: list[str] = []
+    compiled_commits: list[object] = []
 
     def fake_compile(
         clone_dest: Path,
@@ -2288,6 +2299,7 @@ def test_build_all_zerotts_variants_success(
         **kwargs: object,
     ) -> None:
         compiled_variants.append(variant)
+        compiled_commits.append(kwargs.get("commit"))
         so_file = staging_dir / ZeroTtsFile.LIBZEROTTS_SO
         so_file.write_bytes(f"ELF_{variant}".encode())
 
@@ -2301,9 +2313,52 @@ def test_build_all_zerotts_variants_success(
         results = build_all_zerotts_variants(target_dir)
         assert set(results.keys()) == set(expected_variants)
         assert compiled_variants == expected_variants
+        assert compiled_commits == [ZEROTTS_SOURCE_COMMIT] * len(expected_variants)
         default_link = target_dir / ZeroTtsFile.LIBZEROTTS_SO
         assert default_link.is_symlink()
         assert default_link.readlink() == Path(ZeroTtsVariant.COMPAT) / ZeroTtsFile.LIBZEROTTS_SO
+
+
+def test_build_all_zerotts_variants_missing_local_source_raises(tmp_path: Path) -> None:
+    """Test build_all_zerotts_variants fails before compilation when local source is missing."""
+    from tools.build_zerotts import build_all_zerotts_variants
+
+    target_dir = tmp_path / "lib"
+    with (
+        patch("tools.build_zerotts._checkout_repo"),
+        patch("tools.build_zerotts.LOCAL_ZEROTTS_SOURCE", tmp_path / "missing_zerotts.cpp"),
+        patch("tools.build_zerotts._is_toolchain_variant_supported", return_value=True),
+        patch("platform.machine", return_value="x86_64"),
+        pytest.raises(FileNotFoundError, match=r"Local ZeroTTS C\+\+ source not found at"),
+    ):
+        build_all_zerotts_variants(target_dir)
+
+    leftovers = list(target_dir.glob("_build_all_*"))
+    assert not leftovers
+
+
+def test_build_all_zerotts_variants_mismatched_base_commit_raises(tmp_path: Path) -> None:
+    """Test build_all_zerotts_variants fails when base commit does not match requested commit."""
+    from tools.build_zerotts import build_all_zerotts_variants
+
+    target_dir = tmp_path / "lib"
+    fake_cpp = tmp_path / "zerotts.cpp"
+    fake_cpp.write_bytes(b"// fake")
+    fake_base = tmp_path / "ZEROTTS_BASE_COMMIT"
+    fake_base.write_text("0000000000000000000000000000000000000000\n", encoding="utf-8")
+
+    with (
+        patch("tools.build_zerotts._checkout_repo"),
+        patch("tools.build_zerotts.LOCAL_ZEROTTS_SOURCE", fake_cpp),
+        patch("tools.build_zerotts.LOCAL_ZEROTTS_BASE_COMMIT", fake_base),
+        patch("tools.build_zerotts._is_toolchain_variant_supported", return_value=True),
+        patch("platform.machine", return_value="x86_64"),
+        pytest.raises(RuntimeError, match="does not match requested commit"),
+    ):
+        build_all_zerotts_variants(target_dir)
+
+    leftovers = list(target_dir.glob("_build_all_*"))
+    assert not leftovers
 
 
 def test_build_all_zerotts_variants_compilation_failure(tmp_path: Path) -> None:

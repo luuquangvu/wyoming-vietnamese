@@ -78,6 +78,31 @@ def _validate_git_argument(value: str, pattern: re.Pattern[str], param_name: str
     return clean
 
 
+def _validate_local_source(commit: str) -> None:
+    """Validate bundled ZeroTTS C++ source and pinned base commit.
+
+    Args:
+        commit: Target Git commit hash to verify against.
+
+    Raises:
+        FileNotFoundError: If the local source file or base commit file is missing.
+        RuntimeError: If the base commit does not match the requested commit.
+    """
+    if not LOCAL_ZEROTTS_SOURCE.is_file():
+        raise FileNotFoundError(
+            f"Local ZeroTTS C++ source not found at {LOCAL_ZEROTTS_SOURCE}; "
+            "upstream source lacks codebook-limit support"
+        )
+    if not LOCAL_ZEROTTS_BASE_COMMIT.is_file():
+        raise FileNotFoundError(f"Missing {LOCAL_ZEROTTS_BASE_COMMIT}")
+    base_commit = LOCAL_ZEROTTS_BASE_COMMIT.read_text(encoding="utf-8").strip()
+    if base_commit != commit:
+        raise RuntimeError(
+            f"Local ZeroTTS C++ source forked from {base_commit} "
+            f"does not match requested commit {commit}"
+        )
+
+
 def _checkout_repo(clone_dest: Path, repo_url: str, commit: str) -> None:
     """Clone upstream ZeroTTS repository and checkout pinned commit.
 
@@ -496,6 +521,7 @@ def _compile_libraries(
             or target a portable instruction set baseline (native=False).
         commit: Target Git commit hash to checkout and compile against.
     """
+    _validate_local_source(commit)
     actual_variant = ZeroTtsVariant.NATIVE if native else variant
     cmake_build_dir = clone_dest / "cpp" / f"build_{actual_variant}"
     cmake_cmd = [
@@ -526,23 +552,8 @@ def _compile_libraries(
     )
 
     cpp_source = clone_dest / "cpp" / "src" / _ZEROTTS_CPP_FILENAME
-    if LOCAL_ZEROTTS_SOURCE.is_file():
-        if LOCAL_ZEROTTS_BASE_COMMIT.is_file():
-            base_commit = LOCAL_ZEROTTS_BASE_COMMIT.read_text(encoding="utf-8").strip()
-            if base_commit != commit:
-                _LOGGER.warning(
-                    "Local ZeroTTS C++ source forked from %s does not match requested commit %s",
-                    base_commit,
-                    commit,
-                )
-        cpp_source.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(LOCAL_ZEROTTS_SOURCE, cpp_source)
-    else:
-        _LOGGER.warning(
-            "Local ZeroTTS C++ source not found at %s; "
-            "building upstream source which lacks codebook-limit support",
-            LOCAL_ZEROTTS_SOURCE,
-        )
+    cpp_source.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(LOCAL_ZEROTTS_SOURCE, cpp_source)
 
     gxx_cmd = [
         "g++",
@@ -998,7 +1009,7 @@ def build_all_zerotts_variants(
             variant_stage_dir.mkdir(parents=True, exist_ok=True)
 
             print(f"--> Compiling ZeroTTS variant: {var}...")
-            _compile_libraries(clone_dest, variant_stage_dir, variant=var)
+            _compile_libraries(clone_dest, variant_stage_dir, variant=var, commit=commit)
             staged_candidate = variant_stage_dir / ZeroTtsFile.LIBZEROTTS_SO
             if not staged_candidate.is_file():
                 raise FileNotFoundError(

@@ -1585,6 +1585,7 @@ def test_download_models_zerotts_quality_env_selection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Test download_models honors ZEROTTS_QUALITY when zerotts_quant is unset."""
+    monkeypatch.delenv(ZeroTtsEnv.MODEL, raising=False)
     stt, tts_snapshot, tts_spec, test_voice = _setup_zerotts_download_test(tmp_path, monkeypatch)
     q4_spec = _write_q4_hybrid_snapshot_artifact(tts_snapshot, tts_spec)
     monkeypatch.setattr(
@@ -1615,7 +1616,6 @@ def test_download_models_zerotts_quality_env_selection(
     )
     assert paths_low.zerotts_resolution is not None
     assert paths_low.zerotts_resolution.spec is q4_spec
-    monkeypatch.delenv(ZeroTtsEnv.QUALITY, raising=False)
 
 
 def test_download_models_zerotts_fallback_to_existing_when_download_fails(
