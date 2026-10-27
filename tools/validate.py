@@ -24,7 +24,6 @@ from string import ascii_letters, digits
 
 import orjson
 from packaging.requirements import InvalidRequirement, Requirement
-from packaging.version import InvalidVersion, Version
 
 _DEPENDENCY_SYNC_TIMEOUT_SECONDS = 300
 _DEPENDENCY_UPDATE_TIMEOUT_SECONDS = 120
@@ -665,14 +664,6 @@ def _load_project_dependency_packages(repo_root: str) -> set[str]:
     return _project_table_packages(pyproject_data.get("project")) | _dependency_group_packages(
         pyproject_data.get("dependency-groups")
     )
-
-
-def versions_differ(installed: str, required: str) -> bool:
-    """Return whether two dependency versions differ."""
-    try:
-        return Version(installed) != Version(required)
-    except InvalidVersion:
-        return installed != required
 
 
 def _run_dependency_steps(repo_root: str) -> None:

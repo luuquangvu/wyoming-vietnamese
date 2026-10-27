@@ -7,8 +7,10 @@ import io
 import logging
 import os
 import signal
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
@@ -29,6 +31,7 @@ from wyoming_vietnamese.__main__ import (
     _register_shutdown_signals,
     _remove_obsolete_cache_namespaces,
     _resolve_zerotts_identity,
+    _run_cleanup_bounded,
     _select_loaded_voices,
     _select_startup_voices,
     _shutdown_server,
@@ -143,6 +146,13 @@ def test_tts_cache_namespace_tracks_engine_and_voice_artifact_revision(
     zerotts_default_ns = _tts_cache_namespace(zerotts_config, (DEFAULT_ZEROTTS_VOICE,))
     assert zerotts_default_ns != initial
 
+    # Codec precision and bundled codec/runtime revisions affect generated audio.
+    int8_engine = Mock(codec_int8=True)
+    fp32_engine = Mock(codec_int8=False)
+    assert _tts_cache_namespace(
+        zerotts_config, (DEFAULT_ZEROTTS_VOICE,), tts_engine=int8_engine
+    ) != _tts_cache_namespace(zerotts_config, (DEFAULT_ZEROTTS_VOICE,), tts_engine=fp32_engine)
+
     # ZeroTTS namespace changes when GGUF model identity changes
     zerotts_q4_ns = _tts_cache_namespace(
         zerotts_config, (DEFAULT_ZEROTTS_VOICE,), zerotts_model_identity="q4_sha256"
@@ -209,7 +219,7 @@ def test_tts_cache_namespace_tracks_engine_and_voice_artifact_revision(
     assert nghitts_with_id == initial
 
     second_voice = NGHITTS_VOICES_BY_ID["chieu-thanh"]
-    assert _tts_cache_namespace(nghitts_config, (voice, second_voice)) == _tts_cache_namespace(
+    assert _tts_cache_namespace(nghitts_config, (voice, second_voice)) != _tts_cache_namespace(
         nghitts_config, (second_voice, voice)
     )
 
@@ -496,6 +506,25 @@ async def test_drain_inference_reports_a_stuck_request(
     assert any("in-flight STT inference" in message for message in caplog.messages)
 
 
+async def test_run_cleanup_bounded_reports_timeout_and_exceptions(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test blocking cleanup is bounded and failures are contained."""
+    assert await _run_cleanup_bounded("quick", lambda: None, 1.0) is True
+
+    with caplog.at_level(logging.WARNING, logger=PROGRAM_NAME):
+        assert await _run_cleanup_bounded("slow", lambda: time.sleep(0.2), 0.01) is False
+    assert any("slow cleanup did not finish" in message for message in caplog.messages)
+
+    def broken_cleanup() -> None:
+        """Raise to exercise the cleanup error path."""
+        raise RuntimeError("cleanup failed")
+
+    with caplog.at_level(logging.ERROR, logger=PROGRAM_NAME):
+        assert await _run_cleanup_bounded("broken", broken_cleanup, 1.0) is True
+    assert any("broken cleanup failed" in message for message in caplog.messages)
+
+
 async def test_run_server_starts_one_combined_service(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -652,8 +681,52 @@ async def test_shutdown_server_handles_stop_failure_and_idle_timeout(
     assert tts_engine.closed is True
 
 
+async def test_shutdown_server_skips_tts_cleanup_when_executor_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test native TTS resources stay open while an executor task may still be running."""
+    server = FakeServer()
+    limiter = ConnectionLimiter(5)
+    stt_lock = asyncio.Lock()
+    tts_lock = asyncio.Lock()
+    cache = Mock()
+    cache.clear.return_value = (0, 0)
+    executor = Mock()
+    tts_engine = ClosableTTS()
+    loop = Mock()
+    bounded_cleanup = _run_cleanup_bounded
+
+    async def cleanup(label: str, callback: Callable[[], None], timeout: float) -> bool:
+        """Simulate an inference executor that does not stop in time."""
+        if label == "inference executor":
+            return False
+        return await bounded_cleanup(label, callback, timeout)
+
+    monkeypatch.setattr(main_module, "_run_cleanup_bounded", cleanup)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(asyncio, "get_running_loop", Mock(return_value=loop))
+        with caplog.at_level(logging.WARNING, logger=PROGRAM_NAME):
+            await _shutdown_server(
+                server,
+                limiter,
+                stt_lock,
+                tts_lock,
+                cache,
+                executor,
+                tts_engine,
+                [],
+                server_started=False,
+            )
+
+    assert tts_engine.closed is False
+    executor.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
+    assert any("Skipping TTS engine cleanup" in message for message in caplog.messages)
+
+
 def test_resolve_zerotts_identity_cases(tmp_path: Path) -> None:
-    """Test _resolve_zerotts_identity returns expected SHA-256 or filename."""
+    """Test _resolve_zerotts_identity returns pinned or custom content digests."""
     assert _resolve_zerotts_identity(TtsEngine.NGHITTS, None) is None
     assert _resolve_zerotts_identity(TtsEngine.ZEROTTS, None) is None
 
@@ -664,8 +737,19 @@ def test_resolve_zerotts_identity_cases(tmp_path: Path) -> None:
 
     spec_no_gguf = Mock()
     spec_no_gguf.gguf_model = None
-    resolution_path = ZeroTtsModelResolution(spec=spec_no_gguf, gguf_path=tmp_path / "custom.gguf")
-    assert _resolve_zerotts_identity(TtsEngine.ZEROTTS, resolution_path) == "custom.gguf"
+    first_model = tmp_path / "a" / "custom.gguf"
+    first_model.parent.mkdir(parents=True)
+    first_model.write_bytes(b"first model")
+    second_model = tmp_path / "b" / "custom.gguf"
+    second_model.parent.mkdir(parents=True)
+    second_model.write_bytes(b"second model")
+    first_resolution = ZeroTtsModelResolution(spec=spec_no_gguf, gguf_path=first_model)
+    second_resolution = ZeroTtsModelResolution(spec=spec_no_gguf, gguf_path=second_model)
+    first_identity = _resolve_zerotts_identity(TtsEngine.ZEROTTS, first_resolution)
+    second_identity = _resolve_zerotts_identity(TtsEngine.ZEROTTS, second_resolution)
+    assert first_identity == f"custom:{sha256(b'first model').hexdigest()}"
+    assert second_identity == f"custom:{sha256(b'second model').hexdigest()}"
+    assert first_identity != second_identity
 
 
 def test_create_server_handler_factory(tmp_path: Path) -> None:
@@ -921,7 +1005,12 @@ async def test_run_server_starts_zerotts_engine(
     )
     init_nghitts.assert_not_called()
     warm_up.assert_called_once_with(tts, (DEFAULT_ZEROTTS_VOICE,), TtsEngine.ZEROTTS)
-    get_tts_info_mock.assert_called_once_with((DEFAULT_ZEROTTS_VOICE,), engine=TtsEngine.ZEROTTS)
+    get_tts_info_mock.assert_called_once_with(
+        (DEFAULT_ZEROTTS_VOICE,),
+        engine=TtsEngine.ZEROTTS,
+        zerotts_model_name="auto",
+        zerotts_quality="auto",
+    )
 
 
 async def _run_configured_zerotts_server(

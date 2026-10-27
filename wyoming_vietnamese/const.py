@@ -99,6 +99,15 @@ class ZeroTtsEnv(StrEnum):
     OPPORTUNISTIC = "ZEROTTS_OPPORTUNISTIC"
     MAX_CODEBOOKS = "ZEROTTS_MAX_CODEBOOKS"
     QUALITY = "ZEROTTS_QUALITY"
+    ALLOW_UNPINNED_FALLBACK = "ALLOW_UNPINNED_MODEL_FALLBACK"
+
+
+class ZeroTtsLimit(IntEnum):
+    """Native ZeroTTS text and audio generation bounds."""
+
+    MAX_TEXT_IDS = 512
+    MAX_TEXT_TOKENS = MAX_TEXT_IDS - 2
+    MAX_FRAMES = 1_500
 
 
 class ZeroTtsQuality(StrEnum):
@@ -157,6 +166,7 @@ class Timeout(float, Enum):
     EVENT = 60.0
     WRITE = 5.0
     SHUTDOWN_DRAIN = 10.0
+    ABORT = 6.0
 
 
 class ConnectionLimit(IntEnum):
@@ -166,9 +176,16 @@ class ConnectionLimit(IntEnum):
     LOCAL_RESERVE = 2
 
 
+class RequestLimit(IntEnum):
+    """Per-request event bounds that prevent zero-progress abuse."""
+
+    MAX_EMPTY_EVENTS = 256
+
+
 DEFAULT_MAX_STT_BUFFER_MB = 256
 DEFAULT_MAX_STT_AUDIO_SECONDS = 120.0
 DEFAULT_MAX_TTS_TEXT_CHARS = 2_000
+DEFAULT_MAX_TTS_STREAM_SECONDS = 300.0
 
 
 class TtsSilenceMs(IntEnum):

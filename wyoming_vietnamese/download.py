@@ -136,6 +136,41 @@ def setup_hf_environment(cache_dir: Path, offline: bool = False) -> None:
         os.environ["HF_HUB_OFFLINE"] = "1"
 
 
+def _process_is_alive(pid: int) -> bool:
+    """Return whether a process ID still exists."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _cleanup_stale_temporary_files(root: Path) -> None:
+    """Remove PID-suffixed temporary files left by interrupted model operations."""
+    if not root.is_dir():
+        return
+    for candidate in root.rglob(".*.tmp"):
+        name = candidate.name
+        if not name.startswith(".") or not name.endswith(".tmp"):
+            continue
+        parts = name.rsplit(".", 2)
+        if len(parts) != 3 or not parts[1].isdigit():
+            continue
+        pid = int(parts[1])
+        if pid != os.getpid() and _process_is_alive(pid):
+            continue
+        try:
+            candidate.unlink()
+        except OSError as err:
+            _LOGGER.debug("Could not remove stale temporary model file %s: %s", candidate, err)
+            continue
+        _LOGGER.debug("Removed stale temporary model file: %s", candidate)
+
+
 def download_models(
     cache_dir: Path,
     download_dir: Path,
@@ -170,6 +205,8 @@ def download_models(
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     download_dir.mkdir(parents=True, exist_ok=True)
+    with _model_structure_lock(download_dir):
+        _cleanup_stale_temporary_files(download_dir)
     setup_hf_environment(cache_dir, offline)
 
     _LOGGER.info(
@@ -186,16 +223,21 @@ def download_models(
         stt_model.revision,
         len(stt_model.artifacts),
     )
-    stt_snapshot = _sync_repo(
-        stt_model.repo,
-        offline,
-        revision=stt_model.revision,
-        allow_patterns=stt_model.allow_patterns,
-    )
-
     stt_dest = download_dir / STT_DIR / stt_engine_name
     tts_dest = download_dir / TTS_DIR / tts_engine_name
     zerotts_resolution: ZeroTtsModelResolution | None = None
+    stt_layout_ready = _stt_layout_ready(stt_dest, stt_model)
+    stt_snapshot: Path | None = None
+    if not stt_layout_ready:
+        stt_snapshot = _sync_repo(
+            stt_model.repo,
+            offline,
+            revision=stt_model.revision,
+            allow_patterns=stt_model.allow_patterns,
+        )
+        with _model_structure_lock(download_dir):
+            stt_dest.mkdir(parents=True, exist_ok=True)
+            _structure_stt_files(stt_snapshot, stt_dest, stt_model)
 
     if tts_engine_name == TtsEngine.ZEROTTS:
         if zerotts_quant is not None:
@@ -245,45 +287,59 @@ def download_models(
             len(zerotts_spec.artifacts),
             gguf_label,
         )
-        with _model_structure_lock(download_dir):
-            stt_dest.mkdir(parents=True, exist_ok=True)
-            _structure_stt_files(stt_snapshot, stt_dest, stt_model)
 
-        try:
-            zerotts_snapshot = _sync_repo(
-                zerotts_spec.repo,
-                offline,
-                revision=zerotts_spec.revision,
-                allow_patterns=zerotts_spec.allow_patterns,
+        existing_target = _resolve_existing_zerotts_target(
+            tts_dest,
+            zerotts_spec,
+            resolved_gguf_path,
+            tts_voices,
+        )
+        if existing_target is not None:
+            _LOGGER.info(
+                "Using verified local ZeroTTS model without a remote check: %s",
+                existing_target.gguf_path,
             )
-            with _model_structure_lock(download_dir):
-                _structure_zerotts_files(zerotts_snapshot, tts_dest, tts_voices, zerotts_spec)
-        except Exception as sync_err:
-            fallback = _find_existing_zerotts_fallback(
+            _ensure_zerotts_int8_codec(
+                download_dir,
                 tts_dest,
-                zerotts_spec,
-                resolved_gguf_path=resolved_gguf_path,
-                voices=tts_voices,
+                existing_target.spec,
+                existing_target.gguf_path,
             )
-            if fallback is not None:
-                _LOGGER.warning(
-                    "Failed to download or update ZeroTTS model (%s); "
-                    "falling back to existing model at %s: %s",
-                    gguf_label,
-                    fallback.gguf_path,
-                    sync_err,
+            zerotts_resolution = existing_target
+        else:
+            try:
+                zerotts_snapshot = _sync_repo(
+                    zerotts_spec.repo,
+                    offline,
+                    revision=zerotts_spec.revision,
+                    allow_patterns=zerotts_spec.allow_patterns,
                 )
-                zerotts_resolution = fallback
-            else:
-                raise
+                with _model_structure_lock(download_dir):
+                    _structure_zerotts_files(zerotts_snapshot, tts_dest, tts_voices, zerotts_spec)
+            except Exception as sync_err:
+                fallback = _find_existing_zerotts_fallback(
+                    tts_dest,
+                    zerotts_spec,
+                    resolved_gguf_path=resolved_gguf_path,
+                    voices=tts_voices,
+                )
+                if fallback is not None:
+                    _LOGGER.warning(
+                        "Failed to download or update ZeroTTS model (%s); "
+                        "falling back to existing model at %s: %s",
+                        gguf_label,
+                        fallback.gguf_path,
+                        sync_err,
+                    )
+                    zerotts_resolution = fallback
+                else:
+                    raise
     elif tts_engine_name == TtsEngine.NGHITTS:
         nghitts_voices = tuple(voice for voice in tts_voices if isinstance(voice, NghiTtsVoiceSpec))
         tts_snapshots = {
             voice.id: _sync_nghitts_model(cache_dir, offline, voice) for voice in nghitts_voices
         }
         with _model_structure_lock(download_dir):
-            stt_dest.mkdir(parents=True, exist_ok=True)
-            _structure_stt_files(stt_snapshot, stt_dest, stt_model)
             for voice in nghitts_voices:
                 voice_dest = tts_dest / voice.id
                 voice_dest.mkdir(parents=True, exist_ok=True)
@@ -767,6 +823,54 @@ def _verified_stt_source(snapshot_path: Path, artifact: SttArtifact) -> Path:
     return source
 
 
+def _stt_tokens_marker_path(dest_dir: Path) -> Path:
+    """Return the sidecar recording the generated STT token table identity."""
+    return dest_dir / ".tokens.prepared.json"
+
+
+def _record_stt_tokens(dest_dir: Path, tokenizer_sha256: str, tokens_path: Path) -> None:
+    """Atomically record the pinned tokenizer and generated token table digests."""
+    marker_path = _stt_tokens_marker_path(dest_dir)
+    payload = json.dumps(
+        {
+            "tokenizer_sha256": tokenizer_sha256,
+            "tokens_sha256": _file_sha256(tokens_path),
+        },
+        sort_keys=True,
+    )
+    temporary_path = marker_path.with_name(f".{marker_path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary_path.open("w", encoding="utf-8") as marker_file:
+            marker_file.write(payload)
+            marker_file.flush()
+            os.fsync(marker_file.fileno())
+        os.replace(temporary_path, marker_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _stt_layout_ready(dest_dir: Path, stt_model: SttModelSpec) -> bool:
+    """Return whether the structured STT destination already holds verified files."""
+    tokens_path = dest_dir / "tokens.txt"
+    marker_path = _stt_tokens_marker_path(dest_dir)
+    if not tokens_path.is_file() or not marker_path.is_file():
+        return False
+    try:
+        recorded = json.loads(marker_path.read_text(encoding="utf-8"))
+    except OSError, ValueError:
+        return False
+    if not isinstance(recorded, dict):
+        return False
+    if recorded.get("tokenizer_sha256") != stt_model.tokenizer.sha256:
+        return False
+    if recorded.get("tokens_sha256") != _file_sha256(tokens_path):
+        return False
+    return all(
+        _is_verified_file(dest_dir / artifact.local_name, artifact.sha256)
+        for artifact in stt_model.graphs
+    )
+
+
 def _structure_stt_files(
     snapshot_path: Path,
     dest_dir: Path,
@@ -787,6 +891,7 @@ def _structure_stt_files(
 
     generated_tokens = dest_dir / "tokens.txt"
     _generate_tokens_from_bpe(sources[model.tokenizer.remote_name], generated_tokens)
+    _record_stt_tokens(dest_dir, model.tokenizer.sha256, generated_tokens)
     copied_paths.append(generated_tokens)
     return copied_paths
 
@@ -886,6 +991,25 @@ def _find_unpinned_zerotts_fallback(
     return None
 
 
+def _resolve_existing_zerotts_target(
+    dest_dir: Path,
+    target_spec: ZeroTtsModelSpec,
+    resolved_gguf_path: Path | None = None,
+    voices: Sequence[AnyVoiceSpec] | None = None,
+) -> ZeroTtsModelResolution | None:
+    """Return the exact requested model only when it already verifies locally."""
+    target_path = (
+        dest_dir / target_spec.gguf_model.local_name
+        if target_spec.gguf_model is not None
+        else resolved_gguf_path
+    )
+    if target_path is not None and _verify_existing_zerotts_candidate(
+        dest_dir, target_spec, target_path, voices
+    ):
+        return ZeroTtsModelResolution(spec=target_spec, gguf_path=target_path)
+    return None
+
+
 def _find_existing_zerotts_fallback(
     dest_dir: Path,
     target_spec: ZeroTtsModelSpec,
@@ -906,6 +1030,10 @@ def _find_existing_zerotts_fallback(
     gguf_dir = dest_dir / ZeroTtsDirectory.GGUF
     checked_filenames: set[str] = set()
 
+    if target_resolution := _resolve_existing_zerotts_target(
+        dest_dir, target_spec, resolved_gguf_path, voices
+    ):
+        return target_resolution
     target_path = (
         dest_dir / target_spec.gguf_model.local_name
         if target_spec.gguf_model is not None
@@ -913,8 +1041,6 @@ def _find_existing_zerotts_fallback(
     )
     if target_path is not None:
         checked_filenames.add(target_path.name)
-        if _verify_existing_zerotts_candidate(dest_dir, target_spec, target_path, voices):
-            return ZeroTtsModelResolution(spec=target_spec, gguf_path=target_path)
 
     candidates = (
         (ZeroTtsFile.Q4_HYBRID_GGUF_MODEL, ZEROTTS_Q4_MODEL),
@@ -928,7 +1054,9 @@ def _find_existing_zerotts_fallback(
         if _verify_existing_zerotts_candidate(dest_dir, spec, candidate_path, voices):
             return ZeroTtsModelResolution(spec=spec, gguf_path=candidate_path)
 
-    return _find_unpinned_zerotts_fallback(dest_dir, gguf_dir, checked_filenames, voices)
+    if target_spec.gguf_model is None or get_env_bool(ZeroTtsEnv.ALLOW_UNPINNED_FALLBACK, False):
+        return _find_unpinned_zerotts_fallback(dest_dir, gguf_dir, checked_filenames, voices)
+    return None
 
 
 def _locate_zerotts_gguf(snapshot_path: Path, artifact: ZeroTtsArtifact) -> Path:
@@ -1090,6 +1218,25 @@ def _structure_zerotts_artifact(
             f"recorded SHA-256 digest"
         )
     return dst
+
+
+def _ensure_zerotts_int8_codec(
+    download_dir: Path,
+    dest_dir: Path,
+    spec: ZeroTtsModelSpec,
+    gguf_path: Path,
+) -> None:
+    """Structure the optional INT8 codec when the resolved model enables it."""
+    if not tts_model.resolve_zerotts_codec_int8(model_name=gguf_path.name):
+        return
+    int8_name = f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}"
+    artifact = next((item for item in spec.codec_files if item.local_name == int8_name), None)
+    if artifact is None:
+        return
+    if _is_verified_file(dest_dir / artifact.local_name, artifact.sha256):
+        return
+    with _model_structure_lock(download_dir):
+        _structure_zerotts_artifact(dest_dir, dest_dir, artifact)
 
 
 def _structure_zerotts_voice_files(snapshot_path: Path, dest_dir: Path) -> list[Path]:

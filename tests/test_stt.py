@@ -19,7 +19,7 @@ from wyoming.event import Event
 from wyoming.info import Describe
 
 from tests.helpers import make_reader, stream_writer, written_events
-from wyoming_vietnamese.const import PROGRAM_NAME, VIETNAMESE_LANGUAGE
+from wyoming_vietnamese.const import PROGRAM_NAME, VIETNAMESE_LANGUAGE, RequestLimit
 from wyoming_vietnamese.protocol import ByteBudget
 from wyoming_vietnamese.stt import (
     SherpaSTTEventHandler,
@@ -100,10 +100,13 @@ async def test_stt_describe_and_unknown_event() -> None:
 
 
 async def test_stt_accepts_advertised_transcribe_language() -> None:
-    """Test stt accepts its exact advertised language selector."""
+    """Test stt accepts advertised and regional Vietnamese language selectors."""
     handler, _ = make_handler()
     request = Transcribe(name="owner/model", language=VIETNAMESE_LANGUAGE).event()
     assert await handler.handle_event(request) is True
+    for language in ("vi-VN", "VI", " vi ", "vi-vn"):
+        handler, _ = make_handler()
+        assert await handler.handle_event(Transcribe(language=language).event()) is True
 
 
 @pytest.mark.parametrize(
@@ -114,11 +117,14 @@ async def test_stt_accepts_advertised_transcribe_language() -> None:
         Transcribe(name="other/model").event(),
         Transcribe(language="en").event(),
         Transcribe(language="viking").event(),
-        Transcribe(language="VI").event(),
-        Transcribe(language=" vi ").event(),
         Transcribe(language="VI_vn").event(),
-        Transcribe(language="vi-VN").event(),
+        Transcribe(language="vi-Latn-VN-1996").event(),
         Transcribe(language="vi-Latn-VN").event(),
+        Transcribe(language="vi-Latn").event(),
+        Transcribe(language="vi-419").event(),
+        Transcribe(language="vi-VIETNAM").event(),
+        Transcribe(language="vi-VN-extra").event(),
+        Transcribe(language="vi-x-private").event(),
         Transcribe(language="vi-").event(),
         Transcribe(language="").event(),
     ],
@@ -410,6 +416,74 @@ async def test_stt_skips_inference_for_closed_client() -> None:
     writer.close()
     assert await handler.handle_event(AudioStop().event()) is False
     assert recognizer.decoded is False
+
+
+async def test_stt_converts_float_only_after_inference_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test queued audio stays in the byte budget and is not converted before the lock."""
+    lock = asyncio.Lock()
+    await lock.acquire()
+    budget = ByteBudget(1024 * 1024)
+    handler, writer = make_handler(lock=lock, queue_timeout=0.001, buffer_budget=budget)
+    conversion_calls: list[int] = []
+
+    def spy_multiply(x1: object, x2: float, **_kwargs: object) -> np.ndarray:
+        """Record conversion attempts without changing the numeric result."""
+        conversion_calls.append(1)
+        return np.asarray(x1, dtype=np.float32) * x2
+
+    monkeypatch.setattr("wyoming_vietnamese.stt.np.multiply", spy_multiply)
+    assert await handler.handle_event(AudioStart(rate=16000, width=2, channels=1).event())
+    assert await handler.handle_event(
+        AudioChunk(rate=16000, width=2, channels=1, audio=b"\x00\x00" * 1600).event()
+    )
+    assert await handler.handle_event(AudioStop().event()) is False
+    assert conversion_calls == []
+    assert budget.used == 0
+    assert len(handler.audio_bytes) == 0
+    assert written_events(writer)[0].data["code"] == "server-busy"
+    lock.release()
+
+
+async def test_stt_request_deadline_and_empty_event_limit() -> None:
+    """Test slowloris-style streams are bounded by time and zero-progress events."""
+    handler, writer = make_handler()
+    assert await handler.handle_event(AudioStart(rate=16000, width=2, channels=1).event())
+    handler.audio_deadline = 0
+    assert (
+        await handler.handle_event(
+            AudioChunk(rate=16000, width=2, channels=1, audio=b"\x00\x00").event()
+        )
+        is False
+    )
+    assert written_events(writer)[0].data["code"] == "request-timeout"
+
+    handler, writer = make_handler()
+    assert await handler.handle_event(AudioStart(rate=16000, width=2, channels=1).event())
+    for _ in range(RequestLimit.MAX_EMPTY_EVENTS):
+        assert (
+            await handler.handle_event(
+                AudioChunk(rate=16000, width=2, channels=1, audio=b"").event()
+            )
+            is True
+        )
+    assert (
+        await handler.handle_event(AudioChunk(rate=16000, width=2, channels=1, audio=b"").event())
+        is False
+    )
+    assert written_events(writer)[0].data["code"] == "too-many-empty-events"
+
+
+async def test_stt_describe_cannot_bypass_active_audio_deadline() -> None:
+    """Test discovery events do not keep an expired audio stream alive."""
+    handler, writer = make_handler()
+    assert await handler.handle_event(AudioStart(rate=16000, width=2, channels=1).event())
+    handler.audio_deadline = 0
+
+    assert await handler.handle_event(Describe().event()) is False
+    assert written_events(writer)[0].data["code"] == "request-timeout"
+    assert handler.audio_started is False
 
 
 async def test_stt_releases_buffer_while_a_numpy_view_is_alive() -> None:

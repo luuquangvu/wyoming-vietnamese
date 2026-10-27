@@ -20,6 +20,13 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+_VIETNAMESE_LANGUAGE_TAGS = frozenset(
+    {
+        VIETNAMESE_LANGUAGE,
+        f"{VIETNAMESE_LANGUAGE}-vn",
+    }
+)
+
 
 class ProtocolError(ValueError):
     """Raised when an incoming Wyoming frame is malformed or exceeds a limit."""
@@ -30,8 +37,13 @@ class ProtocolWriteError(ConnectionError):
 
 
 def is_vietnamese_language(language: str) -> bool:
-    """Return whether a Wyoming language selector matches the advertised value."""
-    return language == VIETNAMESE_LANGUAGE
+    """Return whether a Wyoming language selector is Vietnamese.
+
+    BCP-47 tags are case-insensitive. The service accepts the canonical ``vi``
+    tag and its Vietnamese regional form ``vi-VN`` while continuing to advertise
+    ``vi`` in discovery metadata.
+    """
+    return language.strip().lower() in _VIETNAMESE_LANGUAGE_TAGS
 
 
 class ConnectionLimiter:

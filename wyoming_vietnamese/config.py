@@ -15,6 +15,7 @@ from .const import (
     DEFAULT_DOWNLOAD_DIR,
     DEFAULT_MAX_STT_AUDIO_SECONDS,
     DEFAULT_MAX_STT_BUFFER_MB,
+    DEFAULT_MAX_TTS_STREAM_SECONDS,
     DEFAULT_MAX_TTS_TEXT_CHARS,
     DEFAULT_PORT,
     DEFAULT_STT_ENGINE,
@@ -268,6 +269,7 @@ class ServerConfig:
     zerotts_opportunistic: bool = True
     zerotts_max_codebooks: int | None = None
     zerotts_quality: str = ZeroTtsQuality.AUTO
+    max_tts_stream_seconds: float = DEFAULT_MAX_TTS_STREAM_SECONDS
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> ServerConfig:
@@ -313,6 +315,12 @@ class ServerConfig:
                 "MAX_TTS_TEXT_CHARS",
                 DEFAULT_MAX_TTS_TEXT_CHARS,
                 minimum=1,
+            ),
+            max_tts_stream_seconds=_get_float(
+                env,
+                "MAX_TTS_STREAM_SECONDS",
+                DEFAULT_MAX_TTS_STREAM_SECONDS,
+                minimum_exclusive=0,
             ),
             tts_paragraph_silence_ms=_get_int(
                 env,

@@ -25,6 +25,7 @@ from .const import (
     SUPPORTED_INPUT_WIDTHS,
     VIETNAMESE_LANGUAGE,
     InputSampleRate,
+    RequestLimit,
     SttAudio,
     SttConversion,
     Timeout,
@@ -107,7 +108,9 @@ class SherpaSTTEventHandler(SafeAsyncEventHandler):
         self.reserved_audio_bytes = 0
         self.audio_started = False
         self.audio_started_at: float | None = None
+        self.audio_deadline: float | None = None
         self.audio_chunk_count = 0
+        self.empty_chunk_count = 0
         self.input_audio_bytes = 0
         self.input_audio_frames = 0
         self.audio_conversion_seconds = 0.0
@@ -116,6 +119,12 @@ class SherpaSTTEventHandler(SafeAsyncEventHandler):
 
     async def handle_event(self, event: Event) -> bool:
         """Handle service discovery and one transcription lifecycle."""
+        if self.audio_started and self._audio_deadline_exceeded():
+            return await self._fail(
+                "Audio stream exceeded the configured request deadline",
+                "request-timeout",
+            )
+
         if Describe.is_type(event.type):
             await self.write_event(self.wyoming_info_event)
             _LOGGER.debug("Sent STT service information")
@@ -174,7 +183,9 @@ class SherpaSTTEventHandler(SafeAsyncEventHandler):
         self._clear_audio_buffer()
         self.audio_started = True
         self.audio_started_at = perf_counter()
+        self.audio_deadline = self.audio_started_at + self.max_audio_seconds + self.event_timeout
         self.audio_chunk_count = 0
+        self.empty_chunk_count = 0
         self.input_audio_bytes = 0
         self.input_audio_frames = 0
         self.audio_conversion_seconds = 0.0
@@ -209,9 +220,21 @@ class SherpaSTTEventHandler(SafeAsyncEventHandler):
 
         if (chunk.rate, chunk.width, chunk.channels) != self.source_format:
             return await self._fail("Audio format changed during the stream", "invalid-audio")
+        if self._audio_deadline_exceeded():
+            return await self._fail(
+                "Audio stream exceeded the configured request deadline",
+                "request-timeout",
+            )
         self.audio_chunk_count += 1
         if not chunk.audio:
+            self.empty_chunk_count += 1
+            if self.empty_chunk_count > RequestLimit.MAX_EMPTY_EVENTS:
+                return await self._fail(
+                    "Audio stream made no progress",
+                    "too-many-empty-events",
+                )
             return True
+        self.empty_chunk_count = 0
 
         frame_width = chunk.width * chunk.channels
         if len(chunk.audio) % frame_width:
@@ -321,10 +344,19 @@ class SherpaSTTEventHandler(SafeAsyncEventHandler):
         # and resizing an exported bytearray raises BufferError.
         self.audio_bytes = bytearray()
 
+    def _audio_deadline_exceeded(self) -> bool:
+        """Return whether the streaming audio request deadline has passed."""
+        return self.audio_deadline is not None and perf_counter() > self.audio_deadline
+
     async def _handle_audio_stop(self) -> bool:
         """Finish the audio lifecycle and run recognition outside the event loop."""
         if not self.audio_started:
             return await self._fail("Audio stop received before audio start", "invalid-event-order")
+        if self._audio_deadline_exceeded():
+            return await self._fail(
+                "Audio stream exceeded the configured request deadline",
+                "request-timeout",
+            )
 
         stop_started = perf_counter()
         request_started = self.audio_started_at or stop_started
@@ -362,22 +394,10 @@ class SherpaSTTEventHandler(SafeAsyncEventHandler):
                 (completed_at - request_started) * 1000,
             )
             self.audio_started_at = None
+            self.audio_deadline = None
             return False
 
-        preprocess_started = perf_counter()
-        audio_float = np.multiply(
-            np.frombuffer(self.audio_bytes, dtype="<i2"),
-            np.float32(1.0 / 32768.0),
-            dtype=np.float32,
-        )
-        self._clear_audio_buffer()
-        preprocess_seconds = perf_counter() - preprocess_started
-        _LOGGER.debug(
-            "STT step=preprocess samples=%d duration_ms=%.3f",
-            audio_float.size,
-            preprocess_seconds * 1000,
-        )
-
+        preprocess_seconds = 0.0
         queue_started = perf_counter()
         _LOGGER.debug("STT step=queue-wait timeout_seconds=%.3f", self.queue_timeout)
         try:
@@ -395,8 +415,22 @@ class SherpaSTTEventHandler(SafeAsyncEventHandler):
         try:
             if self.writer.is_closing():
                 _LOGGER.debug("STT step=inference-skipped reason=client-closed")
+                self._clear_audio_buffer()
                 self.audio_started_at = None
                 return False
+            preprocess_started = perf_counter()
+            audio_float = np.multiply(
+                np.frombuffer(self.audio_bytes, dtype="<i2"),
+                np.float32(1.0 / 32768.0),
+                dtype=np.float32,
+            )
+            self._clear_audio_buffer()
+            preprocess_seconds = perf_counter() - preprocess_started
+            _LOGGER.debug(
+                "STT step=preprocess samples=%d duration_ms=%.3f",
+                audio_float.size,
+                preprocess_seconds * 1000,
+            )
             inference_started = perf_counter()
             try:
                 text = await run_inference(
@@ -417,6 +451,7 @@ class SherpaSTTEventHandler(SafeAsyncEventHandler):
 
         if self.writer.is_closing():
             self.audio_started_at = None
+            self.audio_deadline = None
             return False
         real_time_factor = inference_seconds / audio_seconds
         _LOGGER.debug(
@@ -450,6 +485,7 @@ class SherpaSTTEventHandler(SafeAsyncEventHandler):
             real_time_factor,
         )
         self.audio_started_at = None
+        self.audio_deadline = None
         return False
 
     def _recognize(self, audio_float: np.ndarray) -> str:
@@ -485,7 +521,9 @@ class SherpaSTTEventHandler(SafeAsyncEventHandler):
         )
         self.audio_started = False
         self.audio_started_at = None
+        self.audio_deadline = None
         self.audio_chunk_count = 0
+        self.empty_chunk_count = 0
         self.input_audio_bytes = 0
         self.input_audio_frames = 0
         self.audio_conversion_seconds = 0.0
@@ -507,6 +545,7 @@ class SherpaSTTEventHandler(SafeAsyncEventHandler):
             )
         self._clear_audio_buffer()
         self.audio_started_at = None
+        self.audio_deadline = None
         self.converter = None
 
 

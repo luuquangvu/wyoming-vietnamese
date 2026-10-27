@@ -103,6 +103,7 @@ def test_server_config_custom_values() -> None:
             "LOG_LEVEL": "debug",
             "MAX_STT_AUDIO_SECONDS": "2.5",
             "MAX_TTS_TEXT_CHARS": "50",
+            "MAX_TTS_STREAM_SECONDS": "45",
             "TTS_SENTENCE_SILENCE_MS": "450",
             "TTS_CLAUSE_SILENCE_MS": "0",
             "TTS_PARAGRAPH_SILENCE_MS": "800",
@@ -130,6 +131,7 @@ def test_server_config_custom_values() -> None:
     assert config.log_level == "DEBUG"
     assert config.max_stt_audio_seconds == 2.5
     assert config.max_tts_text_chars == 50
+    assert config.max_tts_stream_seconds == 45
     assert config.tts_sentence_silence_ms == 450
     assert config.tts_clause_silence_ms == 0
     assert config.tts_paragraph_silence_ms == 800
@@ -171,6 +173,7 @@ def test_server_config_accepts_tts_voice_separators(value: str) -> None:
         ({"MAX_STT_AUDIO_SECONDS": "nan"}, "must be finite"),
         ({"INFERENCE_QUEUE_TIMEOUT": "inf"}, "must be finite"),
         ({"MAX_TTS_TEXT_CHARS": "0"}, "must be at least"),
+        ({"MAX_TTS_STREAM_SECONDS": "0"}, "must be greater"),
         ({"TTS_SENTENCE_SILENCE_MS": "-1"}, "must be at least"),
         ({"TTS_CLAUSE_SILENCE_MS": "3001"}, "at most"),
         ({"TTS_PARAGRAPH_SILENCE_MS": "-1"}, "must be at least"),
