@@ -57,6 +57,7 @@ _HF_API_BASE_URL: Final = HUGGINGFACE_API_MODELS_URL
 _NGHITTS_MODEL_BASE_URL: Final = _NGHITTS_MODEL_BASE_URL_SOURCE.rstrip("/")
 _MAX_JSON_RESPONSE_BYTES: Final = 4 * 1024 * 1024
 _SHA256_PATTERN: Final = re.compile(r"^[0-9a-f]{64}$")
+_REVISION_PATTERN: Final = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _ZEROTTS_CORE_FILES: Final = tuple(artifact.remote_name for artifact in ZEROTTS_MODEL.artifacts)
 _LINK_HEADER_PATTERN: Final = re.compile(r"<([^>]+)>([^,]*)")
 _REL_PARAM_PATTERN: Final = re.compile(r"""\brel\s*=\s*(?:"([^"]*)"|([^"\s,;]+))""", re.IGNORECASE)
@@ -553,7 +554,12 @@ def _remote_hf_revision(repo: str, timeout: int) -> str:
     """Read the current revision for a Hugging Face repository."""
     url = f"{_HF_API_BASE_URL}/{quote(repo, safe='/')}"
     payload = _require_dict(_request_json(url, timeout), f"Hugging Face model {repo}")
-    return _require_string(payload.get("sha"), "Hugging Face model sha")
+    revision = _require_string(payload.get("sha"), "Hugging Face model sha")
+    if not _REVISION_PATTERN.fullmatch(revision):
+        raise ModelCheckError(
+            f"Hugging Face model {repo} returned an invalid revision: {revision!r}"
+        )
+    return revision
 
 
 def _validate_tree_url(candidate_url: str, expected_tree_url: str) -> None:
@@ -723,11 +729,22 @@ def _build_zerotts_artifact_comparison(
             if flat_candidate.is_file():
                 candidate = flat_candidate
         if candidate.is_file():
-            actual_sha = _sha256_file(candidate) if hash_artifacts else None
+            if local_sha256 is None:
+                raise ModelCheckError(
+                    f"Bundled ZeroTTS artifact {remote_name!r} has no pinned SHA-256 digest"
+                )
+            if hash_artifacts:
+                actual_sha = _sha256_file(candidate)
+                if actual_sha != local_sha256:
+                    raise ModelCheckError(
+                        f"Bundled ZeroTTS artifact {remote_name!r} does not match its pinned "
+                        f"SHA-256 digest ({actual_sha} != {local_sha256}); refusing to "
+                        "self-certify a modified local asset"
+                    )
             return ArtifactComparison(
                 remote_name=remote_name,
                 local_sha256=local_sha256,
-                remote_sha256=actual_sha,
+                remote_sha256=local_sha256 if hash_artifacts else None,
                 remote_present=True,
             )
         return ArtifactComparison(

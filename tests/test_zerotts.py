@@ -37,6 +37,7 @@ from wyoming_vietnamese.cpu import (
     get_host_cpu_flags,
     get_supported_variants_for_host,
 )
+from wyoming_vietnamese.errors import SynthesisOutputLimitError, SynthesisTextLimitError
 from wyoming_vietnamese.tts import warm_up_tts
 from wyoming_vietnamese.tts_model import ZEROTTS_VOICES
 from wyoming_vietnamese.zerotts_engine import (
@@ -929,13 +930,58 @@ def test_zerotts_engine_lifecycle_and_inference(tmp_path: Path) -> None:
 
 
 def test_zerotts_engine_generation_stops_at_maximum_frames(tmp_path: Path) -> None:
-    """Test synthesis stops at maximum frames without EOA and closes decoder."""
+    """Test synthesis surfaces truncation when the frame ceiling is reached without EOA."""
     engine, fake_cdll, fake_stream_decoder, _ = _setup_engine_fixture(tmp_path)
-    chunks = list(engine.infer_stream("Xin chào Việt Nam", voice="Mai Chi"))
-    assert chunks
+    with pytest.raises(SynthesisOutputLimitError):
+        list(engine.infer_stream("Xin chào Việt Nam", voice="Mai Chi"))
     assert fake_cdll.zerotts_frame.call_count == 1500
     assert fake_cdll.zerotts_advance.call_count == 1500
     assert fake_stream_decoder.close.called
+
+
+def test_zerotts_engine_token_limit_and_segmentation(tmp_path: Path) -> None:
+    """Test token-aware text checks and segmentation stay inside native bounds."""
+    engine, _, _, fake_tokenizer = _setup_engine_fixture(tmp_path)
+    fake_tokenizer.encode_body.side_effect = lambda text: [1] * (len(text.split()) * 2)
+
+    assert engine.text_token_count("một hai") == 4
+    assert engine.max_text_tokens == 510
+    long_text = " ".join(["từ"] * 300)
+    segments = engine.split_text_by_tokens(long_text)
+    assert len(segments) > 1
+    assert all(engine.text_token_count(segment) <= engine.max_text_tokens for segment in segments)
+    assert " ".join(segments) == long_text
+
+    with pytest.raises(SynthesisTextLimitError):
+        engine._prepare_synthesis_session(long_text, None, None)
+
+
+def test_zerotts_engine_splits_overlong_single_word(tmp_path: Path) -> None:
+    """Test a single over-budget token span is split at character boundaries."""
+    engine, _, _, fake_tokenizer = _setup_engine_fixture(tmp_path)
+    fake_tokenizer.encode_body.side_effect = lambda text: [1] * len(text)
+
+    segments = engine.split_text_by_tokens("x" * 250, max_tokens=100)
+    assert len(segments) == 3
+    assert "".join(segments) == "x" * 250
+    assert all(engine.text_token_count(segment) <= 100 for segment in segments)
+
+
+def test_zerotts_engine_fallback_token_count_does_not_truncate(tmp_path: Path) -> None:
+    """Test token counting without encode_body does not silently clamp long text."""
+    engine, _, _, fake_tokenizer = _setup_engine_fixture(tmp_path)
+    fake_tokenizer.encode_body = None
+    fake_tokenizer.side_effect = lambda text, max_length=512: np.asarray(
+        [1] + [2] * min(len(text), max_length) + [3], dtype=np.int32
+    )
+
+    text = "x" * 600
+    assert engine.text_token_count(text) > engine.max_text_tokens
+
+    segments = engine.split_text_by_tokens(text)
+    assert len(segments) > 1
+    assert "".join(segments) == text
+    assert all(engine.text_token_count(segment) <= engine.max_text_tokens for segment in segments)
 
 
 @pytest.mark.parametrize("num_codebooks", [1, 8])
@@ -1032,6 +1078,14 @@ def test_zerotts_engine_non_pipelined_synthesis(
     mock_thread = Mock()
     monkeypatch.setattr(threading, "Thread", mock_thread)
 
+    def fake_frame_eoa(*args: object, **kwargs: object) -> int:
+        eoa_arg = args[6] if len(args) > 6 else kwargs.get("is_eoa")
+        eoa_target = getattr(eoa_arg, "_obj", eoa_arg)
+        if isinstance(eoa_target, ctypes.c_int):
+            eoa_target.value = 1
+        return 0
+
+    fake_cdll.zerotts_frame.side_effect = fake_frame_eoa
     chunks = list(engine.infer_stream("Xin chào Việt Nam", voice="Mai Chi"))
     assert chunks
     mock_thread.assert_not_called()
@@ -3758,7 +3812,16 @@ def test_zerotts_engine_inplace_tensor_reuse_and_zero_copy_buffers(tmp_path: Pat
     assert audio_from_list.shape == (960,)
 
     # 5. Non-pipelined streaming uses zero-copy chunk buffers
-    engine_seq, _, fake_seq_stream, _ = _setup_engine_fixture(tmp_path, num_threads=1)
+    engine_seq, fake_seq_cdll, fake_seq_stream, _ = _setup_engine_fixture(tmp_path, num_threads=1)
+
+    def fake_seq_frame_eoa(*args: object, **kwargs: object) -> int:
+        eoa_arg = args[6] if len(args) > 6 else kwargs.get("is_eoa")
+        eoa_target = getattr(eoa_arg, "_obj", eoa_arg)
+        if isinstance(eoa_target, ctypes.c_int):
+            eoa_target.value = 1
+        return 0
+
+    fake_seq_cdll.zerotts_frame.side_effect = fake_seq_frame_eoa
     chunks_seq = list(engine_seq.infer_stream("Xin chào Việt Nam", voice="Mai Chi"))
     assert chunks_seq
     assert fake_seq_stream.close.called

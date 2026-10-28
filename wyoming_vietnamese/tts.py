@@ -36,6 +36,7 @@ from zerotts.text_norm import normalize_vi_text
 
 from .cache import ResultCache
 from .const import (
+    DEFAULT_MAX_TTS_STREAM_SECONDS,
     DEFAULT_TTS_ENGINE,
     NGHITTS_REPO_URL,
     PROGRAM_NAME,
@@ -43,6 +44,7 @@ from .const import (
     ZEROTTS_REPO_URL,
     NghiTtsAudio,
     NghiTtsFile,
+    RequestLimit,
     Timeout,
     TtsAudio,
     TtsEngine,
@@ -53,6 +55,7 @@ from .const import (
     ZeroTtsVariant,
 )
 from .cpu import resolve_cpu_threads
+from .errors import SynthesisOutputLimitError
 from .inference import run_inference
 from .protocol import ProtocolWriteError, SafeAsyncEventHandler, is_vietnamese_language
 from .tts_model import (
@@ -77,6 +80,7 @@ _LOGGER = logging.getLogger(__name__)
 
 _ERR_AT_LEAST_ONE_VOICE = "At least one TTS voice must be configured"
 _ERR_TEXT_TOO_LONG = "Synthesis text exceeds the configured limit"
+_NGHI_CLOSE_TIMEOUT_SECONDS = 5.0
 
 
 class TTSEngine(Protocol):
@@ -123,6 +127,24 @@ class _NormalizedTTSEngine(Protocol):
         ...
 
 
+@runtime_checkable
+class _TokenLimitedTTSEngine(Protocol):
+    """Optional engine surface for token-bounded synthesis segmentation."""
+
+    @property
+    def max_text_tokens(self) -> int:
+        """Maximum body token count accepted by the engine."""
+        ...
+
+    def text_token_count(self, text: str) -> int:
+        """Return the body token count for normalized text."""
+        ...
+
+    def split_text_by_tokens(self, text: str, max_tokens: int | None = None) -> tuple[str, ...]:
+        """Split normalized text into engine-safe segments."""
+        ...
+
+
 class _SherpaGeneratedAudio(Protocol):
     """Audio result returned by Sherpa-ONNX offline synthesis."""
 
@@ -154,14 +176,70 @@ class _NghiDone:
 _NGHI_DONE = _NghiDone()
 
 
+class _NghiWorkerGuard:
+    """Coordinate the native NghiTTS worker shared by one or more voice engines."""
+
+    def __init__(self) -> None:
+        """Initialize an empty worker slot."""
+        self._lock = threading.Lock()
+        self._worker: _NghiAudioIterator | None = None
+
+    def _raise_if_busy_locked(self) -> None:
+        """Reject a start while the tracked worker is still running."""
+        worker = self._worker
+        if worker is None:
+            return
+        if worker.is_alive():
+            raise RuntimeError("Previous NghiTTS inference worker is still running")
+        self._worker = None
+
+    def ensure_idle(self) -> None:
+        """Reject native synthesis while an earlier worker is still running."""
+        with self._lock:
+            self._raise_if_busy_locked()
+
+    def start(self, worker: _NghiAudioIterator) -> None:
+        """Register a worker before its native thread starts."""
+        with self._lock:
+            self._raise_if_busy_locked()
+            self._worker = worker
+
+    def release(self, worker: _NghiAudioIterator) -> None:
+        """Forget a worker after its native thread exits."""
+        with self._lock:
+            if self._worker is worker:
+                self._worker = None
+
+    def take(self) -> _NghiAudioIterator | None:
+        """Remove and return the tracked worker during a guard hand-off."""
+        with self._lock:
+            worker = self._worker
+            self._worker = None
+            return worker
+
+    def adopt(self, worker: _NghiAudioIterator) -> None:
+        """Take ownership of a live worker from another guard."""
+        with self._lock:
+            self._raise_if_busy_locked()
+            self._worker = worker
+
+
 class _NghiAudioIterator(Iterator[np.ndarray]):
     """Bridge Sherpa's native callback API to a bounded blocking iterator."""
 
-    def __init__(self, tts: _SherpaOfflineTts, text: str, speaker_id: int) -> None:
+    def __init__(
+        self,
+        tts: _SherpaOfflineTts,
+        text: str,
+        speaker_id: int,
+        *,
+        guard: _NghiWorkerGuard | None = None,
+    ) -> None:
         """Start one native synthesis worker and expose its sentence chunks."""
         self._tts = tts
         self._text = text
         self._speaker_id = speaker_id
+        self._guard = guard
         self._queue: queue.Queue[np.ndarray | Exception | _NghiDone] = queue.Queue(maxsize=2)
         self._stop = threading.Event()
         self._emitted_audio = False
@@ -171,6 +249,8 @@ class _NghiAudioIterator(Iterator[np.ndarray]):
             name="NghiTTS inference",
             daemon=True,
         )
+        if self._guard is not None:
+            self._guard.start(self)
         self._thread.start()
 
     def __iter__(self) -> _NghiAudioIterator:
@@ -226,6 +306,8 @@ class _NghiAudioIterator(Iterator[np.ndarray]):
             self._put(err)
         finally:
             self._put(_NGHI_DONE)
+            if self._guard is not None:
+                self._guard.release(self)
 
     def close(self) -> None:
         """Stop after the current native unit and release queued callback chunks."""
@@ -233,10 +315,25 @@ class _NghiAudioIterator(Iterator[np.ndarray]):
             return
         self._closed = True
         self._stop.set()
-        while self._thread.is_alive():
+        deadline = monotonic() + _NGHI_CLOSE_TIMEOUT_SECONDS
+        while self._thread.is_alive() and monotonic() < deadline:
             with suppress(queue.Empty):
                 self._queue.get_nowait()
             self._thread.join(timeout=0.1)
+        if self._thread.is_alive():
+            _LOGGER.warning(
+                "NghiTTS inference worker did not stop within %.1f seconds",
+                _NGHI_CLOSE_TIMEOUT_SECONDS,
+            )
+
+    def is_alive(self) -> bool:
+        """Return whether the native synthesis worker is still running."""
+        return self._thread.is_alive()
+
+    def join(self, timeout: float | None = None) -> bool:
+        """Wait for native worker termination and report whether it exited."""
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
 
 
 class NghiTTSEngine:
@@ -249,6 +346,7 @@ class NghiTTSEngine:
         *,
         normalize_fn: Callable[[str], str] | None = normalize_vi_text,
         max_text_chars: int | None = None,
+        worker_guard: _NghiWorkerGuard | None = None,
     ) -> None:
         """Validate the native model contract and expose one named preset voice."""
         if tts.sample_rate != NghiTtsAudio.SAMPLE_RATE:
@@ -258,6 +356,7 @@ class NghiTTSEngine:
         self._tts: _SherpaOfflineTts | None = tts
         self._normalize_fn = normalize_fn
         self._max_text_chars = max_text_chars
+        self._worker_guard = worker_guard if worker_guard is not None else _NghiWorkerGuard()
         self.voice = voice
         self.sample_rate = tts.sample_rate
         self.chunks_are_sentences: bool = True
@@ -276,6 +375,20 @@ class NghiTTSEngine:
         if voice not in (None, self.voice.name):
             raise ValueError(f"Unsupported NghiTTS voice: {voice!r}")
         return 0
+
+    def _rebind_worker_guard(self, guard: _NghiWorkerGuard) -> None:
+        """Route this engine through a wrapper-wide native worker guard."""
+        previous = self._worker_guard
+        if previous is guard:
+            return
+        worker = previous.take()
+        if worker is not None and worker.is_alive():
+            try:
+                guard.adopt(worker)
+            except RuntimeError:
+                previous.adopt(worker)
+                raise
+        self._worker_guard = guard
 
     def infer_stream(
         self,
@@ -298,11 +411,9 @@ class NghiTTSEngine:
                 f"Normalized synthesis text exceeds the limit of {self._max_text_chars} characters "
                 f"({len(text)} chars)"
             )
-        return _NghiAudioIterator(
-            self._native_tts(),
-            text,
-            self._speaker_id(voice),
-        )
+        native_tts = self._native_tts()
+        speaker_id = self._speaker_id(voice)
+        return _NghiAudioIterator(native_tts, text, speaker_id, guard=self._worker_guard)
 
     def normalize(self, text: str, *, voice: str | None = None) -> str:
         """Return text after this engine's configured normalizer."""
@@ -310,7 +421,7 @@ class NghiTTSEngine:
         return text if self._normalize_fn is None else self._normalize_fn(text)
 
     def close(self) -> None:
-        """Release the native model reference."""
+        """Release the native model reference while retaining any live worker."""
         self._tts = None
 
 
@@ -328,6 +439,9 @@ class MultiVoiceTTSEngine:
         self._engines = {engine.voice.name: engine for engine in engine_list}
         if len(self._engines) != len(engine_list):
             raise ValueError("Configured TTS voices must have unique names")
+        self._worker_guard = _NghiWorkerGuard()
+        for engine in engine_list:
+            engine._rebind_worker_guard(self._worker_guard)
         self._default_engine = engine_list[0]
         self.sample_rate = self._default_engine.sample_rate
         self.chunks_are_sentences: bool = True
@@ -404,9 +518,14 @@ class LazyMultiVoiceTTSEngine:
         self._max_text_chars = max_text_chars
         self._min_replacement_interval = min_replacement_interval
         self._last_replacement_monotonic: float = 0.0
-        # Most recently used voice is at the end.
+        # Most recently used voice is at the end. The caller passes startup voices in
+        # most-recent-first order, so insert them in reverse to keep the actual MRU entry
+        # at the end and the least recently used entry at the front.
         self._engines: OrderedDict[str, NghiTTSEngine] = OrderedDict()
+        self._worker_guard = _NghiWorkerGuard()
         for engine in engine_list:
+            engine._rebind_worker_guard(self._worker_guard)
+        for engine in reversed(engine_list):
             self._engines[engine.voice.name] = engine
         self._default_voice_name = all_voices[0].name
         self.sample_rate: int = (
@@ -427,6 +546,7 @@ class LazyMultiVoiceTTSEngine:
         if voice_spec is None:
             raise ValueError(f"Unsupported NghiTTS voice: {name!r}")
 
+        self._worker_guard.ensure_idle()
         now = monotonic()
         if (
             len(self._engines) >= self._max_loaded
@@ -447,6 +567,7 @@ class LazyMultiVoiceTTSEngine:
         )
         if not isinstance(engine, NghiTTSEngine):
             raise TypeError("initialize_tts returned an incompatible engine")
+        engine._rebind_worker_guard(self._worker_guard)
 
         while len(self._engines) >= self._max_loaded:
             evicted_name, evicted_engine = self._engines.popitem(last=False)
@@ -816,6 +937,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
         inference_executor: Executor | None = None,
         voice_usage_store: RecentVoiceStore | None = None,
         cache_namespace: bytes = b"",
+        max_request_seconds: float = DEFAULT_MAX_TTS_STREAM_SECONDS,
     ) -> None:
         """Initialize per-connection state around the shared TTS engine."""
         super().__init__(
@@ -832,6 +954,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
         self.voice_usage_store = voice_usage_store
         self.cache_namespace = cache_namespace
         self.max_text_chars = max_text_chars
+        self.max_request_seconds = max_request_seconds
         self.queue_timeout = queue_timeout
         self.sample_rate = get_tts_sample_rate(tts)
         self.sentence_silence_ms = sentence_silence_ms
@@ -839,6 +962,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
         self.paragraph_silence_ms = paragraph_silence_ms
         self.chunks_are_sentences = bool(getattr(tts, "chunks_are_sentences", True))
         self.preset_voices = dict(getattr(tts, "_preset_voices", {}))
+        self.default_voice_name = next(iter(self.preset_voices), None)
         self.stream_voice_name: str | None
         # Survives _reset_stream() so a late compatibility request cannot restart a
         # lifecycle that already ended. Reset only when the connection is released.
@@ -955,6 +1079,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
         self._reset_stream()
         self.is_streaming = True
         self.stream_started_at = perf_counter()
+        self.stream_deadline = self.stream_started_at + self.max_request_seconds
         self.stream_voice_name = voice_name
         await self._record_voice_usage(voice_name)
         _LOGGER.debug(
@@ -968,7 +1093,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
         """Persist the requested voice or current engine default off the event loop."""
         if self.voice_usage_store is None:
             return
-        selected_voice = voice_name or next(iter(self.preset_voices), None)
+        selected_voice = voice_name or self.default_voice_name
         if selected_voice is not None:
             await asyncio.to_thread(self.voice_usage_store.record, selected_voice)
 
@@ -989,6 +1114,21 @@ class TTSEventHandler(SafeAsyncEventHandler):
                 "Malformed synthesis stream chunk",
                 "invalid-request",
             )
+
+        if self._stream_deadline_exceeded():
+            return await self._fail_stream(
+                "Synthesis stream exceeded the configured request deadline",
+                "request-timeout",
+            )
+        if not stream_chunk.text.strip():
+            self.stream_empty_events += 1
+            if self.stream_empty_events > RequestLimit.MAX_EMPTY_EVENTS:
+                return await self._fail_stream(
+                    "Synthesis stream made no progress",
+                    "too-many-empty-events",
+                )
+        else:
+            self.stream_empty_events = 0
 
         self.stream_chunk_count += 1
         raw_stream_chars = self.stream_text_chars + len(stream_chunk.text)
@@ -1054,6 +1194,11 @@ class TTSEventHandler(SafeAsyncEventHandler):
             return await self._fail_stream(
                 "Synthesis stop received before stream start",
                 "invalid-event-order",
+            )
+        if self._stream_deadline_exceeded():
+            return await self._fail_stream(
+                "Synthesis stream exceeded the configured request deadline",
+                "request-timeout",
             )
 
         stop_started = perf_counter()
@@ -1231,9 +1376,19 @@ class TTSEventHandler(SafeAsyncEventHandler):
             )
         return perf_counter() - write_started
 
+    def _effective_voice_name(self, voice_name: str | None) -> str | None:
+        """Resolve a request selector to the voice the engine will actually use."""
+        return voice_name or self.default_voice_name
+
+    def _token_segments(self, text: str) -> tuple[str, ...]:
+        """Split text when the engine exposes a token budget, otherwise return it whole."""
+        if not text or not isinstance(self.tts, _TokenLimitedTTSEngine):
+            return (text,)
+        return self.tts.split_text_by_tokens(text, self.tts.max_text_tokens)
+
     def _cache_key(self, text: str, voice_name: str | None) -> bytes:
-        """Hash text and voice without retaining request text in cache keys."""
-        voice_bytes = (voice_name or "").encode("utf-8")
+        """Hash text and the resolved effective voice without retaining request text."""
+        voice_bytes = (self._effective_voice_name(voice_name) or "").encode("utf-8")
         digest = sha256()
         digest.update(len(voice_bytes).to_bytes(4, "big"))
         digest.update(voice_bytes)
@@ -1249,9 +1404,58 @@ class TTSEventHandler(SafeAsyncEventHandler):
         send_start: bool = True,
         send_stop: bool = True,
         separator: str = "",
+        _allow_token_split: bool = True,
     ) -> _TTSProduction | None:
         """Pipeline inference and bounded network output around the shared lock."""
         segment_started = perf_counter()
+        audio_started = not send_start
+        if _allow_token_split and isinstance(self.tts, _TokenLimitedTTSEngine):
+            try:
+                token_segments = await run_inference(
+                    self.inference_executor,
+                    self._token_segments,
+                    text,
+                )
+            except Exception:
+                _LOGGER.exception(
+                    "TTS token segmentation failed: segment=%d text_chars=%d",
+                    self.stream_segment_count if self.is_streaming else 1,
+                    len(text),
+                )
+                with suppress(ProtocolWriteError):
+                    await self._write_audio_failure(
+                        "Speech synthesis failed",
+                        "inference-failed",
+                        audio_started=audio_started,
+                    )
+                return None
+            if len(token_segments) > 1:
+                aggregate = _TTSProduction()
+                aggregate.inference_api = "token-segments"
+                for index, token_segment in enumerate(token_segments):
+                    is_last = index == len(token_segments) - 1
+                    part = await self._synthesize(
+                        token_segment,
+                        voice_name,
+                        send_start=send_start and index == 0,
+                        send_stop=send_stop and is_last,
+                        separator=separator if is_last else "",
+                        _allow_token_split=False,
+                    )
+                    if part is None:
+                        return None
+                    aggregate.total_bytes += part.total_bytes
+                    aggregate.engine_chunk_count += part.engine_chunk_count
+                    aggregate.engine_seconds += part.engine_seconds
+                    aggregate.pcm_seconds += part.pcm_seconds
+                    aggregate.cleanup_seconds += part.cleanup_seconds
+                _LOGGER.debug(
+                    "TTS step=token-segments segment_count=%d text_chars=%d total_bytes=%d",
+                    len(token_segments),
+                    len(text),
+                    aggregate.total_bytes,
+                )
+                return aggregate
         segment_number = self.stream_segment_count if self.is_streaming else 1
         _LOGGER.debug(
             "TTS step=segment-start segment=%d streaming=%s text_chars=%d voice=%s "
@@ -1264,7 +1468,6 @@ class TTSEventHandler(SafeAsyncEventHandler):
             send_stop,
         )
         lock_acquired = False
-        audio_started = not send_start
         production = _TTSProduction()
         output_chunk_count = 0
         pause_bytes = 0
@@ -1472,6 +1675,32 @@ class TTSEventHandler(SafeAsyncEventHandler):
                     abort_production,
                 )
             raise
+        except SynthesisOutputLimitError:
+            if (
+                producer is not None
+                and output_queue is not None
+                and output_slots is not None
+                and abort_production is not None
+            ):
+                await self._abort_audio_producer(
+                    producer,
+                    output_queue,
+                    output_slots,
+                    abort_production,
+                )
+            _LOGGER.warning(
+                "TTS output exceeded the engine duration limit: segment=%d api=%s audio_bytes=%d",
+                segment_number,
+                production.inference_api,
+                production.total_bytes,
+            )
+            with suppress(ProtocolWriteError):
+                await self._write_audio_failure(
+                    "Speech synthesis exceeded the engine duration limit",
+                    "audio-too-long",
+                    audio_started=audio_started,
+                )
+            return None
         except Exception:
             if (
                 producer is not None
@@ -1565,6 +1794,52 @@ class TTSEventHandler(SafeAsyncEventHandler):
     ) -> None:
         """Run engine iteration under the inference lock and fill a bounded queue."""
         iterator: Iterator[np.ndarray] | None = None
+        pending_inference: asyncio.Future[Any] | None = None
+        cancelled = False
+
+        async def run_native[T](func: Callable[..., T], /, *args: object) -> T:
+            """Run one executor call without cancelling the underlying native work."""
+            nonlocal pending_inference
+            future = asyncio.ensure_future(run_inference(self.inference_executor, func, *args))
+            pending_inference = future
+            try:
+                result = await asyncio.shield(future)
+            except Exception:
+                pending_inference = None
+                raise
+            pending_inference = None
+            return result
+
+        async def drain_native() -> Any:
+            """Wait through cancellation until the active native call finishes."""
+            nonlocal pending_inference, cancelled
+            future = pending_inference
+            if future is None:
+                return None
+            while not future.done():
+                try:
+                    await asyncio.shield(future)
+                except asyncio.CancelledError:
+                    cancelled = True
+                    continue
+                except Exception:
+                    break
+            pending_inference = None
+            if future.cancelled():
+                return None
+            error = future.exception()
+            if error is not None:
+                _LOGGER.debug("Native inference failed during cleanup: %s", error)
+                return None
+            return future.result()
+
+        async def close_iterator(candidate: object) -> None:
+            """Close an engine iterator that survived cancellation."""
+            close = getattr(candidate, "close", None)
+            if callable(close):
+                with suppress(Exception):
+                    await run_native(close)
+
         try:
             production.inference_api = "infer_stream"
             _LOGGER.debug("TTS step=inference-start api=%s", production.inference_api)
@@ -1578,17 +1853,13 @@ class TTSEventHandler(SafeAsyncEventHandler):
                 return self.tts.infer_stream(text, voice=voice_name)
 
             try:
-                iterator = await run_inference(
-                    self.inference_executor,
-                    infer_normalized,
-                )
+                iterator = await run_native(infer_normalized)
             finally:
                 production.engine_seconds += perf_counter() - engine_started
 
             while not abort.is_set():
                 worker_step_started = perf_counter()
-                has_chunk, audio_bytes, engine_seconds, pcm_seconds = await run_inference(
-                    self.inference_executor,
+                has_chunk, audio_bytes, engine_seconds, pcm_seconds = await run_native(
                     _next_pcm_chunk,
                     iterator,
                 )
@@ -1644,18 +1915,19 @@ class TTSEventHandler(SafeAsyncEventHandler):
         finally:
             cleanup_started = perf_counter()
             try:
-                if iterator is not None:
-                    close = getattr(iterator, "close", None)
-                    if callable(close):
-                        with suppress(Exception):
-                            await run_inference(self.inference_executor, close)
+                pending_result = await drain_native()
+                candidate = iterator if iterator is not None else pending_result
+                if isinstance(candidate, Iterator):
+                    await close_iterator(candidate)
             finally:
-                # Awaiting above re-raises CancelledError if this task is cancelled, so
-                # the lock release and the completion sentinel must not sit behind it:
-                # skipping them would strand the shared lock and the waiting consumer.
+                await drain_native()
+                # The executor future can outlive task cancellation. Awaiting it above
+                # keeps the shared lock held until no native call can still be running.
                 production.cleanup_seconds = perf_counter() - cleanup_started
                 self.inference_lock.release()
                 output_queue.put_nowait(None)
+        if cancelled:
+            raise asyncio.CancelledError
 
     @staticmethod
     def _drain_audio_queue(
@@ -1681,8 +1953,23 @@ class TTSEventHandler(SafeAsyncEventHandler):
         """Stop queueing, preserve native-call cleanup, and consume task failures."""
         abort.set()
         self._drain_audio_queue(output_queue, output_slots)
-        with suppress(Exception):
-            await asyncio.shield(producer)
+        try:
+            async with asyncio.timeout(Timeout.ABORT):
+                with suppress(Exception):
+                    await asyncio.shield(producer)
+        except TimeoutError:
+            _LOGGER.warning(
+                "TTS producer did not stop within %.1f seconds; cancelling it",
+                Timeout.ABORT,
+            )
+            producer.cancel()
+            producer.add_done_callback(lambda task: None if task.cancelled() else task.exception())
+            done, _ = await asyncio.wait({producer}, timeout=Timeout.ABORT)
+            if not done:
+                _LOGGER.warning(
+                    "TTS producer is still waiting on native inference; "
+                    "detaching while it holds the inference lock"
+                )
         self._drain_audio_queue(output_queue, output_slots)
 
     async def _write_audio_failure(self, text: str, code: str, *, audio_started: bool) -> None:
@@ -1731,16 +2018,22 @@ class TTSEventHandler(SafeAsyncEventHandler):
         self._reset_stream()
         return False
 
+    def _stream_deadline_exceeded(self) -> bool:
+        """Return whether the configured streaming request deadline has passed."""
+        return self.stream_deadline is not None and perf_counter() > self.stream_deadline
+
     def _reset_stream(self) -> None:
         """Release all per-connection streaming text state."""
         self.is_streaming = False
         self.stream_audio_started = False
         self.stream_started_at: float | None = None
+        self.stream_deadline: float | None = None
         self.stream_first_audio_at: float | None = None
         self.stream_chunk_count = 0
         self.stream_segment_count = 0
         self.stream_text_chars = 0
         self.stream_normalized_chars = 0
+        self.stream_empty_events = 0
         self.stream_audio_bytes = 0
         self.stream_queue_seconds = 0.0
         self.stream_engine_seconds = 0.0
@@ -1840,9 +2133,24 @@ def warm_up_tts(
     )
 
 
+def _zerotts_model_label(model_name: str | None) -> str:
+    """Return a compact discovery label for the active ZeroTTS GGUF model."""
+    if not model_name:
+        return "Q8_0"
+    normalized = model_name.lower()
+    if "q4" in normalized or "hybrid" in normalized:
+        return "Q4-Hybrid"
+    if "q8" in normalized:
+        return "Q8_0"
+    return Path(model_name).name
+
+
 def get_tts_info(
     voices: AnyVoiceSpec | Iterable[AnyVoiceSpec],
     engine: str = DEFAULT_TTS_ENGINE,
+    *,
+    zerotts_model_name: str | None = None,
+    zerotts_quality: str | None = None,
 ) -> Info:
     """Build Wyoming discovery information with the selected engine's provider metadata."""
     voice_specs = tuple(voices) if isinstance(voices, Iterable) else (voices,)
@@ -1853,13 +2161,17 @@ def get_tts_info(
             name="ZeroWeight AI",
             url=ZEROTTS_REPO_URL,
         )
-        description = f"{TtsProvider.ZEROTTS} Vietnamese (GGML Q8_0)"
+        description = (
+            f"{TtsProvider.ZEROTTS} Vietnamese (GGML {_zerotts_model_label(zerotts_model_name)})"
+        )
+        version = zerotts_quality or "auto"
     else:
         attribution = Attribution(
             name="nghimestudio",
             url=NGHITTS_REPO_URL,
         )
         description = f"{TtsProvider.NGHITTS} Vietnamese (Sherpa-ONNX)"
+        version = "medium"
     return Info(
         tts=[
             TtsProgram(
@@ -1867,7 +2179,7 @@ def get_tts_info(
                 description=description,
                 attribution=attribution,
                 installed=True,
-                version="medium",
+                version=version,
                 # Home Assistant currently uses the description field as the display name,
                 # so we set this field to voice.name. Update it if the logic changes in the future.
                 voices=[
@@ -1876,7 +2188,7 @@ def get_tts_info(
                         description=voice.name,
                         attribution=attribution,
                         installed=True,
-                        version="medium",
+                        version=version,
                         languages=[VIETNAMESE_LANGUAGE],
                     )
                     for voice in voice_specs

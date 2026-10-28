@@ -426,6 +426,24 @@ def test_structure_stt_copies_pinned_graphs_and_generates_tokens(
     assert len(paths) == 4
 
 
+def test_stt_layout_ready_requires_matching_token_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test the STT token table marker detects tampering and tokenizer changes."""
+    monkeypatch.setattr(download_module, "_is_verified_file", lambda *_args: True)
+    dest = tmp_path / "stt"
+    dest.mkdir()
+    tokens = dest / "tokens.txt"
+    tokens.write_text("token\n", encoding="utf-8")
+    assert download_module._stt_layout_ready(dest, ZIPFORMER_MODEL) is False
+
+    download_module._record_stt_tokens(dest, ZIPFORMER_MODEL.tokenizer.sha256, tokens)
+    assert download_module._stt_layout_ready(dest, ZIPFORMER_MODEL) is True
+
+    tokens.write_text("tampered\n", encoding="utf-8")
+    assert download_module._stt_layout_ready(dest, ZIPFORMER_MODEL) is False
+
+
 def test_structure_stt_rejects_a_missing_pinned_artifact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1650,6 +1668,37 @@ def test_download_models_zerotts_fallback_to_existing_when_download_fails(
     assert paths.zerotts_resolution.gguf_path == existing_q8
 
 
+def test_download_models_propagates_stt_structure_failure_before_zerotts_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test an STT layout failure is not masked by an available ZeroTTS fallback."""
+    stt, tts_snapshot, tts_spec, test_voice = _setup_zerotts_download_test(tmp_path, monkeypatch)
+    monkeypatch.setattr("wyoming_vietnamese.download.ZEROTTS_MODEL", tts_spec)
+
+    # Leave a verified Q8 fallback on disk while requesting Q4 so the ZeroTTS sync
+    # path would otherwise be able to swallow the STT structuring failure.
+    tts_dest = tmp_path / "models" / TTS_DIR / TtsEngine.ZEROTTS
+    _structure_zerotts_files(tts_snapshot, tts_dest, (test_voice,), tts_spec)
+
+    sync = Mock(side_effect=[stt, RuntimeError("Hugging Face network failure")])
+    monkeypatch.setattr("wyoming_vietnamese.download._sync_repo", sync)
+    monkeypatch.setattr("wyoming_vietnamese.download.setup_hf_environment", Mock())
+    structure_stt = Mock(side_effect=RuntimeError("STT layout failed"))
+    monkeypatch.setattr("wyoming_vietnamese.download._structure_stt_files", structure_stt)
+
+    with pytest.raises(RuntimeError, match="STT layout failed"):
+        download_models(
+            tmp_path / "cache",
+            tmp_path / "models",
+            (test_voice,),
+            tts_engine=TtsEngine.ZEROTTS,
+            zerotts_quant=ZeroTtsFile.Q4_HYBRID_GGUF_MODEL,
+        )
+
+    structure_stt.assert_called_once()
+    assert sync.call_count == 1
+
+
 def test_download_models_zerotts_fallback_fails_when_existing_model_corrupted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2652,6 +2701,143 @@ def test_create_q4_hybrid_cli_tool(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     run_hybrid_cli(["--input", str(src)], src.parent / "zerotts-q4-hybrid.gguf")
 
 
+def test_cleanup_stale_temporary_files_skips_live_processes(tmp_path: Path) -> None:
+    """Test stale PID-suffixed model temporaries are removed without touching live owners."""
+    stale = tmp_path / "models" / ".encoder.onnx.999999.tmp"
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"stale")
+    live = tmp_path / "models" / ".decoder.onnx.1.tmp"
+    live.write_bytes(b"live")
+    unrelated = tmp_path / "models" / "keep.tmp"
+    unrelated.write_bytes(b"keep")
+
+    download_module._cleanup_stale_temporary_files(tmp_path / "models")
+
+    assert not stale.exists()
+    assert live.exists()
+    assert unrelated.exists()
+
+
+def test_download_models_skips_remote_when_structured_layouts_are_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test verified local layouts avoid remote resolution and restructuring."""
+    voice = get_voice("chieu-thanh")
+    sync_repo = Mock(side_effect=AssertionError("remote sync must not run"))
+    structure_stt = Mock(side_effect=AssertionError("STT restructuring must not run"))
+    monkeypatch.setattr(download_module, "_stt_layout_ready", lambda *_args: True)
+    monkeypatch.setattr(download_module, "_sync_repo", sync_repo)
+    monkeypatch.setattr(download_module, "_structure_stt_files", structure_stt)
+    monkeypatch.setattr(download_module, "_sync_nghitts_model", Mock(return_value=tmp_path))
+    monkeypatch.setattr(download_module, "_structure_nghitts_files", Mock(return_value=[]))
+
+    result = download_models(
+        cache_dir=tmp_path / "cache",
+        download_dir=tmp_path / "models",
+        tts_voices=(voice,),
+        tts_engine=TtsEngine.NGHITTS,
+        stt_engine=SttEngine.ZIPFORMER,
+    )
+
+    sync_repo.assert_not_called()
+    structure_stt.assert_not_called()
+    assert result[STT_DIR] == tmp_path / "models" / STT_DIR / DEFAULT_STT_ENGINE
+    assert result[TTS_DIR] == tmp_path / "models" / TTS_DIR / TtsEngine.NGHITTS
+
+
+def test_download_models_skips_zerotts_remote_when_target_is_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test a verified ZeroTTS target is reused without any remote check."""
+    voice = get_voice("maichi", engine=TtsEngine.ZEROTTS)
+    resolution = download_module.ZeroTtsModelResolution(
+        spec=download_module.ZEROTTS_MODEL,
+        gguf_path=tmp_path / "model.gguf",
+    )
+    sync_repo = Mock(side_effect=AssertionError("remote sync must not run"))
+    monkeypatch.setattr(download_module, "_stt_layout_ready", lambda *_args: True)
+    monkeypatch.setattr(download_module, "_sync_repo", sync_repo)
+    monkeypatch.setattr(download_module, "resolve_zerotts_model", Mock(return_value=resolution))
+    monkeypatch.setattr(
+        download_module,
+        "_resolve_existing_zerotts_target",
+        Mock(return_value=resolution),
+    )
+
+    result = download_models(
+        cache_dir=tmp_path / "cache",
+        download_dir=tmp_path / "models",
+        tts_voices=(voice,),
+        tts_engine=TtsEngine.ZEROTTS,
+        stt_engine=SttEngine.ZIPFORMER,
+        zerotts_quant="auto",
+    )
+
+    sync_repo.assert_not_called()
+    assert result.zerotts_resolution == resolution
+
+
+def test_download_models_structures_int8_codec_for_existing_hybrid_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test an existing hybrid target receives the bundled INT8 codec without a sync."""
+    voice = get_voice("maichi", engine=TtsEngine.ZEROTTS)
+    base_spec = download_module.ZEROTTS_Q4_MODEL
+    int8_content = b"BUNDLED_INT8_CODEC_ONNX_BYTES"
+    int8_name = f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}"
+    int8_artifact = ZeroTtsArtifact(
+        int8_name,
+        int8_name,
+        sha256(int8_content).hexdigest(),
+    )
+    spec = ZeroTtsModelSpec(
+        repo=base_spec.repo,
+        revision=base_spec.revision,
+        config=base_spec.config,
+        tokenizer=base_spec.tokenizer,
+        null_voice_emb=base_spec.null_voice_emb,
+        gguf_model=base_spec.gguf_model,
+        codec_files=(
+            *(artifact for artifact in base_spec.codec_files if artifact.local_name != int8_name),
+            int8_artifact,
+        ),
+    )
+    tts_dest = tmp_path / "models" / TTS_DIR / TtsEngine.ZEROTTS
+    gguf_path = tts_dest / ZeroTtsDirectory.GGUF / ZeroTtsFile.Q4_HYBRID_GGUF_MODEL
+    resolution = download_module.ZeroTtsModelResolution(spec=spec, gguf_path=gguf_path)
+
+    bundled_assets = tmp_path / "assets"
+    bundled_int8 = bundled_assets / int8_name
+    bundled_int8.parent.mkdir(parents=True, exist_ok=True)
+    bundled_int8.write_bytes(int8_content)
+
+    sync_repo = Mock(side_effect=AssertionError("remote sync must not run"))
+    monkeypatch.setattr(download_module, "_stt_layout_ready", lambda *_args: True)
+    monkeypatch.setattr(download_module, "_sync_repo", sync_repo)
+    monkeypatch.setattr(download_module, "_BUNDLED_ASSETS_DIR", bundled_assets)
+    monkeypatch.setattr(download_module, "resolve_zerotts_model", Mock(return_value=resolution))
+    monkeypatch.setattr(
+        download_module,
+        "_resolve_existing_zerotts_target",
+        Mock(return_value=resolution),
+    )
+
+    result = download_models(
+        cache_dir=tmp_path / "cache",
+        download_dir=tmp_path / "models",
+        tts_voices=(voice,),
+        tts_engine=TtsEngine.ZEROTTS,
+        stt_engine=SttEngine.ZIPFORMER,
+        zerotts_quant=ZeroTtsFile.Q4_HYBRID_GGUF_MODEL,
+    )
+
+    sync_repo.assert_not_called()
+    assert result.zerotts_resolution == resolution
+    dest_int8 = tts_dest / int8_name
+    assert dest_int8.is_file()
+    assert dest_int8.read_bytes() == int8_content
+
+
 def test_find_existing_zerotts_fallback_skips_checked_pinned_and_finds_custom(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2678,10 +2864,13 @@ def test_find_existing_zerotts_fallback_skips_checked_pinned_and_finds_custom(
     res = _find_existing_zerotts_fallback(dest_dir, ZEROTTS_MODEL)
     assert res is None
 
-    # Now add a valid custom GGUF
+    # Now add a valid custom GGUF. A pinned target fails closed by default.
     custom_gguf = gguf_dir / "custom-zerotts.gguf"
     custom_gguf.write_bytes(b"CUSTOM_GGUF")
 
+    assert _find_existing_zerotts_fallback(dest_dir, ZEROTTS_MODEL) is None
+
+    monkeypatch.setenv(ZeroTtsEnv.ALLOW_UNPINNED_FALLBACK, "true")
     res_custom = _find_existing_zerotts_fallback(dest_dir, ZEROTTS_MODEL)
     assert res_custom is not None
     assert res_custom.spec == ZEROTTS_BASE_MODEL

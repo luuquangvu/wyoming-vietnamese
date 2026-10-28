@@ -9,6 +9,9 @@ on:
       - ".github/workflows/ci.yaml"
       - "pyproject.toml"
       - "uv.lock"
+      - "Dockerfile"
+      - "docker-compose*.yaml"
+      - "tools/src/**"
   pull_request: *ci_trigger
 
 permissions: {}

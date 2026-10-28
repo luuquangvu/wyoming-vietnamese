@@ -56,6 +56,8 @@ class CombinedEventHandler(SafeAsyncEventHandler):
         self.tts_handler = tts_handler_factory(reader, writer)
         self.wyoming_info_event = wyoming_info_event
         self.connection_limiter = connection_limiter
+        self._stt_request_active = False
+        self._tts_request_active = False
 
     def _is_loopback_peer(self) -> bool:
         """Return whether this client connected over the loopback interface."""
@@ -95,8 +97,40 @@ class CombinedEventHandler(SafeAsyncEventHandler):
         finally:
             self.connection_limiter.release()
 
+    def _starts_new_request(self, event: Event) -> bool:
+        """Return whether an event begins a new request during shutdown."""
+        if Transcribe.is_type(event.type) or SynthesizeStart.is_type(event.type):
+            return True
+        if Synthesize.is_type(event.type):
+            return not self._tts_request_active
+        if AudioStart.is_type(event.type):
+            return not self._stt_request_active
+        return False
+
+    def _track_stt_event(self, event: Event, keep_open: bool) -> None:
+        """Record whether an accepted STT lifecycle may still receive events."""
+        if Transcribe.is_type(event.type) or AudioStart.is_type(event.type):
+            self._stt_request_active = keep_open
+        elif AudioStop.is_type(event.type) or not keep_open:
+            self._stt_request_active = False
+
+    def _track_tts_event(self, event: Event, keep_open: bool) -> None:
+        """Record whether an accepted TTS lifecycle may still receive events."""
+        if SynthesizeStart.is_type(event.type):
+            self._tts_request_active = keep_open
+        elif SynthesizeStop.is_type(event.type) or not keep_open:
+            self._tts_request_active = False
+
     async def handle_event(self, event: Event) -> bool:
         """Advertise both services and route each request by event type."""
+        if (
+            self.connection_limiter is not None
+            and not self.connection_limiter.accepting
+            and self._starts_new_request(event)
+        ):
+            await self._try_write_error("Server is shutting down", "server-busy")
+            return False
+
         if Describe.is_type(event.type):
             await self.write_event(self.wyoming_info_event)
             _LOGGER.debug("Sent combined STT/TTS service information")
@@ -108,7 +142,9 @@ class CombinedEventHandler(SafeAsyncEventHandler):
             or SynthesizeChunk.is_type(event.type)
             or SynthesizeStop.is_type(event.type)
         ):
-            return await self.tts_handler.handle_event(event)
+            keep_open = await self.tts_handler.handle_event(event)
+            self._track_tts_event(event, keep_open)
+            return keep_open
 
         if (
             Transcribe.is_type(event.type)
@@ -116,7 +152,9 @@ class CombinedEventHandler(SafeAsyncEventHandler):
             or AudioChunk.is_type(event.type)
             or AudioStop.is_type(event.type)
         ):
-            return await self.stt_handler.handle_event(event)
+            keep_open = await self.stt_handler.handle_event(event)
+            self._track_stt_event(event, keep_open)
+            return keep_open
 
         return True
 

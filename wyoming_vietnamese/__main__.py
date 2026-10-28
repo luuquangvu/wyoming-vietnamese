@@ -9,6 +9,8 @@ import os
 import shutil
 import signal
 import sys
+import threading
+from collections.abc import Callable
 from concurrent.futures import Executor
 from functools import partial
 from pathlib import Path
@@ -29,6 +31,7 @@ from .const import (
     STT_DIR,
     TTS_CACHE_DIR,
     TTS_DIR,
+    ZEROTTS_SOURCE_COMMIT,
     Timeout,
     TtsCacheFile,
     TtsEngine,
@@ -59,6 +62,7 @@ from .tts_model import (
     ZeroTtsVoiceSpec,
     is_zerotts_edge_variant,
     resolve_quality_codebooks,
+    resolve_zerotts_codec_int8,
     resolve_zerotts_model,
 )
 from .voice_usage import RecentVoiceStore
@@ -101,6 +105,34 @@ async def _drain_inference(
         )
         return
     lock.release()
+
+
+async def _run_cleanup_bounded(label: str, cleanup: Callable[[], None], timeout: float) -> bool:
+    """Run blocking cleanup in a daemon thread and report whether it finished in time."""
+    finished = threading.Event()
+
+    def runner() -> None:
+        """Execute one cleanup callback and always release the waiters."""
+        try:
+            cleanup()
+        except Exception:
+            _LOGGER.exception("%s cleanup failed", label)
+        finally:
+            finished.set()
+
+    threading.Thread(
+        target=runner,
+        name=f"shutdown-{label}",
+        daemon=True,
+    ).start()
+    completed = await asyncio.to_thread(finished.wait, timeout)
+    if not completed:
+        _LOGGER.warning(
+            "%s cleanup did not finish within %.1f seconds; continuing shutdown",
+            label,
+            timeout,
+        )
+    return completed
 
 
 def _log_startup_configuration(
@@ -324,10 +356,21 @@ def _tts_cache_namespace(
     digest = hashlib.sha256(server_config.tts_engine.encode("utf-8"))
     if server_config.tts_engine == TtsEngine.ZEROTTS:
         digest.update(ZEROTTS_MODEL.revision.encode("ascii"))
+        digest.update(b"runtime:" + ZEROTTS_SOURCE_COMMIT.encode("ascii"))
         if zerotts_model_identity:
             digest.update(zerotts_model_identity.encode("utf-8"))
+        for artifact in sorted(ZEROTTS_MODEL.codec_files, key=lambda a: a.local_name):
+            digest.update(artifact.sha256.encode("ascii"))
+        codec_int8 = getattr(tts_engine, "codec_int8", None)
+        if not isinstance(codec_int8, bool):
+            codec_int8 = resolve_zerotts_codec_int8(model_name=server_config.zerotts_model)
+        digest.update(b"codec-int8:" + (b"1" if codec_int8 else b"0"))
         effective_cbks = _resolve_effective_zerotts_codebooks(server_config, tts_engine)
         digest.update(b"cbk" + effective_cbks.to_bytes(1, "big"))
+    if voices:
+        # Reordering TTS_VOICE changes which voice the engine treats as the default,
+        # so the effective default identity is part of the namespace.
+        digest.update(b"default:" + voices[0].id.encode("utf-8"))
     digest.update(server_config.tts_sentence_silence_ms.to_bytes(4, "big"))
     for voice in sorted(voices, key=lambda v: v.id):
         digest.update(voice.id.encode("utf-8"))
@@ -474,24 +517,43 @@ def _download_configured_models(server_config: ServerConfig) -> ModelDownloadRes
     )
 
 
+def _file_sha256(path: Path) -> str:
+    """Return a file's lowercase SHA-256 digest."""
+    with path.open("rb") as input_file:
+        return hashlib.file_digest(input_file, "sha256").hexdigest()
+
+
 def _resolve_zerotts_identity(
     tts_engine: str,
     zerotts_resolution: ZeroTtsModelResolution | None,
 ) -> str | None:
-    """Resolve GGUF model identity digest or filename for cache namespacing.
+    """Resolve GGUF model identity digest for cache namespacing.
 
     Args:
         tts_engine: Selected TTS engine name.
         zerotts_resolution: Optional resolved ZeroTTS model specification and paths.
 
     Returns:
-        SHA-256 digest or local filename string, or None if not applicable.
+        SHA-256 digest, a metadata fallback for unreadable custom files, or None.
     """
     if tts_engine != TtsEngine.ZEROTTS or zerotts_resolution is None:
         return None
     if zerotts_resolution.spec.gguf_model is not None:
         return zerotts_resolution.spec.gguf_model.sha256
-    return zerotts_resolution.gguf_path.name
+    custom_path = zerotts_resolution.gguf_path
+    try:
+        return f"custom:{_file_sha256(custom_path)}"
+    except OSError as err:
+        _LOGGER.warning(
+            "Could not hash custom ZeroTTS model %s for cache identity: %s",
+            custom_path,
+            err,
+        )
+        try:
+            stat = custom_path.stat()
+        except OSError:
+            return f"custom:{custom_path.name}"
+        return f"custom:{custom_path.name}:{stat.st_size}:{stat.st_mtime_ns}"
 
 
 def _create_server_handler_factory(
@@ -562,6 +624,7 @@ def _create_server_handler_factory(
         inference_executor=inference_executor,
         voice_usage_store=voice_usage_store,
         cache_namespace=tts_namespace,
+        max_request_seconds=server_config.max_tts_stream_seconds,
     )
     return partial(
         CombinedEventHandler,
@@ -650,8 +713,20 @@ async def _shutdown_server(
         tts_entries,
         tts_bytes,
     )
-    await asyncio.to_thread(inference_executor.shutdown)
-    await asyncio.to_thread(tts_engine.close)
+    executor_stopped = await _run_cleanup_bounded(
+        "inference executor",
+        inference_executor.shutdown,
+        Timeout.SHUTDOWN_DRAIN,
+    )
+    if executor_stopped:
+        await _run_cleanup_bounded("TTS engine", tts_engine.close, Timeout.SHUTDOWN_DRAIN)
+    else:
+        inference_executor.shutdown(wait=False, cancel_futures=True)
+        _LOGGER.warning(
+            "Skipping TTS engine cleanup because the inference executor did not stop "
+            "within %.1f seconds",
+            Timeout.SHUTDOWN_DRAIN,
+        )
     _LOGGER.info("Wyoming services stopped")
 
 
@@ -710,7 +785,17 @@ async def run_server(
         zerotts_resolution=zerotts_resolution,
     )
     await _warm_up_tts_safely(tts_engine, active_voices, server_config.tts_engine)
-    tts_info = get_tts_info(server_config.tts_voices, engine=server_config.tts_engine)
+    zerotts_model_name = (
+        zerotts_resolution.gguf_path.name
+        if zerotts_resolution is not None
+        else server_config.zerotts_model
+    )
+    tts_info = get_tts_info(
+        server_config.tts_voices,
+        engine=server_config.tts_engine,
+        zerotts_model_name=zerotts_model_name,
+        zerotts_quality=server_config.zerotts_quality,
+    )
 
     stt_lock = asyncio.Lock()
     tts_lock = asyncio.Lock()

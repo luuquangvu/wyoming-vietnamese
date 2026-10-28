@@ -35,6 +35,7 @@ from wyoming_vietnamese.const import (
     VIETNAMESE_LANGUAGE,
     NghiTtsAudio,
     NghiTtsFile,
+    RequestLimit,
     TtsAudio,
     TtsEngine,
     TtsProvider,
@@ -44,6 +45,7 @@ from wyoming_vietnamese.const import (
     ZeroTtsFile,
     ZeroTtsVariant,
 )
+from wyoming_vietnamese.errors import SynthesisOutputLimitError
 from wyoming_vietnamese.tts import (
     _PREFIX_ABBR,
     MultiVoiceTTSEngine,
@@ -54,6 +56,7 @@ from wyoming_vietnamese.tts import (
     _audio_to_pcm_bytes,
     _boundary_kind,
     _next_pcm_chunk,
+    _NghiAudioIterator,
     _resolve_nghitts_espeak_data,
     _silence_pcm,
     get_tts_info,
@@ -113,6 +116,93 @@ class FakeTTS:
         self.closed = True
 
 
+class BlockingTTS(FakeTTS):
+    """Fake engine that blocks its first native chunk until the test releases it."""
+
+    def __init__(self) -> None:
+        """Initialize a single blocking native call."""
+        super().__init__([np.zeros(1, dtype=np.float32)])
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def infer_stream(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+        **kwargs: object,
+    ) -> Iterator[np.ndarray]:
+        """Return an iterator whose first native step blocks in the executor."""
+        self.calls.append((text, voice))
+        self.options.append(kwargs)
+        return self._blocking_iterator()
+
+    def _blocking_iterator(self) -> Iterator[np.ndarray]:
+        """Yield one chunk only after the test releases the native call."""
+        self.started.set()
+        self.release.wait()
+        yield np.zeros(1, dtype=np.float32)
+
+
+class TokenLimitedFakeTTS(FakeTTS):
+    """Fake engine that splits normalized text by whitespace token count."""
+
+    max_text_tokens = 2
+
+    def text_token_count(self, text: str) -> int:
+        """Count whitespace tokens as a stand-in for BPE body tokens."""
+        return len(text.split())
+
+    def split_text_by_tokens(
+        self,
+        text: str,
+        max_tokens: int | None = None,
+    ) -> tuple[str, ...]:
+        """Split text into whitespace groups that fit the fake token budget."""
+        limit = self.max_text_tokens if max_tokens is None else max_tokens
+        parts: list[str] = []
+        current: list[str] = []
+        for word in text.split():
+            if len(current) >= limit:
+                parts.append(" ".join(current))
+                current = []
+            current.append(word)
+        if current:
+            parts.append(" ".join(current))
+        return tuple(parts)
+
+    def infer_stream_normalized(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+    ) -> Iterator[np.ndarray]:
+        """Synthesize already-normalized text."""
+        return self.infer_stream(text, voice=voice)
+
+    def normalize(self, text: str, *, voice: str | None = None) -> str:
+        """Return text unchanged."""
+        del voice
+        return text
+
+
+class OutputLimitFakeTTS(FakeTTS):
+    """Fake engine that yields audio and then reports native truncation."""
+
+    def infer_stream(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+        **kwargs: object,
+    ) -> Iterator[np.ndarray]:
+        """Yield one chunk and then raise the engine output limit error."""
+        self.calls.append((text, voice))
+        self.options.append(kwargs)
+        yield np.array([0.0], dtype=np.float32)
+        raise SynthesisOutputLimitError("frame limit reached")
+
+
 class FakeGeneratedAudio:
     """Provide the native generated-audio shape used by the NghiTTS adapter."""
 
@@ -146,6 +236,86 @@ class FakeSherpaTTS:
     ) -> FakeGeneratedAudio:
         """Return complete audio and emit two native sentence chunks when requested."""
         self.calls.append((text, sid, speed))
+        chunks = (
+            np.array([0.1, 0.2], dtype=np.float32),
+            np.array([0.3], dtype=np.float32),
+        )
+        if callback is not None:
+            self.callback_results.extend([callback(chunks[0], 0.5), callback(chunks[1], 1.0)])
+        return FakeGeneratedAudio(np.concatenate(chunks))
+
+
+class ThreadRecordingTokenTTS(TokenLimitedFakeTTS):
+    """Token-limited fake engine that records where token splitting runs."""
+
+    def __init__(self) -> None:
+        """Initialize the split-thread record."""
+        super().__init__()
+        self.split_threads: list[int] = []
+
+    def split_text_by_tokens(
+        self,
+        text: str,
+        max_tokens: int | None = None,
+    ) -> tuple[str, ...]:
+        """Record the worker thread before splitting the text."""
+        self.split_threads.append(threading.get_ident())
+        return super().split_text_by_tokens(text, max_tokens)
+
+
+class FailingSplitTokenTTS(TokenLimitedFakeTTS):
+    """Token-limited fake whose segmentation always fails."""
+
+    def split_text_by_tokens(
+        self,
+        text: str,
+        max_tokens: int | None = None,
+    ) -> tuple[str, ...]:
+        """Raise a deterministic segmentation failure."""
+        del text, max_tokens
+        raise RuntimeError("token segmentation failed")
+
+
+class FailAfterFirstSplitTokenTTS(TokenLimitedFakeTTS):
+    """Token-limited fake that fails segmentation after the first segment."""
+
+    def __init__(self) -> None:
+        """Initialize the split call counter."""
+        super().__init__()
+        self.split_calls = 0
+
+    def split_text_by_tokens(
+        self,
+        text: str,
+        max_tokens: int | None = None,
+    ) -> tuple[str, ...]:
+        """Fail every split request after the first one."""
+        self.split_calls += 1
+        if self.split_calls > 1:
+            raise RuntimeError("token segmentation failed")
+        return super().split_text_by_tokens(text, max_tokens)
+
+
+class BlockingSherpaTTS(FakeSherpaTTS):
+    """Sherpa OfflineTts double whose native generate call blocks until released."""
+
+    def __init__(self) -> None:
+        """Initialize one blocked native synthesis call."""
+        super().__init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def generate(
+        self,
+        text: str,
+        sid: int = 0,
+        speed: float = 1.0,
+        callback: Callable[[np.ndarray, float], int] | None = None,
+    ) -> FakeGeneratedAudio:
+        """Block the native call until the test releases the worker."""
+        self.calls.append((text, sid, speed))
+        self.started.set()
+        self.release.wait()
         chunks = (
             np.array([0.1, 0.2], dtype=np.float32),
             np.array([0.3], dtype=np.float32),
@@ -343,9 +513,15 @@ async def test_tts_validates_language_and_speaker_selectors() -> None:
     assert engine.calls == [("Xin chào", None)]
 
     engine = FakeTTS()
-    handler, writer = make_handler(engine)
+    handler, _ = make_handler(engine)
     regional = Synthesize(text="Xin chào", voice=SynthesizeVoice(language="vi-VN")).event()
     assert await handler.handle_event(regional) is False
+    assert engine.calls == [("Xin chào", None)]
+
+    engine = FakeTTS()
+    handler, writer = make_handler(engine)
+    malformed = Synthesize(text="Xin chào", voice=SynthesizeVoice(language="vi-VIETNAM")).event()
+    assert await handler.handle_event(malformed) is False
     assert engine.calls == []
     assert written_events(writer)[0].data["code"] == "invalid-request"
 
@@ -988,6 +1164,35 @@ async def test_tts_producer_cancellation_frees_the_lock_and_the_consumer() -> No
     assert lock.locked() is False
 
 
+async def test_tts_producer_cancellation_keeps_lock_until_native_call_finishes() -> None:
+    """Test cancellation cannot release the inference lock while native work is running."""
+    lock = asyncio.Lock()
+    engine = BlockingTTS()
+    handler, _ = make_handler(engine, lock=lock)
+    request = asyncio.create_task(handler.handle_event(Synthesize(text="Blocking").event()))
+
+    for _ in range(500):
+        if engine.started.is_set():
+            break
+        await asyncio.sleep(0.001)
+    assert engine.started.is_set()
+    assert lock.locked() is True
+
+    producer = next(
+        (task for task in asyncio.all_tasks() if task.get_name() == "TTS inference producer"),
+        None,
+    )
+    assert producer is not None
+    producer.cancel()
+    await asyncio.sleep(0.05)
+    assert lock.locked() is True
+
+    engine.release.set()
+    with suppress(asyncio.CancelledError):
+        await asyncio.wait_for(request, timeout=5)
+    assert lock.locked() is False
+
+
 async def test_tts_skips_inference_for_closed_client() -> None:
     """Test tts skips inference for closed client."""
     engine = FakeTTS()
@@ -1030,14 +1235,133 @@ async def test_tts_cache_key_includes_voice() -> None:
         max_idle_seconds=60,
     )
     engine = FakeTTS()
+    engine._preset_voices["voice-b"] = {"description": "Voice B"}
     default_handler, _ = make_handler(engine, cache=cache)
     await default_handler.handle_event(Synthesize(text="Voice test").event())
 
     voice_handler, _ = make_handler(engine, cache=cache)
-    request = Synthesize(text="Voice test", voice=SynthesizeVoice(name="voice-a")).event()
+    request = Synthesize(text="Voice test", voice=SynthesizeVoice(name="voice-b")).event()
     await voice_handler.handle_event(request)
-    assert engine.calls == [("Voice test", None), ("Voice test", "voice-a")]
+    assert engine.calls == [("Voice test", None), ("Voice test", "voice-b")]
     assert len(cache) == 2
+
+
+async def test_tts_default_voice_cache_key_uses_effective_voice() -> None:
+    """Test omitted and explicit default voices share a key, while reordered defaults differ."""
+    first_engine = FakeTTS()
+    first_engine._preset_voices = {
+        "voice-a": {"description": "Voice A"},
+        "voice-b": {"description": "Voice B"},
+    }
+    first_handler, _ = make_handler(first_engine)
+    assert first_handler._cache_key("Xin chào", None) == first_handler._cache_key(
+        "Xin chào", "voice-a"
+    )
+
+    reordered_engine = FakeTTS()
+    reordered_engine._preset_voices = {
+        "voice-b": {"description": "Voice B"},
+        "voice-a": {"description": "Voice A"},
+    }
+    reordered_handler, _ = make_handler(reordered_engine)
+    assert first_handler._cache_key("Xin chào", None) != reordered_handler._cache_key(
+        "Xin chào", None
+    )
+
+
+async def test_tts_splits_token_bounded_text_without_changing_lifecycle() -> None:
+    """Test token-aware segmentation synthesizes every part inside one audio lifecycle."""
+    engine = TokenLimitedFakeTTS()
+    handler, writer = make_handler(engine)
+    await handler.handle_event(Synthesize(text="one two three four five").event())
+
+    assert engine.calls == [
+        ("one two", None),
+        ("three four", None),
+        ("five", None),
+    ]
+    event_types = [event.type for event in written_events(writer)]
+    assert event_types.count("audio-start") == 1
+    assert event_types.count("audio-stop") == 1
+    assert "error" not in event_types
+
+
+async def test_tts_token_segmentation_runs_on_inference_executor() -> None:
+    """Test token splitting does not block the event-loop thread."""
+    from wyoming_vietnamese.inference import create_inference_executor
+
+    executor = create_inference_executor(max_workers=1)
+    try:
+        engine = ThreadRecordingTokenTTS()
+        handler, _ = make_handler(engine)
+        handler.inference_executor = executor
+        await handler.handle_event(Synthesize(text="one two three four five").event())
+    finally:
+        executor.shutdown()
+
+    assert engine.split_threads
+    assert all(thread != threading.get_ident() for thread in engine.split_threads)
+
+
+async def test_tts_reports_token_segmentation_failure() -> None:
+    """Test token segmentation failures use the standard synthesis error lifecycle."""
+    engine = FailingSplitTokenTTS()
+    handler, writer = make_handler(engine)
+    assert await handler.handle_event(Synthesize(text="one two three").event()) is False
+
+    events = written_events(writer)
+    assert [event.type for event in events] == ["error", "audio-start", "audio-stop"]
+    assert events[0].data["code"] == "inference-failed"
+    assert engine.calls == []
+
+
+async def test_tts_stream_preserves_started_audio_on_token_segmentation_failure() -> None:
+    """Test a later segmentation failure does not restart a stream that already has audio."""
+    engine = FailAfterFirstSplitTokenTTS()
+    handler, writer = make_handler(engine)
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="one two three. ").event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="four five. ").event()) is False
+
+    events = written_events(writer)
+    assert [event.type for event in events].count("audio-start") == 1
+    assert any(
+        event.type == "error" and event.data["code"] == "inference-failed" for event in events
+    )
+    assert events[-1].type == "synthesize-stopped"
+
+
+async def test_tts_reports_engine_output_limit_as_audio_too_long() -> None:
+    """Test native frame truncation is surfaced instead of treated as success."""
+    engine = OutputLimitFakeTTS()
+    handler, writer = make_handler(engine)
+    await handler.handle_event(Synthesize(text="Xin chào").event())
+
+    events = written_events(writer)
+    errors = [event for event in events if event.type == "error"]
+    assert errors
+    assert errors[0].data["code"] == "audio-too-long"
+    assert [event.type for event in events].count("audio-stop") == 1
+
+
+async def test_tts_stream_request_deadline_and_empty_event_limit() -> None:
+    """Test streaming requests cannot be held open by empty chunks or elapsed time."""
+    handler, writer = make_handler()
+    handler.max_request_seconds = -1
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="xin chào").event()) is False
+    events = written_events(writer)
+    assert events[0].data["code"] == "request-timeout"
+    assert events[-1].type == "synthesize-stopped"
+
+    handler, writer = make_handler()
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    for _ in range(RequestLimit.MAX_EMPTY_EVENTS):
+        assert await handler.handle_event(SynthesizeChunk(text="").event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="").event()) is False
+    events = written_events(writer)
+    assert events[0].data["code"] == "too-many-empty-events"
+    assert events[-1].type == "synthesize-stopped"
 
 
 async def test_tts_does_not_cache_oversized_pcm() -> None:
@@ -1095,6 +1419,20 @@ def test_tts_info_lists_configured_voices_zerotts_engine() -> None:
         DEFAULT_ZEROTTS_VOICE.name,
         second_voice.name,
     ]
+
+
+def test_tts_info_reflects_active_zerotts_quality() -> None:
+    """Test ZeroTTS discovery reports the active GGUF model and quality tier."""
+    info = get_tts_info(
+        DEFAULT_ZEROTTS_VOICE,
+        engine=TtsEngine.ZEROTTS,
+        zerotts_model_name="zerotts-q4-hybrid.gguf",
+        zerotts_quality="medium",
+    )
+    program = info.tts[0]
+    assert program.description == f"{TtsProvider.ZEROTTS} Vietnamese (GGML Q4-Hybrid)"
+    assert program.version == "medium"
+    assert program.voices[0].version == "medium"
 
 
 def test_initialize_tts_engine_routes_by_engine(
@@ -1729,11 +2067,11 @@ def test_lazy_engine_moves_accessed_voice_to_mru() -> None:
         num_threads=1,
         max_loaded=2,
     )
-    # Initially: [first, second] -> first is LRU
-    assert list(lazy._engines) == [first_voice.name, second_voice.name]
-    # Access first -> moves to MRU end
-    list(lazy.infer_stream("Xin chào", voice=first_voice.name))
+    # The caller passes MRU-first startup voices, so the first entry becomes MRU.
     assert list(lazy._engines) == [second_voice.name, first_voice.name]
+    # Access second -> moves to MRU end
+    list(lazy.infer_stream("Xin chào", voice=second_voice.name))
+    assert list(lazy._engines) == [first_voice.name, second_voice.name]
     lazy.close()
 
 
@@ -1913,6 +2251,114 @@ def test_nghitts_adapter_streams_callbacks_and_validates_voice() -> None:
     engine.close()
     with pytest.raises(RuntimeError, match="closed"):
         engine.infer_stream("Xin chào.")
+
+
+def test_nghitts_engine_rejects_new_worker_while_previous_is_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test a timed-out native worker blocks another generate call."""
+    monkeypatch.setattr("wyoming_vietnamese.tts._NGHI_CLOSE_TIMEOUT_SECONDS", 0.01)
+    native = BlockingSherpaTTS()
+    engine = NghiTTSEngine(native, DEFAULT_NGHITTS_VOICE)
+
+    worker = engine.infer_stream_normalized("Xin chào.")
+    assert isinstance(worker, _NghiAudioIterator)
+    assert native.started.wait(1)
+    worker.close()
+    assert worker.is_alive()
+
+    with pytest.raises(RuntimeError, match="still running"):
+        engine.infer_stream_normalized("Xin chào.")
+    assert len(native.calls) == 1
+
+    native.release.set()
+    assert worker.join(1)
+    next_worker = engine.infer_stream_normalized("Xin chào.")
+    assert isinstance(next_worker, _NghiAudioIterator)
+    next_worker.close()
+    assert len(native.calls) == 2
+
+
+def test_multi_voice_engine_shares_native_worker_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test a live native worker blocks synthesis for every configured voice."""
+    monkeypatch.setattr("wyoming_vietnamese.tts._NGHI_CLOSE_TIMEOUT_SECONDS", 0.01)
+    second_voice = get_voice("chieu-thanh")
+    first_native = BlockingSherpaTTS()
+    second_native = FakeSherpaTTS()
+    engine = MultiVoiceTTSEngine(
+        (
+            NghiTTSEngine(first_native, DEFAULT_NGHITTS_VOICE),
+            NghiTTSEngine(second_native, second_voice),
+        )
+    )
+
+    worker = engine.infer_stream_normalized("Xin chào.")
+    assert isinstance(worker, _NghiAudioIterator)
+    assert first_native.started.wait(1)
+    worker.close()
+    assert worker.is_alive()
+
+    with pytest.raises(RuntimeError, match="still running"):
+        engine.infer_stream_normalized("Xin chào.", voice=second_voice.name)
+    assert second_native.calls == []
+
+    first_native.release.set()
+    assert worker.join(1)
+    next_worker = engine.infer_stream_normalized("Xin chào.", voice=second_voice.name)
+    assert isinstance(next_worker, _NghiAudioIterator)
+    list(next_worker)
+    assert len(second_native.calls) == 1
+    engine.close()
+
+
+def test_lazy_engine_reload_uses_shared_worker_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test reloading an evicted voice cannot start a second native worker."""
+    monkeypatch.setattr("wyoming_vietnamese.tts._NGHI_CLOSE_TIMEOUT_SECONDS", 0.01)
+    first_voice = DEFAULT_NGHITTS_VOICE
+    second_voice = get_voice("chieu-thanh")
+    first_native = BlockingSherpaTTS()
+    first_engine = NghiTTSEngine(first_native, first_voice)
+
+    def load_voice(_dir: Path, _threads: int, voice: Any, **_kwargs: object) -> NghiTTSEngine:
+        return NghiTTSEngine(FakeSherpaTTS(), voice)
+
+    monkeypatch.setattr("wyoming_vietnamese.tts.initialize_tts", load_voice)
+
+    from wyoming_vietnamese.tts import LazyMultiVoiceTTSEngine
+
+    lazy = LazyMultiVoiceTTSEngine(
+        [first_engine],
+        (first_voice, second_voice),
+        model_root=Path("/models"),
+        num_threads=1,
+        max_loaded=1,
+        min_replacement_interval=0.0,
+    )
+    worker = lazy.infer_stream_normalized("Xin chào.")
+    assert isinstance(worker, _NghiAudioIterator)
+    assert first_native.started.wait(1)
+    worker.close()
+    assert worker.is_alive()
+
+    with pytest.raises(RuntimeError, match="still running"):
+        lazy.infer_stream_normalized("Xin chào.", voice=second_voice.name)
+    assert list(lazy._engines) == [first_voice.name]
+
+    # Emulate an eviction that already dropped the old engine while its worker runs.
+    lazy._engines.pop(first_voice.name)
+    first_engine.close()
+    with pytest.raises(RuntimeError, match="still running"):
+        lazy.infer_stream_normalized("Xin chào.", voice=first_voice.name)
+
+    first_native.release.set()
+    assert worker.join(1)
+    list(lazy.infer_stream("Xin chào.", voice=first_voice.name))
+    assert first_voice.name in lazy._engines
+    lazy.close()
 
 
 def test_nghitts_adapter_normalizes_vietnamese_text() -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from contextlib import AbstractContextManager, closing
+from dataclasses import replace
 from email.message import Message
 from hashlib import sha256
 from io import BytesIO
@@ -723,6 +724,17 @@ def test_stt_comparison_properties() -> None:
     assert comp_unknown.needs_update is False
 
 
+def test_remote_hf_revision_rejects_non_hex_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test remote revision metadata cannot inject arbitrary text into source pins."""
+    monkeypatch.setattr(
+        check_models,
+        "_request_json",
+        lambda _url, _timeout: {"sha": 'bad"; import os; #'},
+    )
+    with pytest.raises(check_models.ModelCheckError, match="invalid revision"):
+        check_models._remote_hf_revision("owner/model", timeout=1)
+
+
 def _mock_zerotts_remote_repo(monkeypatch: pytest.MonkeyPatch) -> None:
     """Mock remote revision and tree endpoints for ZeroTTS repo."""
     monkeypatch.setattr(
@@ -745,13 +757,23 @@ def _find_int8_artifact(
 def test_compare_zerotts_handles_local_bundled_asset_present(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Test ZeroTTS comparison resolves local bundled assets matching pinned hash."""
+    """Test ZeroTTS comparison accepts bundled assets that match their pinned hash."""
     _mock_zerotts_remote_repo(monkeypatch)
     fake_assets = tmp_path / "assets"
     int8_file = fake_assets / "onnx" / "codec" / ZeroTtsFile.DECODE_STEP_INT8_ONNX
     int8_file.parent.mkdir(parents=True, exist_ok=True)
     int8_file.write_bytes(b"int8_model_content")
     int8_sha = sha256(b"int8_model_content").hexdigest()
+    matched_model = replace(
+        ZEROTTS_MODEL,
+        codec_files=tuple(
+            replace(artifact, sha256=int8_sha)
+            if artifact.remote_name == f"onnx/codec/{ZeroTtsFile.DECODE_STEP_INT8_ONNX}"
+            else artifact
+            for artifact in ZEROTTS_MODEL.codec_files
+        ),
+    )
+    monkeypatch.setattr(check_models, "ZEROTTS_MODEL", matched_model)
 
     comparison = check_models._compare_zerotts(
         timeout=1,
@@ -761,6 +783,7 @@ def test_compare_zerotts_handles_local_bundled_asset_present(
     int8_comp = _find_int8_artifact(comparison)
     assert int8_comp.remote_present is True
     assert int8_comp.remote_sha256 == int8_sha
+    assert int8_comp.status == "MATCH"
 
 
 def test_compare_zerotts_handles_local_bundled_asset_absent(
@@ -781,25 +804,22 @@ def test_compare_zerotts_handles_local_bundled_asset_absent(
     assert int8_comp.status == "REMOVED"
 
 
-def test_compare_zerotts_handles_local_bundled_asset_changed(
+def test_compare_zerotts_rejects_tampered_local_bundled_asset(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Test ZeroTTS comparison marks local bundled assets CHANGED when file hash differs."""
+    """Test ZeroTTS comparison refuses to self-certify a modified bundled asset."""
     _mock_zerotts_remote_repo(monkeypatch)
     fake_assets = tmp_path / "assets"
     flat_int8 = fake_assets / ZeroTtsFile.DECODE_STEP_INT8_ONNX
     flat_int8.parent.mkdir(parents=True, exist_ok=True)
     flat_int8.write_bytes(b"different_content")
 
-    comparison = check_models._compare_zerotts(
-        timeout=1,
-        hash_artifacts=True,
-        bundled_assets_dir=fake_assets,
-    )
-    int8_comp = _find_int8_artifact(comparison)
-    assert int8_comp.remote_present is True
-    assert int8_comp.remote_sha256 == sha256(b"different_content").hexdigest()
-    assert int8_comp.status == "CHANGED"
+    with pytest.raises(check_models.ModelCheckError, match="self-certify"):
+        check_models._compare_zerotts(
+            timeout=1,
+            hash_artifacts=True,
+            bundled_assets_dir=fake_assets,
+        )
 
 
 def test_compare_zerotts_handles_local_bundled_asset_unhashed(

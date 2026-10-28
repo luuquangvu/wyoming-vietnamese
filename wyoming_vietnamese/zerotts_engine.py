@@ -18,7 +18,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, Protocol
 
 import numpy as np
 
@@ -33,12 +33,14 @@ from .const import (
     ZeroTtsCodebook,
     ZeroTtsEnv,
     ZeroTtsFile,
+    ZeroTtsLimit,
     ZeroTtsVariant,
 )
 from .cpu import (
     detect_cpu_variant,
     resolve_cpu_threads,
 )
+from .errors import SynthesisOutputLimitError, SynthesisTextLimitError
 from .tts_model import (
     ZEROTTS_VOICES_BY_ID,
     ZeroTtsVoiceSpec,
@@ -69,6 +71,18 @@ _ZEROTTS_BUILD_TIMEOUT_SECONDS: Final[float] = 1800.0
 _PROCESS_TERMINATION_TIMEOUT_SECONDS: Final[float] = 5.0
 _SIGKILL_GRACE_PERIOD_SECONDS: Final[float] = 15.0
 _WORKER_SHUTDOWN_TIMEOUT_SECONDS: Final[float] = 2.0
+
+
+class _ZeroTtsTokenizer(Protocol):
+    """Tokenizer surface used for token-aware text segmentation."""
+
+    def __call__(self, text: str, max_length: int = 512) -> np.ndarray:
+        """Encode text into wrapped model token IDs."""
+        ...
+
+    def encode_body(self, text: str) -> list[int]:
+        """Encode text into body token IDs without boundary specials."""
+        ...
 
 
 class _ZeroTtsSampling(ctypes.Structure):
@@ -925,7 +939,7 @@ def _resolve_engine_options(
 
 def _load_text_processors(
     model_dir: Path,
-) -> tuple[Callable[..., np.ndarray], Callable[[str], str]]:
+) -> tuple[_ZeroTtsTokenizer, Callable[[str], str]]:
     """Load tokenizer and text normalization function for ZeroTTS.
 
     Args:
@@ -1298,12 +1312,13 @@ class ZeroTtsGgmlEngine:
         """
         k = self.num_codebooks
         min_frames = 4
-        max_frames = 1500
+        max_frames = int(ZeroTtsLimit.MAX_FRAMES)
         eoa_extra = 1
 
         codes_buf = (ctypes.c_int32 * k)()
         is_eoa = ctypes.c_int(0)
         tail_left = -1
+        reached_eoa = False
 
         for t in range(max_frames):
             if stop_event is not None and stop_event.is_set():
@@ -1321,11 +1336,17 @@ class ZeroTtsGgmlEngine:
                 tail_left, is_eoa.value != 0, eoa_extra
             )
             if should_stop:
+                reached_eoa = True
                 break
 
             rc = self._lib.zerotts_advance(self._ctx, codes_buf, t)
             if rc != 0:
                 raise RuntimeError(f"zerotts_advance failed at step {t}")
+
+        if (stop_event is None or not stop_event.is_set()) and not reached_eoa:
+            raise SynthesisOutputLimitError(
+                f"ZeroTTS output reached the {max_frames}-frame engine limit before end-of-audio"
+            )
 
     def infer_stream(
         self,
@@ -1353,6 +1374,84 @@ class ZeroTtsGgmlEngine:
             voice=voice,
             seed=seed,
         )
+
+    @property
+    def max_text_tokens(self) -> int:
+        """Return the maximum body token count accepted by the native runtime."""
+        return int(ZeroTtsLimit.MAX_TEXT_TOKENS)
+
+    def text_token_count(self, text: str) -> int:
+        """Return the tokenizer body length used for native text validation."""
+        if not text:
+            return 0
+        encode_body = getattr(self._tokenizer, "encode_body", None)
+        if callable(encode_body):
+            encoded = encode_body(text)
+            if isinstance(encoded, (list, tuple, np.ndarray)):
+                return len(encoded)
+        return max(0, len(self._tokenizer(text, ZeroTtsLimit.MAX_TEXT_IDS + 1)) - 2)
+
+    def split_text_by_tokens(
+        self,
+        text: str,
+        max_tokens: int | None = None,
+    ) -> tuple[str, ...]:
+        """Split normalized text into segments that fit the engine token budget.
+
+        Args:
+            text: Normalized synthesis text.
+            max_tokens: Optional explicit body-token ceiling.
+
+        Returns:
+            Tuple of non-empty text segments in reading order.
+
+        Raises:
+            ValueError: If the token ceiling is not positive.
+        """
+        limit = self.max_text_tokens if max_tokens is None else max_tokens
+        if limit < 1:
+            raise ValueError("max_tokens must be positive")
+        if self.text_token_count(text) <= limit:
+            return (text,) if text else ()
+
+        parts: list[str] = []
+        current = ""
+        for word in text.split():
+            candidate = f"{current} {word}" if current else word
+            if self.text_token_count(candidate) <= limit:
+                current = candidate
+                continue
+            if current:
+                parts.append(current)
+                current = ""
+            if self.text_token_count(word) <= limit:
+                current = word
+                continue
+            word_chunks = self._split_long_word(word, limit)
+            parts.extend(word_chunks[:-1])
+            current = word_chunks[-1]
+        if current:
+            parts.append(current)
+        return tuple(parts)
+
+    def _split_long_word(self, word: str, limit: int) -> list[str]:
+        """Split a single over-budget token span at character boundaries."""
+        chunks: list[str] = []
+        start = 0
+        while start < len(word):
+            low = start + 1
+            high = len(word)
+            best = start + 1
+            while low <= high:
+                middle = (low + high) // 2
+                if self.text_token_count(word[start:middle]) <= limit:
+                    best = middle
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            chunks.append(word[start:best])
+            start = best
+        return chunks
 
     def _prepare_synthesis_session(
         self,
@@ -1384,10 +1483,21 @@ class ZeroTtsGgmlEngine:
 
         self._rng = np.random.default_rng(self._seed if seed is None else seed)
 
+        body_token_count = self.text_token_count(text)
+        if body_token_count > self.max_text_tokens:
+            raise SynthesisTextLimitError(
+                f"ZeroTTS text has {body_token_count} tokens; the engine accepts at most "
+                f"{self.max_text_tokens}"
+            )
         text_tokens = self._tokenizer(text)
         text_ids = np.ascontiguousarray(text_tokens, dtype=np.int32)
         if len(text_ids) == 0:
             return False
+        if len(text_ids) > ZeroTtsLimit.MAX_TEXT_IDS:
+            raise SynthesisTextLimitError(
+                f"ZeroTTS text produced {len(text_ids)} IDs; the engine accepts at most "
+                f"{ZeroTtsLimit.MAX_TEXT_IDS}"
+            )
 
         voice_emb = self._resolve_voice_embedding(voice)
         voice_emb_ptr = voice_emb.ctypes.data_as(ctypes.POINTER(ctypes.c_float))

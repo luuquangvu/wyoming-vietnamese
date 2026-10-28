@@ -127,6 +127,78 @@ async def test_combined_handler_routes_stt_and_tts_events() -> None:
     assert tts_events == tts_requests
 
 
+async def test_combined_handler_rejects_requests_during_shutdown() -> None:
+    """Test existing connections cannot start a new request once shutdown begins."""
+    limiter = ConnectionLimiter(4)
+    handler, writer, stt_events, tts_events, _ = _make_handler()
+    handler.connection_limiter = limiter
+    limiter.stop_accepting()
+
+    assert await handler.handle_event(Synthesize(text="xin chào").event()) is False
+    assert written_events(writer)[0].data["code"] == "server-busy"
+    assert stt_events == []
+    assert tts_events == []
+    assert await handler.handle_event(Describe().event()) is True
+
+
+async def test_combined_handler_allows_accepted_streams_to_finish_during_shutdown() -> None:
+    """Test shutdown lets accepted STT and TTS lifecycles receive their remaining events."""
+    limiter = ConnectionLimiter(4)
+    handler, writer, stt_events, tts_events, _ = _make_handler()
+    handler.connection_limiter = limiter
+
+    transcribe = Transcribe().event()
+    synthesize_start = SynthesizeStart().event()
+    assert await handler.handle_event(transcribe) is True
+    assert await handler.handle_event(synthesize_start) is True
+    limiter.stop_accepting()
+
+    audio_start = AudioStart(rate=16000, width=2, channels=1).event()
+    audio_chunk = AudioChunk(rate=16000, width=2, channels=1, audio=b"\0\0").event()
+    audio_stop = AudioStop().event()
+    synthesize_chunk = SynthesizeChunk(text="xin chào").event()
+    synthesize_stop = SynthesizeStop().event()
+    assert await handler.handle_event(audio_start) is True
+    assert await handler.handle_event(audio_chunk) is True
+    assert await handler.handle_event(audio_stop) is True
+    assert await handler.handle_event(synthesize_chunk) is True
+    assert await handler.handle_event(synthesize_stop) is True
+
+    assert stt_events == [transcribe, audio_start, audio_chunk, audio_stop]
+    assert tts_events == [synthesize_start, synthesize_chunk, synthesize_stop]
+
+    assert await handler.handle_event(Transcribe().event()) is False
+    assert await handler.handle_event(SynthesizeStart().event()) is False
+    assert [event.data["code"] for event in written_events(writer)] == [
+        "server-busy",
+        "server-busy",
+    ]
+
+
+async def test_combined_handler_rejects_repeated_starts_during_shutdown() -> None:
+    """Test shutdown rejects repeated STT and TTS starts for active streams."""
+    limiter = ConnectionLimiter(4)
+    handler, writer, stt_events, tts_events, _ = _make_handler()
+    handler.connection_limiter = limiter
+
+    assert await handler.handle_event(Transcribe().event()) is True
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    limiter.stop_accepting()
+
+    assert await handler.handle_event(Transcribe().event()) is False
+    assert await handler.handle_event(SynthesizeStart().event()) is False
+    assert [event.data["code"] for event in written_events(writer)] == [
+        "server-busy",
+        "server-busy",
+    ]
+
+    # AudioStart remains a continuation of the accepted transcription request.
+    audio_start = AudioStart(rate=16000, width=2, channels=1).event()
+    assert await handler.handle_event(audio_start) is True
+    assert stt_events[-1] == audio_start
+    assert tts_events[0].type == "synthesize-start"
+
+
 async def test_combined_handler_disconnects_both_handlers() -> None:
     """Test combined handler disconnects both handlers."""
     handler, _, _, _, handlers = _make_handler()
