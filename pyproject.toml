@@ -6,13 +6,14 @@ readme = "README.md"
 requires-python = ">=3.14"
 license = { text = "MIT" }
 dependencies = [
-  "huggingface-hub",
-  "numpy",
-  "psutil",
-  "sherpa-onnx",
-  "sherpa-onnx-core",
-  "wyoming",
-  "zerotts",
+  "huggingface-hub>=2.3.0",
+  "numpy>=2.5.4",
+  "piper-phonemize>=1.5.9",
+  "psutil>=7.2.2",
+  "sherpa-onnx>=2.0.1",
+  "sherpa-onnx-core>=2.0.1",
+  "wyoming>=1.10.2",
+  "zerotts>=0.1.5",
 ]
 
 [dependency-groups]
@@ -36,6 +37,7 @@ dev = [
 
 [tool.uv]
 no-build = true
+find-links = ["https://k2-fsa.github.io/icefall/piper_phonemize.html"]
 exclude-dependencies = [
   { package = { name = "zerotts" }, dependencies = [
     "scipy",
