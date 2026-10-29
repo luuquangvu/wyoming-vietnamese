@@ -152,20 +152,28 @@ class _SherpaGeneratedAudio(Protocol):
     sample_rate: int
 
 
+class _SherpaGenerationConfig(Protocol):
+    """Generation options accepted by Sherpa-ONNX v2 offline synthesis."""
+
+    sid: int
+    speed: float
+    phoneme_codepoints: list[list[int]]
+
+
 class _SherpaOfflineTts(Protocol):
     """Native Sherpa-ONNX TTS surface used by the NghiTTS adapter."""
 
     sample_rate: int
     num_speakers: int
+    lang: str
 
     def generate(
         self,
         text: str,
-        sid: int = 0,
-        speed: float = 1.0,
+        config: _SherpaGenerationConfig,
         callback: Callable[[np.ndarray, float], int] | None = None,
     ) -> _SherpaGeneratedAudio:
-        """Generate speech and optionally report completed sentence audio."""
+        """Generate speech from text and precomputed phoneme codepoints."""
         ...
 
 
@@ -233,12 +241,14 @@ class _NghiAudioIterator(Iterator[np.ndarray]):
         text: str,
         speaker_id: int,
         *,
+        language: str,
         guard: _NghiWorkerGuard | None = None,
     ) -> None:
         """Start one native synthesis worker and expose its sentence chunks."""
         self._tts = tts
         self._text = text
         self._speaker_id = speaker_id
+        self._language = language
         self._guard = guard
         self._queue: queue.Queue[np.ndarray | Exception | _NghiDone] = queue.Queue(maxsize=2)
         self._stop = threading.Event()
@@ -292,10 +302,10 @@ class _NghiAudioIterator(Iterator[np.ndarray]):
     def _run(self) -> None:
         """Run the blocking Sherpa call and terminate the iterator exactly once."""
         try:
+            phoneme_codepoints = _phonemize_nghitts(self._text, self._language)
             generated = self._tts.generate(
                 self._text,
-                sid=self._speaker_id,
-                speed=1.0,
+                _nghitts_generation_config(phoneme_codepoints, sid=self._speaker_id),
                 callback=self._on_audio,
             )
             if not self._emitted_audio and not self._stop.is_set():
@@ -357,6 +367,7 @@ class NghiTTSEngine:
         self._normalize_fn = normalize_fn
         self._max_text_chars = max_text_chars
         self._worker_guard = worker_guard if worker_guard is not None else _NghiWorkerGuard()
+        self._language: str = tts.lang or VIETNAMESE_LANGUAGE
         self.voice = voice
         self.sample_rate = tts.sample_rate
         self.chunks_are_sentences: bool = True
@@ -413,7 +424,13 @@ class NghiTTSEngine:
             )
         native_tts = self._native_tts()
         speaker_id = self._speaker_id(voice)
-        return _NghiAudioIterator(native_tts, text, speaker_id, guard=self._worker_guard)
+        return _NghiAudioIterator(
+            native_tts,
+            text,
+            speaker_id,
+            language=self._language,
+            guard=self._worker_guard,
+        )
 
     def normalize(self, text: str, *, voice: str | None = None) -> str:
         """Return text after this engine's configured normalizer."""
@@ -2218,17 +2235,15 @@ def initialize_tts(
     ):
         if not path.is_file():
             raise FileNotFoundError(f"Required NghiTTS {label} missing: {path!s}")
-    espeak_data_dir = _resolve_nghitts_espeak_data(model_dir)
 
     import sherpa_onnx
 
     threads = resolve_cpu_threads(num_threads)
     _LOGGER.info(
-        "Initializing NghiTTS: voice=%s threads=%d model=%s espeak_data=%s",
+        "Initializing NghiTTS: voice=%s threads=%d model=%s",
         voice.name,
         threads,
         model_path,
-        espeak_data_dir,
     )
     initialization_started = perf_counter()
     native_tts: _SherpaOfflineTts = sherpa_onnx.OfflineTts(
@@ -2237,7 +2252,6 @@ def initialize_tts(
                 vits=sherpa_onnx.OfflineTtsVitsModelConfig(
                     model=str(model_path.resolve()),
                     tokens=str(tokens_path.resolve()),
-                    data_dir=str(espeak_data_dir),
                 ),
                 num_threads=threads,
                 debug=False,
@@ -2472,35 +2486,30 @@ def initialize_tts_engine(
     raise ValueError(f"Unknown TTS engine: {engine}")
 
 
-def _resolve_nghitts_espeak_data(model_dir: Path) -> Path:
-    """Locate a complete architecture-independent eSpeak NG data directory."""
-    required_paths = (
-        Path("phondata"),
-        Path("phontab"),
-        Path("vi_dict"),
-        Path("lang/aav/vi"),
-    )
+def _phonemize_nghitts(text: str, language: str) -> list[list[int]]:
+    """Convert text into Piper phoneme codepoints with the bundled eSpeak NG voice."""
+    from piper_phonemize import phonemize_espeak
 
-    if configured := os.environ.get("NGHITTS_ESPEAK_DATA_DIR", "").strip():
-        configured_path = Path(configured).expanduser()
-        if not all((configured_path / name).is_file() for name in required_paths):
-            raise FileNotFoundError(
-                "NGHITTS_ESPEAK_DATA_DIR does not contain complete eSpeak NG data: "
-                f"{configured_path!s}"
-            )
-        return configured_path.resolve()
-
-    candidates = [
-        model_dir / "espeak-ng-data",
-        Path("/usr/share/espeak-ng-data"),
-        Path("/usr/lib/espeak-ng-data"),
-        *sorted(Path("/usr/lib").glob("*-linux-gnu/espeak-ng-data")),
+    sentences = phonemize_espeak(text, language)
+    phoneme_codepoints = [
+        [ord(char) for phoneme in sentence for char in phoneme] for sentence in sentences
     ]
-    for candidate in candidates:
-        if all((candidate / name).is_file() for name in required_paths):
-            return candidate.resolve()
+    if phoneme_codepoints := [row for row in phoneme_codepoints if row]:
+        return phoneme_codepoints
 
-    raise FileNotFoundError(
-        "NghiTTS eSpeak NG data was not found; install espeak-ng-data or set "
-        "NGHITTS_ESPEAK_DATA_DIR"
-    )
+    raise RuntimeError("NghiTTS phonemizer returned no phonemes")
+
+
+def _nghitts_generation_config(
+    phoneme_codepoints: list[list[int]],
+    *,
+    sid: int = 0,
+) -> _SherpaGenerationConfig:
+    """Build Sherpa-ONNX generation options for pre-phonemized text."""
+    import sherpa_onnx
+
+    config = sherpa_onnx.GenerationConfig()
+    config.sid = sid
+    config.speed = 1.0
+    config.phoneme_codepoints = phoneme_codepoints
+    return config

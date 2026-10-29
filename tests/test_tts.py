@@ -57,7 +57,9 @@ from wyoming_vietnamese.tts import (
     _boundary_kind,
     _next_pcm_chunk,
     _NghiAudioIterator,
-    _resolve_nghitts_espeak_data,
+    _nghitts_generation_config,
+    _phonemize_nghitts,
+    _SherpaGenerationConfig,
     _silence_pcm,
     get_tts_info,
     get_tts_sample_rate,
@@ -212,6 +214,45 @@ class FakeGeneratedAudio:
         self.sample_rate: int = NghiTtsAudio.SAMPLE_RATE
 
 
+class FakeGenerationConfig:
+    """Record the Sherpa-ONNX generation options built by the adapter."""
+
+    sid: int
+    speed: float
+    phoneme_codepoints: list[list[int]]
+
+    def __init__(self, phoneme_codepoints: list[list[int]], *, sid: int = 0) -> None:
+        """Store precomputed phoneme codepoints and fixed sampling options."""
+        self.sid = sid
+        self.speed = 1.0
+        self.phoneme_codepoints = phoneme_codepoints
+
+
+class FakePiperPhonemizeModule(types.ModuleType):
+    """Provide the piper-phonemize surface used by the NghiTTS adapter."""
+
+    phonemize_espeak: Callable[[str, str], list[list[str]]]
+
+
+class FakeSherpaOnnxModule(types.ModuleType):
+    """Provide the sherpa-onnx surface used by the NghiTTS adapter."""
+
+    GenerationConfig: Callable[[], object]
+
+
+@pytest.fixture(autouse=True)
+def fake_nghitts_native_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace native phonemization and Sherpa config construction in adapter tests."""
+    monkeypatch.setattr(
+        "wyoming_vietnamese.tts._phonemize_nghitts",
+        lambda text, _language: [[ord(char) for char in text]],
+    )
+    monkeypatch.setattr(
+        "wyoming_vietnamese.tts._nghitts_generation_config",
+        lambda codepoints, *, sid=0: FakeGenerationConfig(codepoints, sid=sid),
+    )
+
+
 class FakeSherpaTTS:
     """Provide a callback-capable Sherpa OfflineTts test double."""
 
@@ -224,18 +265,18 @@ class FakeSherpaTTS:
         """Initialize native metadata and callback tracking."""
         self.sample_rate = sample_rate
         self.num_speakers = num_speakers
-        self.calls: list[tuple[str, int, float]] = []
+        self.lang = VIETNAMESE_LANGUAGE
+        self.calls: list[tuple[str, _SherpaGenerationConfig]] = []
         self.callback_results: list[int] = []
 
     def generate(
         self,
         text: str,
-        sid: int = 0,
-        speed: float = 1.0,
+        config: _SherpaGenerationConfig,
         callback: Callable[[np.ndarray, float], int] | None = None,
     ) -> FakeGeneratedAudio:
         """Return complete audio and emit two native sentence chunks when requested."""
-        self.calls.append((text, sid, speed))
+        self.calls.append((text, config))
         chunks = (
             np.array([0.1, 0.2], dtype=np.float32),
             np.array([0.3], dtype=np.float32),
@@ -308,12 +349,11 @@ class BlockingSherpaTTS(FakeSherpaTTS):
     def generate(
         self,
         text: str,
-        sid: int = 0,
-        speed: float = 1.0,
+        config: _SherpaGenerationConfig,
         callback: Callable[[np.ndarray, float], int] | None = None,
     ) -> FakeGeneratedAudio:
         """Block the native call until the test releases the worker."""
-        self.calls.append((text, sid, speed))
+        self.calls.append((text, config))
         self.started.set()
         self.release.wait()
         chunks = (
@@ -1912,8 +1952,11 @@ def test_multi_voice_engine_routes_by_name_and_defaults_to_first() -> None:
     list(engine.infer_stream("Mặc định"))
     list(engine.infer_stream("Giọng hai", voice=second_voice.name))
 
-    assert default_native.calls == [("Mặc định", 0, 1.0)]
-    assert second_native.calls == [("Giọng hai", 0, 1.0)]
+    assert [call[0] for call in default_native.calls] == ["Mặc định"]
+    assert [call[0] for call in second_native.calls] == ["Giọng hai"]
+    assert default_native.calls[0][1].sid == 0
+    assert default_native.calls[0][1].speed == 1.0
+    assert second_native.calls[0][1].sid == 0
     assert list(engine._preset_voices) == [DEFAULT_NGHITTS_VOICE.name, second_voice.name]
     with pytest.raises(ValueError, match="Unsupported"):
         list(engine.infer_stream("Lỗi", voice="missing"))
@@ -2220,18 +2263,12 @@ def test_validate_tts_voices_for_engine() -> None:
         validate_tts_voices_for_engine((DEFAULT_NGHITTS_VOICE,), TtsEngine.ZEROTTS)
 
 
-def _make_nghitts_model(directory: Path) -> Path:
-    """Build minimal NghiTTS assets plus complete local eSpeak data markers."""
+def _make_nghitts_model(directory: Path) -> None:
+    """Build minimal NghiTTS model assets for initialization tests."""
     directory.mkdir(parents=True, exist_ok=True)
     (directory / NghiTtsFile.MODEL).write_bytes(b"onnx")
     (directory / NghiTtsFile.CONFIG).write_text("{}", encoding="utf-8")
     (directory / NghiTtsFile.TOKENS).write_text("_ 0\n", encoding="utf-8")
-    espeak_data = directory / "espeak-ng-data"
-    for name in ("phondata", "phontab", "vi_dict", "lang/aav/vi"):
-        path = espeak_data / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"data")
-    return espeak_data
 
 
 def test_nghitts_adapter_streams_callbacks_and_validates_voice() -> None:
@@ -2368,9 +2405,10 @@ def test_nghitts_adapter_normalizes_vietnamese_text() -> None:
 
     list(engine.infer_stream("Ngày 23/8 lúc 15h30, TP.HCM tăng 12,5%."))
     assert len(native.calls) == 1
-    normalized_text, sid, speed = native.calls[0]
-    assert sid == 0
-    assert speed == 1.0
+    normalized_text, config = native.calls[0]
+    assert config.sid == 0
+    assert config.speed == 1.0
+    assert config.phoneme_codepoints == [[ord(char) for char in normalized_text]]
     assert normalized_text == (
         "Ngày hai mươi ba tháng tám lúc mười lăm giờ ba mươi phút, "
         "Thành phố Hồ Chí Minh tăng mười hai phẩy năm phần trăm."
@@ -2569,18 +2607,66 @@ def test_nghitts_adapter_rejects_unexpected_native_metadata(
         )
 
 
-def test_resolve_nghitts_espeak_data_prefers_model_and_validates_override(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_phonemize_nghitts_converts_sentences_to_codepoints(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Test portable model-local eSpeak data and strict explicit overrides."""
-    model_dir = tmp_path / TTS_DIR
-    espeak_data = _make_nghitts_model(model_dir)
-    monkeypatch.delenv("NGHITTS_ESPEAK_DATA_DIR", raising=False)
-    assert _resolve_nghitts_espeak_data(model_dir) == espeak_data.resolve()
+    """Test eSpeak sentences and multi-codepoint phonemes become codepoint rows."""
+    calls: list[tuple[str, str]] = []
+    stress = "\u02c8"
 
-    monkeypatch.setenv("NGHITTS_ESPEAK_DATA_DIR", str(tmp_path / "missing"))
-    with pytest.raises(FileNotFoundError, match="NGHITTS_ESPEAK_DATA_DIR"):
-        _resolve_nghitts_espeak_data(model_dir)
+    def phonemize_espeak(text: str, language: str) -> list[list[str]]:
+        """Record the model language and return Piper-style phoneme sentences."""
+        calls.append((text, language))
+        return [[""], ["s", stress, "i", "n", " "], ["tʃ", "a"]]
+
+    fake_piper = FakePiperPhonemizeModule("piper_phonemize")
+    fake_piper.phonemize_espeak = phonemize_espeak
+    monkeypatch.setitem(sys.modules, "piper_phonemize", fake_piper)
+
+    assert _phonemize_nghitts("Xin chào.", "vi") == [
+        [ord(char) for char in f"s{stress}in "],
+        [ord(char) for char in "tʃa"],
+    ]
+    assert calls == [("Xin chào.", "vi")]
+
+
+@pytest.mark.parametrize("sentences", [[], [[]], [[""]]])
+def test_phonemize_nghitts_rejects_empty_output(
+    sentences: list[list[str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test models without phonemes fail loudly instead of generating no audio."""
+    fake_piper = FakePiperPhonemizeModule("piper_phonemize")
+    fake_piper.phonemize_espeak = lambda _text, _language: sentences
+    monkeypatch.setitem(sys.modules, "piper_phonemize", fake_piper)
+    with pytest.raises(RuntimeError, match="no phonemes") as error:
+        _phonemize_nghitts("Xin chào.", "vi")
+    assert "Xin chào." not in str(error.value)
+
+
+def test_nghitts_generation_config_sets_phoneme_codepoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test Sherpa-ONNX v2 generation options carry phonemes instead of text."""
+
+    class GenerationConfigStub:
+        """Expose the mutable Sherpa-ONNX generation fields used by the adapter."""
+
+        def __init__(self) -> None:
+            """Initialize the default generation options."""
+            self.sid = 0
+            self.speed = 0.5
+            self.phoneme_codepoints: list[list[int]] = []
+
+    fake_sherpa = FakeSherpaOnnxModule("sherpa_onnx")
+    fake_sherpa.GenerationConfig = GenerationConfigStub
+    monkeypatch.setitem(sys.modules, "sherpa_onnx", fake_sherpa)
+
+    config = _nghitts_generation_config([[1, 2]], sid=3)
+
+    assert isinstance(config, GenerationConfigStub)
+    assert config.sid == 3
+    assert config.speed == 1.0
+    assert config.phoneme_codepoints == [[1, 2]]
 
 
 def test_initialize_tts_uses_sherpa_cpu_runtime(
@@ -2588,7 +2674,7 @@ def test_initialize_tts_uses_sherpa_cpu_runtime(
 ) -> None:
     """Test initialization passes verified local paths and effective threads."""
     model_dir = tmp_path / TTS_DIR
-    espeak_data = _make_nghitts_model(model_dir)
+    _make_nghitts_model(model_dir)
     native = FakeSherpaTTS()
     vits_config = Mock(return_value="vits")
     model_config = Mock(return_value="model")
@@ -2608,7 +2694,6 @@ def test_initialize_tts_uses_sherpa_cpu_runtime(
     vits_config.assert_called_once_with(
         model=str((model_dir / NghiTtsFile.MODEL).resolve()),
         tokens=str((model_dir / NghiTtsFile.TOKENS).resolve()),
-        data_dir=str(espeak_data.resolve()),
     )
     model_config.assert_called_once_with(
         vits="vits",

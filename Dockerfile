@@ -33,7 +33,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,id=aptlib,sharing=locked <<EOF
 set -eux
 groupadd -g 1000 app && useradd -u 1000 -g app -d /app -s /usr/sbin/nologin app
-apt-get update && apt-get install --yes --no-install-recommends espeak-ng-data libgomp1 tini
+apt-get update && apt-get install --yes --no-install-recommends libgomp1 tini
 mkdir -p /app/.cache /app/models /app/lib && chown -R app:app /app
 EOF
 
