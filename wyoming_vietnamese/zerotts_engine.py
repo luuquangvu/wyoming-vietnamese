@@ -813,11 +813,15 @@ def resolve_zerotts_thread_budget(
 
     When pipelined streaming overlaps GGML autoregression with ONNX codec decoding,
     allocating full threads to both causes severe thread oversubscription on many-core systems.
-    However, on edge quad-core CPUs (e.g. Intel Celeron N5105 / J4125 / Raspberry Pi 4),
-    the neural codec decoding runs for only ~15 ms every 16 frames (~1.28 s). Under opportunistic
-    budgeting (opportunistic=True, default), GGML is allocated all available cores (total_threads)
-    while the codec is assigned 1 thread, allowing the CPU to execute GGML at full capacity for >98%
-    of the generation time while the OS CFS scheduler timeslices during brief codec bursts.
+    The codec decodes in short bursts (one ~1.28 s slice every 16 frames), which once made it
+    attractive to oversubscribe a <= 4-core device: give GGML every core and let the codec
+    borrow one briefly (opportunistic=True).
+
+    These measurements were originally taken with ggml's OpenMP backend, whose parallel-region
+    overhead dominated on four cores. The service now builds ggml without OpenMP and installs
+    one persistent native threadpool, which changes the absolute numbers but keeps the same
+    trade-off: edge devices scale GGML poorly with fewer threads, so using every core for GGML
+    and letting the mostly-idle codec thread share one remains the default on <= 4 cores.
 
     Strict partitioning (ggml + codec <= total_threads) is enforced with opportunistic=False,
     allowing callers on resource-constrained or strict-quota systems to retain strict budgeting.
@@ -1053,6 +1057,11 @@ class ZeroTtsGgmlEngine:
             self._lib.zerotts_sampling_defaults(ctypes.byref(self._sp))
 
             self._tokenizer, self._normalize_fn = _load_text_processors(model_dir)
+            # Last (text, token_count) pair. The handler asks for the same text's
+            # count before synthesis, and _prepare_synthesis_session asks again when
+            # it starts the segment; one memo entry removes a full BPE encode per
+            # segment without retaining any request history.
+            self._token_count_cache: tuple[str, int] | None = None
             self._codec = self._init_neural_codec(model_dir)
 
             _LOGGER.info(
@@ -1384,12 +1393,19 @@ class ZeroTtsGgmlEngine:
         """Return the tokenizer body length used for native text validation."""
         if not text:
             return 0
+        cached = self._token_count_cache
+        if cached is not None and cached[0] == text:
+            return cached[1]
         encode_body = getattr(self._tokenizer, "encode_body", None)
+        count = -1
         if callable(encode_body):
             encoded = encode_body(text)
             if isinstance(encoded, (list, tuple, np.ndarray)):
-                return len(encoded)
-        return max(0, len(self._tokenizer(text, ZeroTtsLimit.MAX_TEXT_IDS + 1)) - 2)
+                count = len(encoded)
+        if count < 0:
+            count = max(0, len(self._tokenizer(text, ZeroTtsLimit.MAX_TEXT_IDS + 1)) - 2)
+        self._token_count_cache = (text, count)
+        return count
 
     def split_text_by_tokens(
         self,
@@ -1414,9 +1430,53 @@ class ZeroTtsGgmlEngine:
         if self.text_token_count(text) <= limit:
             return (text,) if text else ()
 
+        words = text.split()
+        if callable(getattr(self._tokenizer, "encode_body", None)):
+            # Word counts compose because the tokenizer isolates whitespace into
+            # its own token, so one small encode per word replaces re-encoding a
+            # growing prefix per word (quadratic on long, over-budget text).
+            parts = self._split_words_by_token_counts(words, limit)
+            if all(self.text_token_count(part) <= limit for part in parts):
+                return parts
+        return self._split_words_by_candidate_counts(words, limit)
+
+    def _split_words_by_token_counts(self, words: list[str], limit: int) -> tuple[str, ...]:
+        """Split words using per-word token counts that compose at whitespace."""
         parts: list[str] = []
         current = ""
-        for word in text.split():
+        current_tokens = 0
+        for word in words:
+            word_tokens = self.text_token_count(word)
+            if current:
+                candidate_tokens = current_tokens + self.text_token_count(f" {word}")
+                if candidate_tokens <= limit:
+                    current = f"{current} {word}"
+                    current_tokens = candidate_tokens
+                    continue
+                parts.append(current)
+                current = ""
+                current_tokens = 0
+            if word_tokens <= limit:
+                current = word
+                current_tokens = word_tokens
+                continue
+            word_chunks = self._split_long_word(word, limit)
+            parts.extend(word_chunks[:-1])
+            current = word_chunks[-1]
+            current_tokens = self.text_token_count(current)
+        if current:
+            parts.append(current)
+        return tuple(parts)
+
+    def _split_words_by_candidate_counts(
+        self,
+        words: list[str],
+        limit: int,
+    ) -> tuple[str, ...]:
+        """Split words by re-encoding each candidate prefix, for opaque tokenizers."""
+        parts: list[str] = []
+        current = ""
+        for word in words:
             candidate = f"{current} {word}" if current else word
             if self.text_token_count(candidate) <= limit:
                 current = candidate

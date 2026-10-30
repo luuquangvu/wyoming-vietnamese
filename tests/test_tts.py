@@ -3298,6 +3298,53 @@ def test_stream_clause_detector_without_clause_splitting() -> None:
     assert static_clauses == [text]
 
 
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 5, 8, 64])
+def test_stream_clause_detector_matches_across_chunk_sizes(chunk_size: int) -> None:
+    """Test incremental delimiter scanning yields the same clauses for any chunking."""
+    text = (
+        "Xin chào, tôi là trợ lý ảo. Hôm nay trời đẹp và mát mẻ, "
+        "rất thích hợp để đi dạo. Bạn cần giúp gì không?"
+    )
+    detector = StreamClauseDetector()
+    pairs: list[tuple[str, str]] = []
+    for offset in range(0, len(text), chunk_size):
+        pairs.extend(detector.add_chunk_with_separators(text[offset : offset + chunk_size]))
+    tail = detector.finish()
+
+    clauses = [clause for clause, _ in pairs]
+    assert clauses == [
+        "Xin chào, tôi là trợ lý ảo.",
+        "Hôm nay trời đẹp và mát mẻ,",
+        "rất thích hợp để đi dạo.",
+        "Bạn cần giúp gì không?",
+    ]
+    assert [_boundary_kind(clause, separator) for clause, separator in pairs] == [
+        "sentence",
+        "clause",
+        "sentence",
+        "sentence",
+    ]
+    assert " ".join(clauses) == text
+    assert tail == ""
+
+
+def test_stream_clause_detector_incremental_scan_preserves_pending_boundaries() -> None:
+    """Test a delimiter run and a growing short clause survive an incremental resume."""
+    # A run arriving across chunks must be matched as a whole, not per character.
+    detector = StreamClauseDetector(min_clause_chars=3)
+    assert not list(detector.add_chunk("a\u2013"))
+    assert list(detector.add_chunk("\u2013")) == ["a\u2013\u2013"]
+    assert detector.finish() == ""
+
+    # A trailing delimiter below the clause minimum becomes eligible as its
+    # trailing whitespace arrives, so the scan must resume at the delimiter.
+    detector = StreamClauseDetector(min_clause_chars=5)
+    assert not list(detector.add_chunk("Ab\u2013"))
+    assert not list(detector.add_chunk(" "))
+    assert list(detector.add_chunk(" ")) == ["Ab\u2013"]
+    assert detector.finish() == ""
+
+
 async def test_tts_streaming_subsentence_engine_does_not_split_commas() -> None:
     """Test streaming with chunks_are_sentences=False avoids clause fragmentation."""
     engine = FakeTTS([np.array([0.5], dtype=np.float32)], chunks_are_sentences=False)

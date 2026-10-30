@@ -688,6 +688,8 @@ def _audio_to_pcm_bytes(audio: np.ndarray) -> bytes:
 _SENTENCE_END_CHARS = frozenset(".!?…")
 _CLAUSE_END_CHARS = frozenset(",;:\u2013\u2014-")
 _LINE_BREAK_CHARS = frozenset("\n")
+# Union used to keep an incremental scan from resuming inside one delimiter run.
+_ALL_DELIMITER_CHARS = _SENTENCE_END_CHARS | _CLAUSE_END_CHARS | _LINE_BREAK_CHARS
 # Subset of the delimiters above that also separate digits: "33,8", "1.000", "10:30".
 _NUMERIC_SEPARATOR_CHARS = frozenset(",.:\u2013\u2014-")
 # Subset of the delimiters above that also joins one token: "Wi-Fi", "e-mail", "TP-HCM".
@@ -834,6 +836,9 @@ class StreamClauseDetector:
         # Whitespace discarded after the most recent boundary, kept so a merged
         # final tail can be restored without rewriting the requested text.
         self.trailing_separator = ""
+        # Delimiter matches before this offset were settled by earlier scans and cannot
+        # change when more text arrives, so each streaming chunk only rescans the tail.
+        self._scan_offset = 0
 
     def add_chunk_with_separators(self, text: str) -> list[tuple[str, str]]:
         """Buffer incoming streaming text and yield clauses with their trailing separators."""
@@ -848,6 +853,7 @@ class StreamClauseDetector:
         """Flush all remaining text at stream end."""
         text = self.buffer.strip()
         self.buffer = ""
+        self._scan_offset = 0
         return text
 
     @staticmethod
@@ -901,6 +907,8 @@ class StreamClauseDetector:
             piece = head.strip()
             self.buffer = window[end_pos:].lstrip()
             self.trailing_separator = window[leading + len(piece) : len(window) - len(self.buffer)]
+            # The remainder is a fresh window, so its first delimiter must be rescanned.
+            self._scan_offset = 0
             if piece:
                 yielded.append((piece, self.trailing_separator))
         return yielded
@@ -912,21 +920,53 @@ class StreamClauseDetector:
             None,
         )
 
+    def _resume_offset(self, *match_groups: Sequence[re.Match[str]]) -> int:
+        """Return the first position whose boundary decision may still change.
+
+        Every delimiter with an older sibling has fixed context: a token scan that
+        follows it stops at that sibling. Only the last candidate of each pattern can
+        be waiting at the end of the buffer for more text, so scanning resumes there.
+        The offset is widened to the start of its delimiter run because a run split
+        by the resume point would be classified one character at a time.
+        """
+        last_starts = [matches[-1].start() for matches in match_groups if matches]
+        offset = min(last_starts, default=len(self.buffer))
+        while offset > 0 and self.buffer[offset - 1] in _ALL_DELIMITER_CHARS:
+            offset -= 1
+        return offset
+
     def _find_natural_boundary(self) -> re.Match[str] | None:
         """Find the earliest paragraph, sentence, or sufficiently long clause delimiter."""
-        paragraph_match = self._first_text_boundary(_PARAGRAPH_DELIM_RE.finditer(self.buffer))
-        sentence_match = self._first_text_boundary(_SENTENCE_DELIM_RE.finditer(self.buffer))
-        clause_match = (
-            self._first_text_boundary(
-                match
-                for match in _CLAUSE_DELIM_RE.finditer(self.buffer)
-                if match.end() >= self.min_clause_chars
-            )
+        paragraph_matches = list(_PARAGRAPH_DELIM_RE.finditer(self.buffer, self._scan_offset))
+        sentence_matches = list(_SENTENCE_DELIM_RE.finditer(self.buffer, self._scan_offset))
+        clause_matches = (
+            list(_CLAUSE_DELIM_RE.finditer(self.buffer, self._scan_offset))
             if self.split_clauses
-            else None
+            else []
+        )
+        clause_candidates = [
+            match for match in clause_matches if match.end() >= self.min_clause_chars
+        ]
+        # A trailing short clause can still grow to the minimum as its trailing
+        # whitespace arrives, so it stays resumable without being a boundary yet.
+        clause_resume = [
+            match
+            for match in clause_matches
+            if match.end() >= self.min_clause_chars or match.end() == len(self.buffer)
+        ]
+        self._scan_offset = self._resume_offset(
+            paragraph_matches,
+            sentence_matches,
+            clause_resume,
         )
         if candidates := [
-            match for match in (paragraph_match, sentence_match, clause_match) if match is not None
+            match
+            for match in (
+                self._first_text_boundary(paragraph_matches),
+                self._first_text_boundary(sentence_matches),
+                self._first_text_boundary(clause_candidates),
+            )
+            if match is not None
         ]:
             return min(candidates, key=lambda match: match.start())
         return None

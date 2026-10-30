@@ -160,6 +160,13 @@ def _checkout_repo(clone_dest: Path, repo_url: str, commit: str) -> None:
 _COMMON_DISABLED_CMAKE_FLAGS: Final = [
     "-DGGML_NATIVE=OFF",
     "-DGGML_NATIVE_DEFAULT=OFF",
+    # ggml's OpenMP path runs every graph node inside an OpenMP parallel region
+    # and uses omp barriers between nodes. On a 4-core device the four GGML
+    # workers plus the codec thread oversubscribe those regions badly: measured
+    # on a four-core SSE4 host, an OpenMP build ran the same 12-codebook stream
+    # at RTF 2.0 while the native threadpool path ran at RTF 0.5. The runtime
+    # now installs one persistent ggml threadpool instead.
+    "-DGGML_OPENMP=OFF",
     "-DGGML_AVX512_BF16=OFF",
     "-DGGML_AVX512_VBMI=OFF",
     "-DGGML_AVX512_VNNI=OFF",
@@ -242,7 +249,6 @@ def _get_sse4_build_flags() -> tuple[list[str], list[str]]:
     flags_str = " ".join(c_flags)
     cmake_flags = [
         *_COMMON_DISABLED_CMAKE_FLAGS,
-        "-DGGML_OPENMP=ON",
         _ENABLE_SSE42,
         "-DGGML_AVX=OFF",
         *_DISABLE_AVX2_FAMILY,
@@ -266,9 +272,13 @@ def _get_variant_build_flags(variant: str) -> tuple[list[str], list[str]]:
     """
     if variant == ZeroTtsVariant.NATIVE:
         machine = platform.machine().lower()
+        # Keep the native variant on the same ggml runtime configuration as the
+        # other variants: without this the CMake default re-enables OpenMP, and
+        # the persistent-threadpool path (needed on <= 4-core devices) is lost.
+        cmake_flags = ["-DGGML_OPENMP=OFF", "-DGGML_NATIVE=ON"]
         if machine in ("aarch64", "arm64"):
-            return (["-DGGML_NATIVE=ON"], ["-mcpu=native"])
-        return (["-DGGML_NATIVE=ON"], ["-march=native"])
+            return (cmake_flags, ["-mcpu=native"])
+        return (cmake_flags, ["-march=native"])
 
     if variant == ZeroTtsVariant.ARM_DOTPROD:
         cmake_flags = [
