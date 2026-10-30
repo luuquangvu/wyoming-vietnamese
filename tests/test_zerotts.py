@@ -984,6 +984,58 @@ def test_zerotts_engine_fallback_token_count_does_not_truncate(tmp_path: Path) -
     assert all(engine.text_token_count(segment) <= engine.max_text_tokens for segment in segments)
 
 
+def test_zerotts_engine_token_count_memoizes_repeated_text(tmp_path: Path) -> None:
+    """Test repeated token counts reuse one tokenizer pass for the same text."""
+    engine, _, _, fake_tokenizer = _setup_engine_fixture(tmp_path)
+    fake_tokenizer.encode_body.side_effect = lambda text: [1] * len(text)
+
+    assert engine.text_token_count("một hai") == 7
+    assert engine.text_token_count("một hai") == 7
+    assert fake_tokenizer.encode_body.call_count == 1
+
+    assert engine.text_token_count("ba bốn") == 6
+    assert fake_tokenizer.encode_body.call_count == 2
+
+    # The one-entry cache was replaced, so the older text needs a fresh encode.
+    assert engine.text_token_count("một hai") == 7
+    assert fake_tokenizer.encode_body.call_count == 3
+
+
+def test_zerotts_engine_token_count_memoizes_fallback_path(tmp_path: Path) -> None:
+    """Test token counts without callable encode_body are also memoized."""
+    engine, _, _, fake_tokenizer = _setup_engine_fixture(tmp_path)
+    fake_tokenizer.encode_body = None
+    fake_tokenizer.side_effect = lambda text, max_length=512: np.asarray(
+        [1] + [2] * len(text) + [3], dtype=np.int32
+    )
+
+    assert engine.text_token_count("một hai") == 7
+    assert engine.text_token_count("một hai") == 7
+    assert fake_tokenizer.call_count == 1
+
+    assert engine.text_token_count("ba bốn") == 6
+    assert fake_tokenizer.call_count == 2
+
+    # The one-entry cache was replaced, so the older text needs a fresh encode.
+    assert engine.text_token_count("một hai") == 7
+    assert fake_tokenizer.call_count == 3
+
+
+def test_zerotts_engine_word_split_falls_back_when_word_counts_do_not_compose(
+    tmp_path: Path,
+) -> None:
+    """Test a non-composing tokenizer still produces segments inside the limit."""
+    engine, _, _, fake_tokenizer = _setup_engine_fixture(tmp_path)
+    # A standalone word fits, but any candidate joining two words is far over.
+    fake_tokenizer.encode_body.side_effect = lambda text: (
+        [1] * (10_000 if " " in text.strip() else len(text))
+    )
+
+    segments = engine.split_text_by_tokens("một hai ba bốn", max_tokens=10)
+    assert segments == ("một", "hai", "ba", "bốn")
+    assert all(engine.text_token_count(segment) <= 10 for segment in segments)
+
+
 @pytest.mark.parametrize("num_codebooks", [1, 8])
 def test_zerotts_engine_queued_chunks_survive_buffer_reuse(
     tmp_path: Path, num_codebooks: int
@@ -2845,6 +2897,8 @@ def test_get_variant_build_flags_definitions_and_compiler_options() -> None:
     assert "-DGGML_AVX=OFF" in compat_cmake
     assert "-DGGML_AVX2=OFF" in compat_cmake
     assert "-DGGML_AVX512=OFF" in compat_cmake
+    assert "-DGGML_OPENMP=OFF" in compat_cmake
+    assert "-DGGML_OPENMP=ON" not in compat_cmake
     assert not compat_gxx
 
     # SSE4
@@ -2853,7 +2907,8 @@ def test_get_variant_build_flags_definitions_and_compiler_options() -> None:
     assert "-DGGML_AVX=OFF" in sse4_cmake
     assert "-DGGML_AVX2=OFF" in sse4_cmake
     assert "-DGGML_AVX512=OFF" in sse4_cmake
-    assert "-DGGML_OPENMP=ON" in sse4_cmake
+    assert "-DGGML_OPENMP=OFF" in sse4_cmake
+    assert "-DGGML_OPENMP=ON" not in sse4_cmake
     assert any(flag.startswith("-DCMAKE_C_FLAGS=") for flag in sse4_cmake)
     assert any(flag.startswith("-DCMAKE_CXX_FLAGS=") for flag in sse4_cmake)
     assert "-msse4.2" in sse4_gxx
@@ -2895,11 +2950,15 @@ def test_get_variant_build_flags_definitions_and_compiler_options() -> None:
     with patch("platform.machine", return_value="x86_64"):
         native_cmake, native_gxx = _get_variant_build_flags(ZeroTtsVariant.NATIVE)
         assert "-DGGML_NATIVE=ON" in native_cmake
+        assert "-DGGML_OPENMP=OFF" in native_cmake
+        assert "-DGGML_OPENMP=ON" not in native_cmake
         assert "-march=native" in native_gxx
 
     with patch("platform.machine", return_value="aarch64"):
         native_arm_cmake, native_arm_gxx = _get_variant_build_flags(ZeroTtsVariant.NATIVE)
         assert "-DGGML_NATIVE=ON" in native_arm_cmake
+        assert "-DGGML_OPENMP=OFF" in native_arm_cmake
+        assert "-DGGML_OPENMP=ON" not in native_arm_cmake
         assert "-mcpu=native" in native_arm_gxx
 
 

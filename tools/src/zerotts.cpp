@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <numeric>
 #include <string>
 #include <thread>
@@ -54,15 +55,71 @@ struct zt_dec_layer { zt_norm n_self, n_cross, n_context, n_ffn;
                       zt_attn self_a, cross_a; zt_ffn ffn; };
 struct zt_loc_layer { zt_norm n_attn, n_ffn; zt_attn attn; zt_ffn ffn; };
 
+namespace {
+
+// A scratch context for one graph build. ggml graphs here are small (a few
+// hundred nodes) and cheap to rebuild, so callers that run once per frame
+// construct one on the stack rather than caching graphs keyed on shape.
+struct scratch {
+    uint8_t * mem_ptr = nullptr;
+    size_t    mem_size = 0;
+    ggml_context * c  = nullptr;
+    ggml_cgraph  * gf = nullptr;
+
+    explicit scratch(size_t n_nodes = 4096) {
+        thread_local static std::vector<uint8_t> tls_mem;
+        const size_t req_size = ggml_tensor_overhead() * n_nodes +
+                                ggml_graph_overhead_custom(n_nodes, false);
+        if (tls_mem.size() < req_size) {
+            tls_mem.resize(req_size);
+        }
+        mem_ptr = tls_mem.data();
+        mem_size = req_size;
+        ggml_init_params ip = { mem_size, mem_ptr, /*no_alloc*/ true };
+        c  = ggml_init(ip);
+        gf = ggml_new_graph_custom(c, n_nodes, false);
+    }
+    ~scratch() { if (c) ggml_free(c); }
+};
+
+// One depth of the local (frame) transformer, built once per model load.
+//
+// The topology of a local step never changes while a model is loaded, and
+// building its 139-node graph plus re-planning its allocations accounts for
+// roughly 8% of the local transformer's run time when repeated 17 times per
+// frame. Each depth therefore keeps its own graph and allocator alive; the
+// per-frame path only writes the input tensor, computes, and reads the logits.
+// A private allocator per depth is required because ggml's graph allocator only
+// tracks the allocations of the last graph it planned.
+struct zt_local_graph {
+    std::vector<uint8_t> mem;
+    ggml_context *       ctx   = nullptr;
+    ggml_cgraph *        gf    = nullptr;
+    ggml_gallocr_t       alloc = nullptr;
+    ggml_tensor *        in_h        = nullptr;
+    ggml_tensor *        in_id       = nullptr;
+    ggml_tensor *        in_ctrl_ids = nullptr;
+    ggml_tensor *        logits      = nullptr;
+
+    ~zt_local_graph() {
+        if (alloc) ggml_gallocr_free(alloc);
+        if (ctx)   ggml_free(ctx);
+    }
+};
+
+} // namespace
+
 struct zerotts_context {
     zerotts_hparams hp{};
 
     ggml_backend_t         backend  = nullptr;
+    ggml_threadpool *      threadpool = nullptr;
     ggml_context *         ctx_w    = nullptr;
     ggml_backend_buffer_t  buf_w    = nullptr;
     ggml_context *         ctx_kv   = nullptr;
     ggml_backend_buffer_t  buf_kv   = nullptr;
     ggml_gallocr_t         alloc    = nullptr;
+    std::vector<std::unique_ptr<zt_local_graph>> local_graphs;
     int                    n_threads = 4;
     int                    max_codebooks = 0;
 
@@ -88,6 +145,8 @@ struct zerotts_context {
 
     std::vector<float>   h;      // current global hidden, d_model
     std::vector<uint8_t> seen;   // repetition history, num_codebooks * codebook_size
+    // Voice latent whose prefix already occupies decoder positions [0, V).
+    std::vector<float>   prefix_voice;
 
     double t_text = 0, t_frame = 0, t_advance = 0;   // ms
     int    n_frames = 0;
@@ -402,6 +461,106 @@ static bool zt_alloc_cache(zerotts_context * m) {
     return m->buf_kv != nullptr;
 }
 
+// ── local depth transformer graphs ──────────────────────────────────────────
+
+// Build the persistent graph for one local depth. The body mirrors the old
+// per-frame build; the only difference is that the result is retained.
+static bool zt_build_local_graph(zerotts_context * m, int depth, zt_local_graph & g) {
+    const zerotts_hparams & hp = m->hp;
+
+    // Depth-graph node count grows with the local transformer; the 256 floor
+    // matches the shipped 4-layer model (139 nodes) and leaves headroom for
+    // deeper models without over-allocating the per-depth scratch context.
+    const size_t n_nodes = std::max<size_t>(256, 64 + 48 * (size_t) hp.local_n_layers);
+    const size_t req_size = ggml_tensor_overhead() * n_nodes +
+                            ggml_graph_overhead_custom(n_nodes, false);
+    g.mem.resize(req_size);
+    ggml_init_params ip = { req_size, g.mem.data(), /*no_alloc*/ true };
+    g.ctx = ggml_init(ip);
+    if (!g.ctx) return false;
+    ggml_context * c = g.ctx;
+    g.gf = ggml_new_graph_custom(c, n_nodes, false);
+
+    ggml_tensor * x = nullptr;
+    if (depth == 0) {
+        g.in_h = ggml_new_tensor_2d(c, GGML_TYPE_F32, hp.d_model, 1);
+        ggml_set_input(g.in_h);
+        x = g.in_h;
+    } else {
+        g.in_id = ggml_new_tensor_1d(c, GGML_TYPE_I32, 1);
+        ggml_set_input(g.in_id);
+        // Depth 1 reads the control token embedding; depth d>=2 reads the
+        // previously sampled code from codebook d-2 (see zt_frame_impl).
+        ggml_tensor * embed_table =
+            (depth == 1) ? m->text_embed : m->audio_embed[depth - 2];
+        x = ggml_get_rows(c, embed_table, g.in_id);
+    }
+
+    // Learned depth position embedding — the local transformer uses no RoPE.
+    ggml_tensor * de = ggml_view_2d(c, m->depth_embed, hp.d_model, 1,
+                                    m->depth_embed->nb[1],
+                                    (size_t) depth * m->depth_embed->nb[1]);
+    x = ggml_add(c, x, de);
+
+    for (int i = 0; i < hp.local_n_layers; i++) {
+        const zt_loc_layer & l = m->loc[i];
+        ggml_tensor * a = zt_layer_norm(c, x, l.n_attn, hp.layer_norm_eps);
+        a = zt_attn_cached(c, g.gf, l.attn, a, m->lkv_k[i], m->lkv_v[i],
+                           /*pos*/ nullptr, 1, /*kv_head*/ depth, /*n_kv*/ depth + 1,
+                           hp.local_n_heads, hp.d_model, hp.n_depth, hp.rope_theta);
+        x = ggml_add(c, x, a);
+        ggml_tensor * f = zt_layer_norm(c, x, l.n_ffn, hp.layer_norm_eps);
+        x = ggml_add(c, x, zt_feed_forward(c, f, l.ffn));
+    }
+    ggml_tensor * hid = ggml_norm(c, x, hp.layer_norm_eps);
+    hid = ggml_add(c, ggml_mul(c, hid, m->local_ln_f_w), m->local_ln_f_b);
+
+    if (depth == 0) {
+        // The control head is tied to the 8192-row embedding table, but only
+        // <slot> and <eoa> are ever legal here (export_onnx.py restricts the
+        // logits to those two before sampling). Gathering the two rows turns a
+        // 8192x768 matvec into a 2x768 one — ~6 MB/frame of reads that the
+        // ONNX graph pays and this does not.
+        g.in_ctrl_ids = ggml_new_tensor_1d(c, GGML_TYPE_I32, 2);
+        ggml_set_input(g.in_ctrl_ids);
+        ggml_tensor * rows = ggml_get_rows(c, m->text_embed, g.in_ctrl_ids);  // (d, 2)
+        g.logits = ggml_mul_mat(c, rows, hid);                                // (2, 1)
+    } else {
+        g.logits = ggml_mul_mat(c, m->audio_head[depth - 1], hid);            // (C, 1)
+    }
+    ggml_set_output(g.logits);
+    ggml_build_forward_expand(g.gf, g.logits);
+
+    g.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m->backend));
+    if (!g.alloc) return false;
+    return ggml_gallocr_alloc_graph(g.alloc, g.gf);
+}
+
+static bool zt_init_local_graphs(zerotts_context * m) {
+    const zerotts_hparams & hp = m->hp;
+    // Depth 0 is the control head; depths 1..n_depth-1 each read audio_embed
+    // (depth-2) and audio_head (depth-1). The deepest head index is therefore
+    // n_depth-2, so n_depth must not exceed num_codebooks + 1 or the graph build
+    // would index past the head table.
+    if ((int64_t) hp.n_depth > (int64_t) hp.num_codebooks + 1) {
+        fprintf(stderr, "zerotts: n_depth %d exceeds num_codebooks %d + 1\n",
+                hp.n_depth, hp.num_codebooks);
+        return false;
+    }
+    const int depth_count = std::max(1, hp.n_depth);
+    m->local_graphs.clear();
+    m->local_graphs.reserve((size_t) depth_count);
+    for (int depth = 0; depth < depth_count; depth++) {
+        std::unique_ptr<zt_local_graph> graph(new zt_local_graph());
+        if (!zt_build_local_graph(m, depth, *graph)) {
+            m->local_graphs.clear();
+            return false;
+        }
+        m->local_graphs.push_back(std::move(graph));
+    }
+    return true;
+}
+
 static zerotts_context * zt_finish_init(zerotts_context * m, loader & L,
                                         const uint8_t * blob, FILE * f) {
     if (!zt_load_common(m, L)) { zerotts_free(m); return nullptr; }
@@ -434,6 +593,7 @@ static zerotts_context * zt_finish_init(zerotts_context * m, loader & L,
     }
 
     if (!zt_alloc_cache(m)) { zerotts_free(m); return nullptr; }
+    if (!zt_init_local_graphs(m)) { zerotts_free(m); return nullptr; }
 
     m->alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m->backend));
     m->h.assign(m->hp.d_model, 0.0f);
@@ -447,11 +607,25 @@ static int zt_default_threads(int n) {
     return hc ? (int) std::min(hc, 8u) : 4;
 }
 
+// ggml creates and destroys a disposable thread pool for every
+// ggml_backend_graph_compute when no pool is set: 14 times per frame (one global
+// step plus one per depth), each spawning n_threads-1 OS threads. Keep one pool
+// alive instead. Without OpenMP this is also what makes the native threadpool
+// path usable at all; it measured ~25% faster than disposable pools on four cores.
+static bool zt_init_threadpool(zerotts_context * m) {
+    struct ggml_threadpool_params params = ggml_threadpool_params_default(m->n_threads);
+    m->threadpool = ggml_threadpool_new(&params);
+    if (!m->threadpool) return false;
+    ggml_backend_cpu_set_threadpool(m->backend, m->threadpool);
+    return true;
+}
+
 zerotts_context * zerotts_init_from_file(const char * path, int n_threads) {
     auto * m = new zerotts_context();
     m->n_threads = zt_default_threads(n_threads);
     m->backend = ggml_backend_cpu_init();
     if (!m->backend) { delete m; return nullptr; }
+    if (!zt_init_threadpool(m)) { zerotts_free(m); return nullptr; }
 
     loader L;
     L.m = m;
@@ -481,6 +655,7 @@ zerotts_context * zerotts_init_from_buffer(const void * data, size_t size, int n
     m->n_threads = zt_default_threads(n_threads);
     m->backend = ggml_backend_cpu_init();
     if (!m->backend) { delete m; return nullptr; }
+    if (!zt_init_threadpool(m)) { zerotts_free(m); return nullptr; }
 
     FILE * f = fmemopen(const_cast<void *>(data), size, "rb");
     if (!f) { zerotts_free(m); return nullptr; }
@@ -501,11 +676,14 @@ zerotts_context * zerotts_init_from_buffer(const void * data, size_t size, int n
 
 void zerotts_free(zerotts_context * m) {
     if (!m) return;
+    // Cached depth graphs own compute buffers that the backend allocated.
+    m->local_graphs.clear();
     if (m->alloc)   ggml_gallocr_free(m->alloc);
     if (m->buf_w)   ggml_backend_buffer_free(m->buf_w);
     if (m->buf_kv)  ggml_backend_buffer_free(m->buf_kv);
     if (m->ctx_w)   ggml_free(m->ctx_w);
     if (m->ctx_kv)  ggml_free(m->ctx_kv);
+    if (m->threadpool) ggml_threadpool_free(m->threadpool);
     if (m->backend) ggml_backend_free(m->backend);
     delete m;
 }
@@ -540,35 +718,6 @@ void zerotts_reset_timings(zerotts_context * m) {
 }
 
 // ── graph scaffolding ───────────────────────────────────────────────────────
-
-namespace {
-
-// A scratch context for one graph build. ggml graphs here are small (a few
-// hundred nodes) and cheap to rebuild, so each call constructs its own rather
-// than caching graphs keyed on shape.
-struct scratch {
-    uint8_t * mem_ptr = nullptr;
-    size_t    mem_size = 0;
-    ggml_context * c  = nullptr;
-    ggml_cgraph  * gf = nullptr;
-
-    explicit scratch(size_t n_nodes = 4096) {
-        thread_local static std::vector<uint8_t> tls_mem;
-        const size_t req_size = ggml_tensor_overhead() * n_nodes +
-                                ggml_graph_overhead_custom(n_nodes, false);
-        if (tls_mem.size() < req_size) {
-            tls_mem.resize(req_size);
-        }
-        mem_ptr = tls_mem.data();
-        mem_size = req_size;
-        ggml_init_params ip = { mem_size, mem_ptr, /*no_alloc*/ true };
-        c  = ggml_init(ip);
-        gf = ggml_new_graph_custom(c, n_nodes, false);
-    }
-    ~scratch() { if (c) ggml_free(c); }
-};
-
-} // namespace
 
 static bool zt_compute(zerotts_context * m, scratch & s) {
     if (!ggml_gallocr_alloc_graph(m->alloc, s.gf)) {
@@ -760,79 +909,29 @@ static bool zt_run_decoder_step(zerotts_context * m, const int32_t * codes, int 
 // Depth 0 takes the global hidden directly and reads the control head; depths
 // 1..K take an embedding lookup and read codebook (depth-1)'s head. No mask:
 // depths are generated in order, so the cache is already causal.
+//
+// The graph itself is built once per model load by zt_build_local_graph; this
+// function only feeds its input and evaluates it.
 static bool zt_local_step(zerotts_context * m, int depth,
-                          const float * hidden_in,
-                          ggml_tensor * embed_table, int32_t embed_id,
+                          const float * hidden_in, int32_t embed_id,
                           float * out_logits) {
     const zerotts_hparams & hp = m->hp;
     const int n_logits = (depth == 0) ? 2 : hp.codebook_size;
+    if (depth < 0 || (size_t) depth >= m->local_graphs.size()) return false;
+    const zt_local_graph & g = *m->local_graphs[(size_t) depth];
 
-    scratch s(1024);
-    ggml_context * c = s.c;
-
-    ggml_tensor * in_h  = nullptr;
-    ggml_tensor * in_id = nullptr;
-    ggml_tensor * x     = nullptr;
     if (depth == 0) {
-        in_h = ggml_new_tensor_2d(c, GGML_TYPE_F32, hp.d_model, 1);
-        ggml_set_input(in_h);
-        x = in_h;
-    } else {
-        in_id = ggml_new_tensor_1d(c, GGML_TYPE_I32, 1);
-        ggml_set_input(in_id);
-        x = ggml_get_rows(c, embed_table, in_id);
-    }
-
-    // Learned depth position embedding — the local transformer uses no RoPE.
-    ggml_tensor * de = ggml_view_2d(c, m->depth_embed, hp.d_model, 1,
-                                    m->depth_embed->nb[1],
-                                    (size_t) depth * m->depth_embed->nb[1]);
-    x = ggml_add(c, x, de);
-
-    for (int i = 0; i < hp.local_n_layers; i++) {
-        const zt_loc_layer & l = m->loc[i];
-        ggml_tensor * a = zt_layer_norm(c, x, l.n_attn, hp.layer_norm_eps);
-        a = zt_attn_cached(c, s.gf, l.attn, a, m->lkv_k[i], m->lkv_v[i],
-                           /*pos*/ nullptr, 1, /*kv_head*/ depth, /*n_kv*/ depth + 1,
-                           hp.local_n_heads, hp.d_model, hp.n_depth, hp.rope_theta);
-        x = ggml_add(c, x, a);
-        ggml_tensor * f = zt_layer_norm(c, x, l.n_ffn, hp.layer_norm_eps);
-        x = ggml_add(c, x, zt_feed_forward(c, f, l.ffn));
-    }
-    ggml_tensor * hid = ggml_norm(c, x, hp.layer_norm_eps);
-    hid = ggml_add(c, ggml_mul(c, hid, m->local_ln_f_w), m->local_ln_f_b);
-
-    ggml_tensor * logits = nullptr;
-    ggml_tensor * in_ctrl_ids = nullptr;
-    if (depth == 0) {
-        // The control head is tied to the 8192-row embedding table, but only
-        // <slot> and <eoa> are ever legal here (export_onnx.py restricts the
-        // logits to those two before sampling). Gathering the two rows turns a
-        // 8192x768 matvec into a 2x768 one — ~6 MB/frame of reads that the
-        // ONNX graph pays and this does not.
-        in_ctrl_ids = ggml_new_tensor_1d(c, GGML_TYPE_I32, 2);
-        ggml_set_input(in_ctrl_ids);
-        ggml_tensor * rows = ggml_get_rows(c, m->text_embed, in_ctrl_ids);  // (d, 2)
-        logits = ggml_mul_mat(c, rows, hid);                                // (2, 1)
-    } else {
-        logits = ggml_mul_mat(c, m->audio_head[depth - 1], hid);            // (C, 1)
-    }
-    ggml_set_output(logits);
-    ggml_build_forward_expand(s.gf, logits);
-
-    if (!ggml_gallocr_alloc_graph(m->alloc, s.gf)) return false;
-    if (depth == 0) {
-        ggml_backend_tensor_set(in_h, hidden_in, 0, (size_t) hp.d_model * sizeof(float));
+        ggml_backend_tensor_set(g.in_h, hidden_in, 0, (size_t) hp.d_model * sizeof(float));
         const int32_t ctrl_ids[2] = { SLOT_ID, EOA_ID };
-        ggml_backend_tensor_set(in_ctrl_ids, ctrl_ids, 0, sizeof(ctrl_ids));
+        ggml_backend_tensor_set(g.in_ctrl_ids, ctrl_ids, 0, sizeof(ctrl_ids));
     } else {
-        ggml_backend_tensor_set(in_id, &embed_id, 0, sizeof(embed_id));
+        ggml_backend_tensor_set(g.in_id, &embed_id, 0, sizeof(embed_id));
     }
 
     ggml_backend_cpu_set_n_threads(m->backend, m->n_threads);
-    if (ggml_backend_graph_compute(m->backend, s.gf) != GGML_STATUS_SUCCESS) return false;
+    if (ggml_backend_graph_compute(m->backend, g.gf) != GGML_STATUS_SUCCESS) return false;
 
-    ggml_backend_tensor_get(logits, out_logits, 0, (size_t) n_logits * sizeof(float));
+    ggml_backend_tensor_get(g.logits, out_logits, 0, (size_t) n_logits * sizeof(float));
     return true;
 }
 
@@ -917,7 +1016,23 @@ int zerotts_begin(zerotts_context * m, const int32_t * text_ids, int n_text,
     std::fill(m->seen.begin(), m->seen.end(), 0);
 
     if (!zt_run_text(m, text_ids, n_text)) return -1;
-    if (!zt_run_voice_prefix(m, voice_emb)) return -1;
+    // The voice block is a bidirectional self-attention pass over a fixed
+    // latent: its K/V entries at positions [0, V) depend only on the voice and
+    // nothing later in a segment writes them. Streaming TTS starts a new
+    // segment for every sentence, so reuse the prefix when the voice is
+    // unchanged instead of re-running a whole decoder-layer pass per sentence.
+    const size_t voice_size = (size_t) m->hp.n_voice_queries * m->hp.d_model;
+    const bool prefix_cached =
+        m->prefix_voice.size() == voice_size &&
+        memcmp(m->prefix_voice.data(), voice_emb, voice_size * sizeof(float)) == 0;
+    if (!prefix_cached) {
+        // Drop the old key first: a failed prefix pass can leave partially
+        // rewritten K/V entries, so the next begin must recompute even if it
+        // asks for the voice this cache used to describe.
+        m->prefix_voice.clear();
+        if (!zt_run_voice_prefix(m, voice_emb)) return -1;
+        m->prefix_voice.assign(voice_emb, voice_emb + voice_size);
+    }
     m->n_kv = m->hp.n_voice_queries;
 
     // <soa> sits at position V and is the first position that cross-attends to
@@ -940,7 +1055,7 @@ static int zt_frame_impl(zerotts_context * m, bool forbid_eoa, const zerotts_sam
 
     // depth 0 -> the control channel, restricted to {<slot>, <eoa>}.
     float ctrl[2] = { 0.0f, 0.0f };
-    if (!zt_local_step(m, 0, m->h.data(), nullptr, 0, ctrl)) return -1;
+    if (!zt_local_step(m, 0, m->h.data(), 0, ctrl)) return -1;
     if (forbid_eoa) ctrl[1] = -INFINITY;
     // Only two candidates exist, so top-k is clamped to 2 and top-p is a no-op.
     const int32_t picked = zt_sample(ctrl, 2, ctrl_u, sp->text_temperature,
@@ -951,14 +1066,13 @@ static int zt_frame_impl(zerotts_context * m, bool forbid_eoa, const zerotts_sam
     // channels do not see the sampled control token (see _local_generate's
     // docstring and LocalFrameDecodeONNX.forward, which agree on this).
     std::vector<float> logits(hp.codebook_size);
-    ggml_tensor * table = m->text_embed;
     int32_t       id    = SLOT_ID;
     int effective_codebooks = hp.num_codebooks;
     if (m->max_codebooks > 0 && m->max_codebooks < effective_codebooks) {
         effective_codebooks = m->max_codebooks;
     }
     for (int cbk = 0; cbk < effective_codebooks; cbk++) {
-        if (!zt_local_step(m, cbk + 1, nullptr, table, id, logits.data())) return -1;
+        if (!zt_local_step(m, cbk + 1, nullptr, id, logits.data())) return -1;
 
         uint8_t * seen_c = m->seen.data() + (size_t) cbk * hp.codebook_size;
         zt_apply_repetition_penalty(logits.data(), hp.codebook_size, seen_c,
@@ -970,8 +1084,7 @@ static int zt_frame_impl(zerotts_context * m, bool forbid_eoa, const zerotts_sam
         seen_c[fed] = 1;
         out_codes[cbk] = code;
 
-        table = m->audio_embed[cbk];
-        id    = fed;
+        id = fed;
     }
     for (int cbk = effective_codebooks; cbk < hp.num_codebooks; cbk++) {
         out_codes[cbk] = 0;
