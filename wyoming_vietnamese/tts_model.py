@@ -13,7 +13,7 @@ import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, NamedTuple, overload
+from typing import Literal, overload
 
 from .const import (
     DEFAULT_TTS_ENGINE,
@@ -535,7 +535,8 @@ def resolve_quality_codebooks(
     return ZeroTtsCodebook.MEDIUM if is_edge else ZeroTtsCodebook.DEFAULT
 
 
-class ZeroTtsModelResolution(NamedTuple):
+@dataclass(frozen=True, slots=True)
+class ZeroTtsModelResolution:
     """Resolved ZeroTTS model specification and target GGUF file path."""
 
     spec: ZeroTtsModelSpec

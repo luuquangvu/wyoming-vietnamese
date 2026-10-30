@@ -223,7 +223,7 @@ def _init_zerotts_from_config(
             **extra_kwargs,
         )
 
-    _, gguf_path = resolve_zerotts_model(tts_path, server_config.zerotts_model)
+    gguf_path = resolve_zerotts_model(tts_path, server_config.zerotts_model).gguf_path
     return initialize_zerotts(
         tts_path,
         voices,

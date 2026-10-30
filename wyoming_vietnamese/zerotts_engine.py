@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Protocol
 
@@ -119,6 +120,16 @@ class _ZeroTtsHParams(ctypes.Structure):
         ("layer_norm_eps", ctypes.c_float),
         ("qk_norm_eps", ctypes.c_float),
     ]
+
+
+@dataclass(frozen=True, slots=True)
+class _ZeroTtsTimings:
+    """Native timing counters for one synthesis segment."""
+
+    text_ms: float
+    frame_ms: float
+    advance_ms: float
+    frame_count: int
 
 
 def _get_variant_fallback_order(optimal_variant: str) -> list[str]:
@@ -679,6 +690,9 @@ def _configure_zerotts_lib_signatures(lib: ctypes.CDLL) -> ctypes.CDLL:
     if hasattr(lib, "zerotts_set_max_codebooks"):
         lib.zerotts_set_max_codebooks.argtypes = [ctypes.c_void_p, ctypes.c_int]
         lib.zerotts_set_max_codebooks.restype = None
+    if hasattr(lib, "zerotts_reset_timings"):
+        lib.zerotts_reset_timings.argtypes = [ctypes.c_void_p]
+        lib.zerotts_reset_timings.restype = None
     return lib
 
 
@@ -813,15 +827,14 @@ def resolve_zerotts_thread_budget(
 
     When pipelined streaming overlaps GGML autoregression with ONNX codec decoding,
     allocating full threads to both causes severe thread oversubscription on many-core systems.
-    The codec decodes in short bursts (one ~1.28 s slice every 16 frames), which once made it
+    The codec decodes in short bursts (one ~1.28 s slice every 16 frames), which makes it
     attractive to oversubscribe a <= 4-core device: give GGML every core and let the codec
     borrow one briefly (opportunistic=True).
 
-    These measurements were originally taken with ggml's OpenMP backend, whose parallel-region
-    overhead dominated on four cores. The service now builds ggml without OpenMP and installs
-    one persistent native threadpool, which changes the absolute numbers but keeps the same
-    trade-off: edge devices scale GGML poorly with fewer threads, so using every core for GGML
-    and letting the mostly-idle codec thread share one remains the default on <= 4 cores.
+    All shipped builds use ggml's OpenMP backend. Edge devices scale GGML poorly
+    with fewer threads, so giving every core to GGML and letting the mostly-idle
+    codec thread share one remains the default on <= 4 cores until an on-device
+    A/B shows otherwise.
 
     Strict partitioning (ggml + codec <= total_threads) is enforced with opportunistic=False,
     allowing callers on resource-constrained or strict-quota systems to retain strict budgeting.
@@ -1034,6 +1047,7 @@ class ZeroTtsGgmlEngine:
         self._ctx: ctypes.c_void_p | None = None
         self._busy_worker: threading.Thread | None = None
         self._cleanup_thread: threading.Thread | None = None
+        self._timing_baseline: _ZeroTtsTimings | None = None
 
         self._lib = resolve_zerotts_ggml_lib(custom_lib_path)
         self._ctx = self._lib.zerotts_init_from_file(
@@ -1563,6 +1577,16 @@ class ZeroTtsGgmlEngine:
         voice_emb_ptr = voice_emb.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
         text_ids_ptr = text_ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
 
+        # Isolate this segment's timings from the cumulative native counters.
+        # Libraries predating zerotts_reset_timings keep accumulating across
+        # segments, so snapshot them and report the difference on completion.
+        reset_timings = getattr(self._lib, "zerotts_reset_timings", None)
+        if callable(reset_timings):
+            reset_timings(self._ctx)
+            self._timing_baseline = None
+        else:
+            self._timing_baseline = self._read_native_timings()
+
         ret = self._lib.zerotts_begin(
             self._ctx,
             text_ids_ptr,
@@ -1817,6 +1841,76 @@ class ZeroTtsGgmlEngine:
                 yield from self._infer_stream_pipelined(stream)
         finally:
             stream.close()
+            self._log_native_timings(len(text))
+
+    def _read_native_timings(self) -> _ZeroTtsTimings | None:
+        """Read the raw native timing counters for the current context.
+
+        Returns:
+            Native timing counters, or None when the native context is closed.
+        """
+        if self._ctx is None:
+            return None
+        text_ms = ctypes.c_double()
+        frame_ms = ctypes.c_double()
+        advance_ms = ctypes.c_double()
+        frames = ctypes.c_int()
+        self._lib.zerotts_timings(
+            self._ctx,
+            ctypes.byref(text_ms),
+            ctypes.byref(frame_ms),
+            ctypes.byref(advance_ms),
+            ctypes.byref(frames),
+        )
+        return _ZeroTtsTimings(text_ms.value, frame_ms.value, advance_ms.value, frames.value)
+
+    def _log_native_timings(self, text_chars: int) -> None:
+        """Log native stage timings for the segment that just finished.
+
+        Counters are reset when a segment starts, so each line covers one
+        segment: text encoder plus voice prefix, frame loop, and advance step.
+        Libraries without zerotts_reset_timings keep cumulative counters, so
+        those are reported as deltas from the snapshot taken when the segment
+        started instead of being logged as per-segment totals.
+
+        The native counters are plain fields written by zerotts_frame and
+        zerotts_advance without synchronization. Reading them while the
+        producer worker is still running would race with those writes, so skip
+        the read when the worker outlived the shutdown timeout.
+
+        Args:
+            text_chars: Character count of the synthesized segment.
+        """
+        if not _LOGGER.isEnabledFor(logging.DEBUG) or self._ctx is None:
+            return
+        busy_worker = self._busy_worker
+        if busy_worker is not None and busy_worker.is_alive():
+            return
+        timings = self._read_native_timings()
+        if timings is None:
+            return
+        text_ms = timings.text_ms
+        frame_ms = timings.frame_ms
+        advance_ms = timings.advance_ms
+        frames = timings.frame_count
+        baseline = self._timing_baseline
+        if baseline is not None:
+            text_ms -= baseline.text_ms
+            frame_ms -= baseline.frame_ms
+            advance_ms -= baseline.advance_ms
+            frames -= baseline.frame_count
+        if frames <= 0:
+            return
+        _LOGGER.debug(
+            "ZeroTTS segment timings: chars=%d frames=%d text_prefix_ms=%.1f "
+            "frame_ms=%.1f advance_ms=%.1f frame_ms_per_frame=%.2f",
+            text_chars,
+            frames,
+            text_ms,
+            frame_ms,
+            advance_ms,
+            frame_ms / frames,
+        )
 
     def normalize(self, text: str, *, voice: str | None = None) -> str:
         """Return text after the normalizer used by inference."""
