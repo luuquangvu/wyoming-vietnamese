@@ -1,0 +1,136 @@
+name: Bug Report
+description: File a bug report to help us improve.
+labels: ["bug"]
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > [!NOTE]
+        > **Thank you for reporting this issue.**
+        > Please provide as much detail as possible to help us identify and resolve the problem efficiently.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I have searched existing [issues](https://github.com/luuquangvu/wyoming-vietnamese/issues?q=is%3Aissue) to ensure this hasn't been reported before.
+          required: true
+        - label: I have read the [troubleshooting section](https://github.com/luuquangvu/wyoming-vietnamese#xử-lý-sự-cố-thường-gặp-troubleshooting) of the README.
+          required: true
+        - label: I have updated to the latest Docker image (`latest`) or Home Assistant add-on version.
+          required: true
+  - type: input
+    id: ha_version
+    attributes:
+      label: Home Assistant Version
+      description: The version of Home Assistant you are running.
+      placeholder: e.g. 2026.10.0
+    validations:
+      required: true
+  - type: input
+    id: wyoming_vietnamese_version
+    attributes:
+      label: Wyoming Vietnamese Version / Image Tag
+      description: The Docker image tag, Home Assistant add-on version, or commit SHA you are running.
+      placeholder: e.g. latest, 20261030-abc1234, or 1.0.0
+    validations:
+      required: true
+  - type: dropdown
+    id: installation_method
+    attributes:
+      label: Installation Method
+      description: How is Wyoming Vietnamese installed?
+      options:
+        - Docker Compose (pre-built image)
+        - docker run
+        - Home Assistant Add-on
+        - Built from source
+        - Other / Unknown
+    validations:
+      required: true
+  - type: input
+    id: host_environment
+    attributes:
+      label: Host OS, Architecture & Hardware
+      description: Host operating system, CPU architecture, and hardware. CPU features matter for ZeroTTS.
+      placeholder: e.g. Debian 13, x86_64, Intel N100 (AVX2)
+    validations:
+      required: true
+  - type: dropdown
+    id: stt_engine
+    attributes:
+      label: STT Engine
+      description: The speech-to-text engine configured in `STT_ENGINE`.
+      options:
+        - zipformer
+        - gipformer
+        - Other / Unknown
+    validations:
+      required: true
+  - type: dropdown
+    id: tts_engine
+    attributes:
+      label: TTS Engine
+      description: The text-to-speech engine configured in `TTS_ENGINE`.
+      options:
+        - nghitts
+        - zerotts
+        - Other / Unknown
+    validations:
+      required: true
+  - type: input
+    id: tts_voice
+    attributes:
+      label: Configured Voices
+      description: The voice IDs configured in `TTS_VOICE`, in order.
+      placeholder: e.g. ngoc-huyen-moi, duy-onyx-moi
+  - type: textarea
+    id: environment
+    attributes:
+      label: Other Environment Configuration
+      description: Relevant variables such as `ZEROTTS_QUALITY`, `OFFLINE`, `CPU_THREADS`, `MAX_STT_AUDIO_SECONDS`, or TTS silence settings.
+      placeholder: |
+        ZEROTTS_QUALITY=auto
+        OFFLINE=false
+  - type: textarea
+    id: steps_to_reproduce
+    attributes:
+      label: Steps to Reproduce
+      description: Describe the steps to reproduce the issue.
+      placeholder: |
+        1. Go to...
+        2. Click on...
+        3. See error...
+    validations:
+      required: true
+  - type: textarea
+    id: expected_behavior
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: actual_behavior
+    attributes:
+      label: Actual Behavior
+      description: What actually happened?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Paste relevant logs from `docker logs wyoming-vietnamese`, the Home Assistant log, or the add-on log. Set `LOG_LEVEL` to `debug` when possible.
+      render: text
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Add any other context about the problem here.
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots
+      description: Optional. Add screenshots to help explain your problem.
