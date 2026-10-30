@@ -2433,7 +2433,11 @@ def initialize_zerotts(
         actual_gguf_path = Path(gguf_path)
     else:
         env_model = os.environ.get(ZeroTtsEnv.MODEL, "").strip() or None
-        _, actual_gguf_path = resolve_zerotts_model(model_dir, env_model, cpu_variant=variant)
+        actual_gguf_path = resolve_zerotts_model(
+            model_dir,
+            env_model,
+            cpu_variant=variant,
+        ).gguf_path
     if variant in ZEROTTS_EDGE_VARIANTS:
         if any(m in actual_gguf_path.name for m in ("q4", "hybrid")):
             _LOGGER.info(

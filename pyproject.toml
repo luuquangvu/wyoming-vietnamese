@@ -97,6 +97,7 @@ addopts = [
 [tool.pyright]
 typeCheckingMode = "standard"
 reportUnreachable = "warning"
+exclude = ["scratch"]
 
 [tool.interrogate]
 fail-under = 100

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import queue
 import re
@@ -927,6 +928,196 @@ def test_zerotts_engine_lifecycle_and_inference(tmp_path: Path) -> None:
     # Closed context error
     with pytest.raises(RuntimeError, match="ZeroTTS GGML context is closed"):
         list(engine.infer_stream("Alo"))
+
+
+def test_zerotts_engine_logs_native_timings_per_segment(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test a finished segment logs native stage timings when debug logging is on."""
+    engine, fake_cdll, _, _ = _setup_engine_fixture(tmp_path)
+
+    step_counter = {"val": 0}
+
+    def fake_frame(
+        ctx: int,
+        forbid_eoa: bool,
+        sp: object,
+        cu: float,
+        au: object,
+        codes: object,
+        is_eoa: ctypes.c_void_p,
+    ) -> int:
+        step_counter["val"] += 1
+        if step_counter["val"] >= 2:
+            eoa_ptr = ctypes.cast(is_eoa, ctypes.POINTER(ctypes.c_int))
+            eoa_ptr.contents.value = 1
+        return 0
+
+    def fake_timings(
+        ctx: int,
+        text_ms: Any,
+        frame_ms: Any,
+        advance_ms: Any,
+        frames: Any,
+    ) -> None:
+        text_ms._obj.value = 12.5
+        frame_ms._obj.value = 80.0
+        advance_ms._obj.value = 20.0
+        frames._obj.value = 2
+
+    fake_cdll.zerotts_frame.side_effect = fake_frame
+    fake_cdll.zerotts_timings.side_effect = fake_timings
+
+    with caplog.at_level(logging.DEBUG, logger="wyoming_vietnamese.zerotts_engine"):
+        chunks = list(engine.infer_stream("Xin chào", voice="Mai Chi"))
+
+    assert chunks
+    assert fake_cdll.zerotts_reset_timings.called
+    assert "ZeroTTS segment timings" in caplog.text
+    assert "text_prefix_ms=12.5" in caplog.text
+    assert "frame_ms=80.0" in caplog.text
+    assert "advance_ms=20.0" in caplog.text
+    assert "frame_ms_per_frame=40.00" in caplog.text
+
+
+def test_zerotts_engine_skips_native_timings_without_debug(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test the timing counters are not read when debug logging is disabled."""
+
+    def fake_frame(
+        ctx: int,
+        forbid_eoa: bool,
+        sp: object,
+        cu: float,
+        au: object,
+        codes: object,
+        is_eoa: ctypes.c_void_p,
+    ) -> int:
+        ctypes.cast(is_eoa, ctypes.POINTER(ctypes.c_int)).contents.value = 1
+        return 0
+
+    engine, fake_cdll, _, _ = _setup_engine_fixture(tmp_path)
+    fake_cdll.zerotts_frame.side_effect = fake_frame
+
+    with caplog.at_level(logging.WARNING, logger="wyoming_vietnamese.zerotts_engine"):
+        chunks = list(engine.infer_stream("Xin chào", voice="Mai Chi"))
+
+    assert chunks
+    fake_cdll.zerotts_timings.assert_not_called()
+    assert "ZeroTTS segment timings" not in caplog.text
+
+
+def test_zerotts_engine_logs_native_timing_deltas_without_reset(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test cumulative counters are logged as per-segment deltas when reset is missing."""
+    engine, fake_cdll, _, _ = _setup_engine_fixture(tmp_path, pipelined=False)
+    del fake_cdll.zerotts_reset_timings
+    assert not hasattr(fake_cdll, "zerotts_reset_timings")
+
+    counters = {"text": 0.0, "frame": 0.0, "advance": 0.0, "frames": 0}
+    segment_frames = {"val": 0}
+
+    def fake_begin(ctx: object, text_ids: object, text_len: object, voice_emb: object) -> int:
+        counters["text"] += 5.0
+        segment_frames["val"] = 0
+        return 0
+
+    def fake_frame(
+        ctx: int,
+        forbid_eoa: bool,
+        sp: object,
+        cu: float,
+        au: object,
+        codes: object,
+        is_eoa: ctypes.c_void_p,
+    ) -> int:
+        counters["frame"] += 10.0
+        counters["frames"] += 1
+        segment_frames["val"] += 1
+        if segment_frames["val"] >= 1:
+            ctypes.cast(is_eoa, ctypes.POINTER(ctypes.c_int)).contents.value = 1
+        return 0
+
+    def fake_advance(ctx: object, codes: object, step: int) -> int:
+        counters["advance"] += 3.0
+        return 0
+
+    def fake_timings(
+        ctx: int,
+        text_ms: Any,
+        frame_ms: Any,
+        advance_ms: Any,
+        frames: Any,
+    ) -> None:
+        text_ms._obj.value = counters["text"]
+        frame_ms._obj.value = counters["frame"]
+        advance_ms._obj.value = counters["advance"]
+        frames._obj.value = counters["frames"]
+
+    fake_cdll.zerotts_begin.side_effect = fake_begin
+    fake_cdll.zerotts_frame.side_effect = fake_frame
+    fake_cdll.zerotts_advance.side_effect = fake_advance
+    fake_cdll.zerotts_timings.side_effect = fake_timings
+
+    with caplog.at_level(logging.DEBUG, logger="wyoming_vietnamese.zerotts_engine"):
+        assert list(engine.infer_stream("Xin chào", voice="Mai Chi"))
+        assert list(engine.infer_stream("Tạm biệt", voice="Mai Chi"))
+
+    timing_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "ZeroTTS segment timings" in record.getMessage()
+    ]
+    assert len(timing_lines) == 2
+    for line in timing_lines:
+        assert "frames=2" in line
+        assert "text_prefix_ms=5.0" in line
+        assert "frame_ms=20.0" in line
+        assert "advance_ms=3.0" in line
+        assert "frame_ms_per_frame=10.00" in line
+
+
+def test_zerotts_engine_skips_native_timings_when_worker_outlives_shutdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test timings are not read while a timed-out producer may still write them."""
+    engine, fake_cdll, _, _ = _setup_engine_fixture(tmp_path)
+    monkeypatch.setattr(
+        "wyoming_vietnamese.zerotts_engine._WORKER_SHUTDOWN_TIMEOUT_SECONDS",
+        0.05,
+    )
+
+    blocked_event = threading.Event()
+    unblock_event = threading.Event()
+    call_count = 0
+
+    def slow_execute_frame_step(*args: object, **kwargs: object) -> None:
+        nonlocal call_count
+        call_count += 1
+        if call_count >= 3:
+            blocked_event.set()
+            unblock_event.wait(timeout=2.0)
+
+    monkeypatch.setattr(engine, "_execute_frame_step", slow_execute_frame_step)
+
+    try:
+        with caplog.at_level(logging.DEBUG, logger="wyoming_vietnamese.zerotts_engine"):
+            stream = engine.infer_stream("Xin chào Việt Nam", voice="Mai Chi")
+            assert next(stream) is not None
+            assert blocked_event.wait(timeout=2.0)
+            if isinstance(stream, Generator):
+                stream.close()
+            assert engine._busy_worker is not None
+            assert engine._busy_worker.is_alive()
+    finally:
+        unblock_event.set()
+        if engine._busy_worker is not None:
+            engine._busy_worker.join(timeout=2.0)
+
+    fake_cdll.zerotts_timings.assert_not_called()
+    assert "ZeroTTS segment timings" not in caplog.text
 
 
 def test_zerotts_engine_generation_stops_at_maximum_frames(tmp_path: Path) -> None:
@@ -2897,8 +3088,8 @@ def test_get_variant_build_flags_definitions_and_compiler_options() -> None:
     assert "-DGGML_AVX=OFF" in compat_cmake
     assert "-DGGML_AVX2=OFF" in compat_cmake
     assert "-DGGML_AVX512=OFF" in compat_cmake
-    assert "-DGGML_OPENMP=OFF" in compat_cmake
-    assert "-DGGML_OPENMP=ON" not in compat_cmake
+    assert "-DGGML_OPENMP=ON" in compat_cmake
+    assert "-DGGML_OPENMP=OFF" not in compat_cmake
     assert not compat_gxx
 
     # SSE4
@@ -2907,8 +3098,8 @@ def test_get_variant_build_flags_definitions_and_compiler_options() -> None:
     assert "-DGGML_AVX=OFF" in sse4_cmake
     assert "-DGGML_AVX2=OFF" in sse4_cmake
     assert "-DGGML_AVX512=OFF" in sse4_cmake
-    assert "-DGGML_OPENMP=OFF" in sse4_cmake
-    assert "-DGGML_OPENMP=ON" not in sse4_cmake
+    assert "-DGGML_OPENMP=ON" in sse4_cmake
+    assert "-DGGML_OPENMP=OFF" not in sse4_cmake
     assert any(flag.startswith("-DCMAKE_C_FLAGS=") for flag in sse4_cmake)
     assert any(flag.startswith("-DCMAKE_CXX_FLAGS=") for flag in sse4_cmake)
     assert "-msse4.2" in sse4_gxx
@@ -2921,6 +3112,8 @@ def test_get_variant_build_flags_definitions_and_compiler_options() -> None:
     assert "-DGGML_AVX=ON" in avx_cmake
     assert "-DGGML_AVX2=OFF" in avx_cmake
     assert "-DGGML_AVX512=OFF" in avx_cmake
+    assert "-DGGML_OPENMP=ON" in avx_cmake
+    assert "-DGGML_OPENMP=OFF" not in avx_cmake
     assert "-mavx" in avx_gxx
 
     # AVX2
@@ -2929,6 +3122,8 @@ def test_get_variant_build_flags_definitions_and_compiler_options() -> None:
     assert "-DGGML_AVX=ON" in avx2_cmake
     assert "-DGGML_AVX2=ON" in avx2_cmake
     assert "-DGGML_AVX512=OFF" in avx2_cmake
+    assert "-DGGML_OPENMP=ON" in avx2_cmake
+    assert "-DGGML_OPENMP=OFF" not in avx2_cmake
     assert "-mavx2" in avx2_gxx
     assert "-mfma" in avx2_gxx
 
@@ -2938,27 +3133,31 @@ def test_get_variant_build_flags_definitions_and_compiler_options() -> None:
     assert "-DGGML_AVX=ON" in avx512_cmake
     assert "-DGGML_AVX2=ON" in avx512_cmake
     assert "-DGGML_AVX512=ON" in avx512_cmake
+    assert "-DGGML_OPENMP=ON" in avx512_cmake
+    assert "-DGGML_OPENMP=OFF" not in avx512_cmake
     assert "-mavx512f" in avx512_gxx
     assert "-mavx2" in avx512_gxx
 
     # ARM_DOTPROD
     arm_cmake, arm_gxx = _get_variant_build_flags(ZeroTtsVariant.ARM_DOTPROD)
     assert "-DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod" in arm_cmake
+    assert "-DGGML_OPENMP=ON" in arm_cmake
+    assert "-DGGML_OPENMP=OFF" not in arm_cmake
     assert "-march=armv8.2-a+dotprod" in arm_gxx
 
     # NATIVE on x86 vs ARM
     with patch("platform.machine", return_value="x86_64"):
         native_cmake, native_gxx = _get_variant_build_flags(ZeroTtsVariant.NATIVE)
         assert "-DGGML_NATIVE=ON" in native_cmake
-        assert "-DGGML_OPENMP=OFF" in native_cmake
-        assert "-DGGML_OPENMP=ON" not in native_cmake
+        assert "-DGGML_OPENMP=ON" in native_cmake
+        assert "-DGGML_OPENMP=OFF" not in native_cmake
         assert "-march=native" in native_gxx
 
     with patch("platform.machine", return_value="aarch64"):
         native_arm_cmake, native_arm_gxx = _get_variant_build_flags(ZeroTtsVariant.NATIVE)
         assert "-DGGML_NATIVE=ON" in native_arm_cmake
-        assert "-DGGML_OPENMP=OFF" in native_arm_cmake
-        assert "-DGGML_OPENMP=ON" not in native_arm_cmake
+        assert "-DGGML_OPENMP=ON" in native_arm_cmake
+        assert "-DGGML_OPENMP=OFF" not in native_arm_cmake
         assert "-mcpu=native" in native_arm_gxx
 
 
