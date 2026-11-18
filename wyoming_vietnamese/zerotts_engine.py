@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -72,6 +73,8 @@ _ZEROTTS_BUILD_TIMEOUT_SECONDS: Final[float] = 1800.0
 _PROCESS_TERMINATION_TIMEOUT_SECONDS: Final[float] = 5.0
 _SIGKILL_GRACE_PERIOD_SECONDS: Final[float] = 15.0
 _WORKER_SHUTDOWN_TIMEOUT_SECONDS: Final[float] = 2.0
+# Short wait slice so a cancelled stream stops observing another worker promptly.
+_BUSY_WAIT_SLICE_SECONDS: Final[float] = 0.1
 
 
 class _ZeroTtsTokenizer(Protocol):
@@ -130,6 +133,135 @@ class _ZeroTtsTimings:
     frame_ms: float
     advance_ms: float
     frame_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingContextCleanup:
+    """Native context detached from a worker whose cleanup must be deferred."""
+
+    ctx: ctypes.c_void_p
+    worker: threading.Thread
+    done: threading.Event | None
+
+
+class _ZeroTtsDeferredStream(Iterator[np.ndarray]):
+    """Start a native ZeroTTS session only when iteration begins."""
+
+    def __init__(
+        self,
+        engine: ZeroTtsGgmlEngine,
+        text: str,
+        voice: str | None,
+        seed: int | None,
+    ) -> None:
+        """Store the pending synthesis request."""
+        self._engine = engine
+        self._text = text
+        self._voice = voice
+        self._seed = seed
+        self._iterator: Iterator[np.ndarray] | None = None
+        self._empty_text = False
+        self._closed = False
+        # Stable token that identifies this stream's context reservation.
+        self._owner = object()
+        # Stops an active next() before close() takes the lock.
+        self._stop_event = threading.Event()
+        # close() may run on another thread; serialize it against preparation,
+        # iteration, and assignment so no audio is yielded after it returns.
+        self._lock = threading.RLock()
+
+    @property
+    def empty_text(self) -> bool:
+        """Return whether preparation found no body tokens."""
+        return self._empty_text
+
+    def __iter__(self) -> _ZeroTtsDeferredStream:
+        """Return this iterator."""
+        return self
+
+    def __next__(self) -> np.ndarray:
+        """Prepare the native session on the first step."""
+        with self._lock:
+            if self._closed:
+                raise StopIteration
+            if self._iterator is None:
+                # Record an exhausted iterator before preparation so a failed or
+                # interrupted first step cannot leave the stream retryable.
+                self._iterator = iter(())
+                engine = self._engine
+                try:
+                    # Reserve the context before preparation starts so a later
+                    # chunk cannot begin a second session in the gap.
+                    reservation_done = engine._prepare_synthesis_session(
+                        self._text,
+                        self._voice,
+                        self._seed,
+                        owner=self._owner,
+                        stop_event=self._stop_event,
+                    )
+                except BaseException:
+                    engine._release_context(self._owner)
+                    raise
+                if reservation_done is None:
+                    self._empty_text = True
+                else:
+                    if self._closed or self._stop_event.is_set():
+                        reservation_done.set()
+                        engine._release_context(self._owner, force=True)
+                        raise StopIteration
+                    if not engine._register_busy_session(self):
+                        # Shutdown detached the reservation while startup ran.
+                        reservation_done.set()
+                        engine._release_context(self._owner, force=True)
+                        raise StopIteration
+                    iterator = self._engine._infer_stream_session(
+                        self._text, self._stop_event, self._owner, reservation_done
+                    )
+                    self._iterator = iterator
+            try:
+                chunk = next(self._iterator)
+            except BaseException:
+                self._engine._unregister_busy_session(self)
+                raise
+            if self._closed or self._stop_event.is_set():
+                # Finish the session before releasing the lock for close().
+                close = getattr(self._iterator, "close", None)
+                if callable(close):
+                    close()
+                self._engine._unregister_busy_session(self)
+                raise StopIteration
+            return chunk
+
+    def request_stop(self) -> None:
+        """Signal an active next() to stop without waiting for its lock."""
+        self._closed = True
+        self._stop_event.set()
+
+    def close(self) -> None:
+        """Stop iteration and close any session that was started."""
+        # Signal first so an active next() can stop and release the lock.
+        self.request_stop()
+        if not self._lock.acquire(timeout=_WORKER_SHUTDOWN_TIMEOUT_SECONDS):
+            # next() is still in a native call; it closes the session when it returns.
+            return
+        try:
+            iterator = self._iterator
+            if iterator is not None:
+                close = getattr(iterator, "close", None)
+                if callable(close):
+                    close()
+        finally:
+            try:
+                # Release ownership even when closing the decoder raises.
+                self._engine._unregister_busy_session(self)
+                self._engine._release_context(self._owner)
+            finally:
+                self._lock.release()
+
+    def __del__(self) -> None:
+        """Cancel and close a session abandoned without an explicit close."""
+        with contextlib.suppress(Exception):
+            self.close()
 
 
 def _get_variant_fallback_order(optimal_variant: str) -> list[str]:
@@ -1046,6 +1178,15 @@ class ZeroTtsGgmlEngine:
         self.gguf_path: Path = gguf_path
         self._ctx: ctypes.c_void_p | None = None
         self._busy_worker: threading.Thread | None = None
+        # Completed when the current synthesis operation releases the context.
+        self._busy_done: threading.Event | None = None
+        # Identifies the stream that currently owns the native context.
+        self._busy_owner: object | None = None
+        self._busy_lock = threading.Lock()
+        self._shutting_down = False
+        self._busy_session: weakref.ReferenceType[_ZeroTtsDeferredStream] | None = None
+        self._busy_session_owner: object | None = None
+        self._pending_cleanup: _PendingContextCleanup | None = None
         self._cleanup_thread: threading.Thread | None = None
         self._timing_baseline: _ZeroTtsTimings | None = None
 
@@ -1265,6 +1406,8 @@ class ZeroTtsGgmlEngine:
         forbid_eoa: bool,
         codes_buf: ctypes.Array[ctypes.c_int32],
         is_eoa: ctypes.c_int,
+        *,
+        ctx: ctypes.c_void_p | None = None,
     ) -> None:
         """Execute a single native GGML frame generation step.
 
@@ -1273,6 +1416,7 @@ class ZeroTtsGgmlEngine:
             forbid_eoa: Flag indicating whether end-of-audio is disallowed.
             codes_buf: Ctypes array buffer to store codebook tokens.
             is_eoa: Ctypes integer flag indicating whether end-of-audio was emitted.
+            ctx: Optional context captured when the session started.
 
         Raises:
             RuntimeError: If zerotts_frame returns non-zero.
@@ -1281,7 +1425,7 @@ class ZeroTtsGgmlEngine:
         self._rng.random(out=self._au_buf, dtype=np.float32)
 
         rc = self._lib.zerotts_frame(
-            self._ctx,
+            self._ctx if ctx is None else ctx,
             forbid_eoa,
             ctypes.byref(self._sp),
             cu,
@@ -1338,6 +1482,14 @@ class ZeroTtsGgmlEngine:
         max_frames = int(ZeroTtsLimit.MAX_FRAMES)
         eoa_extra = 1
 
+        if stop_event is not None and stop_event.is_set():
+            # A cancelled consumer ends the iterator cleanly even if shutdown has
+            # already detached and cleared the native context.
+            return
+        ctx = self._ctx
+        if ctx is None:
+            raise RuntimeError("ZeroTTS GGML context is closed")
+
         codes_buf = (ctypes.c_int32 * k)()
         is_eoa = ctypes.c_int(0)
         tail_left = -1
@@ -1347,7 +1499,7 @@ class ZeroTtsGgmlEngine:
             if stop_event is not None and stop_event.is_set():
                 break
             forbid_eoa = (t < min_frames) or (tail_left >= 0)
-            self._execute_frame_step(t, forbid_eoa, codes_buf, is_eoa)
+            self._execute_frame_step(t, forbid_eoa, codes_buf, is_eoa, ctx=ctx)
             self._zero_residual_codebooks(codes_buf, self.max_codebooks, k)
 
             yield np.frombuffer(codes_buf, dtype=np.int32).copy()
@@ -1362,7 +1514,7 @@ class ZeroTtsGgmlEngine:
                 reached_eoa = True
                 break
 
-            rc = self._lib.zerotts_advance(self._ctx, codes_buf, t)
+            rc = self._lib.zerotts_advance(ctx, codes_buf, t)
             if rc != 0:
                 raise RuntimeError(f"zerotts_advance failed at step {t}")
 
@@ -1377,7 +1529,7 @@ class ZeroTtsGgmlEngine:
         *,
         voice: str | None = None,
         seed: int | None = None,
-    ) -> Iterator[np.ndarray]:
+    ) -> _ZeroTtsDeferredStream:
         """Yield synthesized audio waveforms incrementally using progressive MOSS decoding.
 
         Args:
@@ -1392,7 +1544,7 @@ class ZeroTtsGgmlEngine:
             ValueError: If the requested voice is unsupported.
             RuntimeError: If the GGML context is closed or native generation fails.
         """
-        yield from self.infer_stream_normalized(
+        return self.infer_stream_normalized(
             self.normalize(text, voice=voice),
             voice=voice,
             seed=seed,
@@ -1527,84 +1679,272 @@ class ZeroTtsGgmlEngine:
             start = best
         return chunks
 
+    @staticmethod
+    def _worker_active(worker: threading.Thread, done: threading.Event | None) -> bool:
+        """Return whether a worker may still use the native context."""
+        if done is not None:
+            # The operation's own completion event outlives its thread.
+            return not done.is_set()
+        if worker.ident is None:
+            # Reserved but not started yet; shutdown must wait for startup.
+            return True
+        return worker.is_alive()
+
+    def _busy_is_active(self, worker: threading.Thread) -> bool:
+        """Return whether the current owner may still be using the native context."""
+        return self._worker_active(worker, self._busy_done)
+
+    def _set_busy_worker(
+        self,
+        worker: threading.Thread,
+        done: threading.Event | None = None,
+        *,
+        owner: object | None = None,
+    ) -> None:
+        """Mark one thread as owning the native context until the operation completes."""
+        with self._busy_lock:
+            self._busy_owner = owner
+            self._busy_worker = worker
+            self._busy_done = done
+
+    def _clear_busy_worker(self, worker: threading.Thread) -> None:
+        """Release context ownership when the given worker still holds it."""
+        with self._busy_lock:
+            if self._busy_worker is not worker:
+                return
+            done = self._busy_done
+            self._busy_owner = None
+            self._busy_worker = None
+            self._busy_done = None
+        if done is not None:
+            done.set()
+
+    def _acquire_context(
+        self, owner: object, stop_event: threading.Event | None = None
+    ) -> threading.Event:
+        """Reserve the native context for one stream after any active owner finishes."""
+        worker = threading.current_thread()
+        deadline = time.monotonic() + _WORKER_SHUTDOWN_TIMEOUT_SECONDS
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                raise StopIteration
+            wait_worker: threading.Thread | None = None
+            wait_done: threading.Event | None = None
+            registered: _ZeroTtsDeferredStream | None = None
+            with self._busy_lock:
+                if self._shutting_down or self._ctx is None:
+                    raise RuntimeError("ZeroTTS GGML context is closed")
+                current_owner = self._busy_owner
+                current_worker = self._busy_worker
+                current_done = self._busy_done
+                if current_owner is owner:
+                    if current_done is None:
+                        current_done = threading.Event()
+                        self._busy_done = current_done
+                    return current_done
+                registered = self._busy_session() if self._busy_session is not None else None
+                if (
+                    registered is not None
+                    and self._busy_session_owner is not None
+                    and self._busy_session_owner is not owner
+                    and not registered._closed
+                ):
+                    # An unfinished stream keeps the context until its consumer exits.
+                    raise RuntimeError("Previous ZeroTTS synthesis worker is still executing")
+                if current_worker is not None and self._worker_active(current_worker, current_done):
+                    if current_worker is worker:
+                        # Another stream already reserved this thread's context.
+                        raise RuntimeError("Previous ZeroTTS synthesis worker is still executing")
+                    wait_worker = current_worker
+                    wait_done = current_done
+                else:
+                    done = threading.Event()
+                    self._busy_owner = owner
+                    self._busy_worker = worker
+                    self._busy_done = done
+                    return done
+            # Drop the strong reference outside the lock so a stream finalizer
+            # cannot re-enter _busy_lock while it is held.
+            registered = None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if stop_event is not None and stop_event.is_set():
+                    raise StopIteration
+                raise RuntimeError("Previous ZeroTTS synthesis worker is still executing")
+            wait_timeout = remaining
+            if stop_event is not None:
+                # Wait in slices so cancellation is observed before the busy timeout.
+                wait_timeout = min(remaining, _BUSY_WAIT_SLICE_SECONDS)
+            if wait_done is not None:
+                # The operation can finish while an executor thread stays alive.
+                wait_done.wait(timeout=wait_timeout)
+            elif wait_worker is not None:
+                # Reserved but not started, or no completion event to wait on.
+                wait_worker.join(timeout=wait_timeout)
+
+    def _release_context(self, owner: object, *, force: bool = False) -> None:
+        """Release a stream's reservation once no native call can still run."""
+        with self._busy_lock:
+            if self._busy_owner is not owner:
+                return
+            worker = self._busy_worker
+            done = self._busy_done
+            if (
+                not force
+                and worker is not None
+                and worker is not threading.current_thread()
+                and self._worker_active(worker, done)
+            ):
+                # A producer still owns the context; keep the reservation for shutdown.
+                return
+            self._busy_owner = None
+            self._busy_worker = None
+            self._busy_done = None
+        if done is not None:
+            done.set()
+
+    def _transfer_context_worker(
+        self, owner: object, worker: threading.Thread
+    ) -> threading.Event | None:
+        """Move a reservation from the preparing thread to a pipeline worker."""
+        with self._busy_lock:
+            if self._busy_owner is not owner:
+                raise RuntimeError("ZeroTTS GGML context reservation was released")
+            done = self._busy_done
+            self._busy_worker = worker
+            return done
+
+    def _register_busy_session(self, session: _ZeroTtsDeferredStream) -> bool:
+        """Track a deferred session weakly if its reservation is still live."""
+        with self._busy_lock:
+            if self._shutting_down or self._ctx is None or self._busy_owner is not session._owner:
+                return False
+            self._busy_session = weakref.ref(session)
+            self._busy_session_owner = session._owner
+            return True
+
+    def _unregister_busy_session(self, session: _ZeroTtsDeferredStream) -> None:
+        """Forget a session that has finished, failed, or been closed."""
+        with self._busy_lock:
+            if self._busy_session_owner is not session._owner:
+                return
+            self._busy_session = None
+            self._busy_session_owner = None
+
+    def _close_suspended_session(self) -> None:
+        """Cancel and close a tracked session through its synchronized close path."""
+        with self._busy_lock:
+            current = self._busy_session
+            session = current() if current is not None else None
+            if session is None:
+                # Drop only the dead reference; a producer may still own the context.
+                self._busy_session = None
+                self._busy_session_owner = None
+        if session is not None:
+            session.close()
+
     def _prepare_synthesis_session(
         self,
         text: str,
         voice: str | None,
         seed: int | None,
-    ) -> bool:
+        owner: object | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> threading.Event | None:
         """Validate state and initialize native GGML context for utterance synthesis.
 
         Args:
             text: Normalized text to synthesize.
             voice: Voice identifier or display name.
             seed: Optional random generator seed.
+            owner: Stream reservation token; defaults to the calling thread.
+            stop_event: Optional cancellation event checked before native setup.
 
         Returns:
-            True if text tokens were generated and native session started, False if empty.
+            The reservation completion event when native setup succeeded, or None
+            when the text produced no body tokens.
 
         Raises:
+            StopIteration: If cancellation arrives before the native session starts.
             RuntimeError: If GGML context is closed, previous worker is busy, or begin fails.
         """
-        if self._ctx is None:
-            raise RuntimeError("ZeroTTS GGML context is closed")
+        resolved_owner = threading.current_thread() if owner is None else owner
+        done = self._acquire_context(resolved_owner, stop_event)
+        prepared = False
+        try:
+            with self._busy_lock:
+                if self._shutting_down or self._ctx is None:
+                    raise RuntimeError("ZeroTTS GGML context is closed")
+                ctx = self._ctx
+            if stop_event is not None and stop_event.is_set():
+                raise StopIteration
 
-        if self._busy_worker is not None and self._busy_worker.is_alive():
-            self._busy_worker.join(timeout=_WORKER_SHUTDOWN_TIMEOUT_SECONDS)
-            if self._busy_worker.is_alive():
-                raise RuntimeError("Previous ZeroTTS synthesis worker is still executing")
-            self._busy_worker = None
+            self._rng = np.random.default_rng(self._seed if seed is None else seed)
 
-        self._rng = np.random.default_rng(self._seed if seed is None else seed)
+            voice_emb = self._resolve_voice_embedding(voice)
+            voice_emb_ptr = voice_emb.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
-        body_token_count = self.text_token_count(text)
-        if body_token_count > self.max_text_tokens:
-            raise SynthesisTextLimitError(
-                f"ZeroTTS text has {body_token_count} tokens; the engine accepts at most "
-                f"{self.max_text_tokens}"
+            body_token_count = self.text_token_count(text)
+            if body_token_count > self.max_text_tokens:
+                raise SynthesisTextLimitError(
+                    f"ZeroTTS text has {body_token_count} tokens; the engine accepts at most "
+                    f"{self.max_text_tokens}"
+                )
+            if body_token_count == 0 or not any(char.isalnum() for char in text):
+                # Punctuation may encode to body IDs but cannot produce speech.
+                return None
+            text_tokens = self._tokenizer(text)
+            text_ids = np.ascontiguousarray(text_tokens, dtype=np.int32)
+            if len(text_ids) == 0:
+                return None
+            if len(text_ids) > ZeroTtsLimit.MAX_TEXT_IDS:
+                raise SynthesisTextLimitError(
+                    f"ZeroTTS text produced {len(text_ids)} IDs; the engine accepts at most "
+                    f"{ZeroTtsLimit.MAX_TEXT_IDS}"
+                )
+
+            text_ids_ptr = text_ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+
+            # Isolate this segment's timings from the cumulative native counters.
+            # Libraries predating zerotts_reset_timings keep accumulating across
+            # segments, so snapshot them and report the difference on completion.
+            with self._busy_lock:
+                if self._shutting_down or self._ctx is not ctx:
+                    raise RuntimeError("ZeroTTS GGML context is closed")
+            if stop_event is not None and stop_event.is_set():
+                raise StopIteration
+            reset_timings = getattr(self._lib, "zerotts_reset_timings", None)
+            if callable(reset_timings):
+                reset_timings(ctx)
+                self._timing_baseline = None
+            else:
+                self._timing_baseline = self._read_native_timings(ctx)
+
+            ret = self._lib.zerotts_begin(
+                ctx,
+                text_ids_ptr,
+                len(text_ids),
+                voice_emb_ptr,
             )
-        text_tokens = self._tokenizer(text)
-        text_ids = np.ascontiguousarray(text_tokens, dtype=np.int32)
-        if len(text_ids) == 0:
-            return False
-        if len(text_ids) > ZeroTtsLimit.MAX_TEXT_IDS:
-            raise SynthesisTextLimitError(
-                f"ZeroTTS text produced {len(text_ids)} IDs; the engine accepts at most "
-                f"{ZeroTtsLimit.MAX_TEXT_IDS}"
-            )
-
-        voice_emb = self._resolve_voice_embedding(voice)
-        voice_emb_ptr = voice_emb.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-        text_ids_ptr = text_ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
-
-        # Isolate this segment's timings from the cumulative native counters.
-        # Libraries predating zerotts_reset_timings keep accumulating across
-        # segments, so snapshot them and report the difference on completion.
-        reset_timings = getattr(self._lib, "zerotts_reset_timings", None)
-        if callable(reset_timings):
-            reset_timings(self._ctx)
-            self._timing_baseline = None
-        else:
-            self._timing_baseline = self._read_native_timings()
-
-        ret = self._lib.zerotts_begin(
-            self._ctx,
-            text_ids_ptr,
-            len(text_ids),
-            voice_emb_ptr,
-        )
-        if ret != 0:
-            raise RuntimeError(f"zerotts_begin failed with status code {ret}")
-        return True
+            if ret != 0:
+                raise RuntimeError(f"zerotts_begin failed with status code {ret}")
+            prepared = True
+            return done
+        finally:
+            if not prepared:
+                done.set()
+                self._release_context(resolved_owner)
 
     def _infer_stream_sequential(
         self,
         stream: MossStreamingDecoder,
+        stop_event: threading.Event | None = None,
     ) -> Iterator[np.ndarray]:
         """Synthesize and decode audio chunks synchronously in the caller thread.
 
         Args:
             stream: Streaming neural codec decoder.
+            stop_event: Optional event signaling cancellation.
 
         Yields:
             Decoded audio chunks as float32 numpy arrays.
@@ -1614,17 +1954,19 @@ class ZeroTtsGgmlEngine:
         chunk_buf = np.empty((1, self.num_codebooks, cap_chunk_target), dtype=np.int32)
         target_chunk = first_chunk_target
         count = 0
-        for frame in self._generate_code_frames():
+        for frame in self._generate_code_frames(stop_event=stop_event):
             chunk_buf[0, :, count] = frame
             count += 1
             if count >= target_chunk:
                 audio_out = self._decode_audio_chunk(stream, chunk_buf[:, :, :count])
+                if stop_event is not None and stop_event.is_set():
+                    return
                 if audio_out is not None:
                     yield audio_out
                 count = 0
                 target_chunk = min(cap_chunk_target, target_chunk * 2)
 
-        if count > 0:
+        if count > 0 and (stop_event is None or not stop_event.is_set()):
             audio_out = self._decode_audio_chunk(stream, chunk_buf[:, :, :count])
             if audio_out is not None:
                 yield audio_out
@@ -1715,13 +2057,10 @@ class ZeroTtsGgmlEngine:
             remaining = deadline - time.monotonic()
             worker.join(timeout=min(0.05, max(0.001, remaining)))
         if worker.is_alive():
-            self._busy_worker = worker
             _LOGGER.warning(
                 "ZeroTTS synthesis worker did not terminate within %g seconds",
                 _WORKER_SHUTDOWN_TIMEOUT_SECONDS,
             )
-        else:
-            self._busy_worker = None
 
     @staticmethod
     def _check_worker_empty_queue(
@@ -1752,6 +2091,7 @@ class ZeroTtsGgmlEngine:
         chunk_queue: queue.Queue[np.ndarray | Exception | None],
         worker: threading.Thread,
         producer_error: list[Exception],
+        stop_event: threading.Event | None = None,
     ) -> Iterator[np.ndarray]:
         """Consume code slices from queue and yield decoded audio waveform chunks.
 
@@ -1760,6 +2100,7 @@ class ZeroTtsGgmlEngine:
             chunk_queue: Inter-thread queue.
             worker: Active producer thread.
             producer_error: List capturing producer exceptions.
+            stop_event: Optional event signaling cancellation.
 
         Yields:
             Decoded audio chunks as float32 numpy arrays.
@@ -1767,7 +2108,7 @@ class ZeroTtsGgmlEngine:
         Raises:
             Exception: If producer encountered an error during frame generation.
         """
-        while True:
+        while stop_event is None or not stop_event.is_set():
             try:
                 item = chunk_queue.get(timeout=0.1)
             except queue.Empty:
@@ -1778,7 +2119,11 @@ class ZeroTtsGgmlEngine:
                 break
             if isinstance(item, Exception):
                 raise item
+            if stop_event is not None and stop_event.is_set():
+                break
             audio_out = self._decode_audio_chunk(stream, item)
+            if stop_event is not None and stop_event.is_set():
+                break
             if audio_out is not None:
                 yield audio_out
         if producer_error:
@@ -1787,31 +2132,84 @@ class ZeroTtsGgmlEngine:
     def _infer_stream_pipelined(
         self,
         stream: MossStreamingDecoder,
+        stop_event: threading.Event | None = None,
+        owner: object | None = None,
+        done: threading.Event | None = None,
+        *,
+        started: threading.Event | None = None,
+        producer_finished: threading.Event | None = None,
+        on_producer_exit: Callable[[], None] | None = None,
     ) -> Iterator[np.ndarray]:
         """Coordinate producer thread and decode audio asynchronously in caller thread.
 
         Args:
             stream: Streaming neural codec decoder.
+            stop_event: Optional event signaling cancellation.
+            owner: Stream reservation token; defaults to the calling thread.
+            done: Completion event captured for this stream's reservation.
+            started: Optional event signaled once the producer thread owns completion.
+            producer_finished: Optional event signaled when the producer thread exits.
+            on_producer_exit: Optional completion hook run after iteration stops.
 
         Yields:
             Decoded audio chunks as float32 numpy arrays.
         """
+        owner_token = threading.current_thread() if owner is None else owner
         chunk_queue: queue.Queue[np.ndarray | Exception | None] = queue.Queue(maxsize=4)
-        stop_event = threading.Event()
+        session_stop = stop_event if stop_event is not None else threading.Event()
         producer_error: list[Exception] = []
 
+        def run_producer() -> None:
+            """Run the producer loop and signal when native generation stops."""
+            try:
+                self._run_producer_loop(chunk_queue, session_stop, producer_error)
+            finally:
+                if producer_finished is not None:
+                    producer_finished.set()
+                if on_producer_exit is not None:
+                    on_producer_exit()
+                # Generation has stopped; free a detached context exactly once.
+                self._claim_pending_context(threading.current_thread())
+
         worker = threading.Thread(
-            target=self._run_producer_loop,
-            args=(chunk_queue, stop_event, producer_error),
+            target=run_producer,
             daemon=True,
         )
-        self._busy_worker = worker
-        worker.start()
+        reserved_done = self._transfer_context_worker(owner_token, worker)
+        if done is None:
+            done = reserved_done
+        start_error: BaseException | None = None
+        blocked = False
+        with self._busy_lock:
+            if self._shutting_down or self._ctx is None:
+                blocked = True
+            else:
+                try:
+                    worker.start()
+                except BaseException as exc:
+                    start_error = exc
+                else:
+                    if started is not None:
+                        started.set()
+        if blocked:
+            if done is not None:
+                done.set()
+            self._release_context(owner_token, force=True)
+            raise RuntimeError("ZeroTTS GGML context is closed")
+        if start_error is not None:
+            # Startup failed before native generation began. Session cleanup
+            # closes the decoder and releases the reservation, so do not signal
+            # completion here.
+            raise start_error
 
         try:
-            yield from self._consume_pipeline_queue(stream, chunk_queue, worker, producer_error)
+            yield from self._consume_pipeline_queue(
+                stream, chunk_queue, worker, producer_error, session_stop
+            )
         finally:
-            self._drain_and_join_worker(worker, chunk_queue, stop_event)
+            # Native generation must stop before the session closes the decoder;
+            # the session signals done only after that close completes.
+            self._drain_and_join_worker(worker, chunk_queue, session_stop)
 
     def infer_stream_normalized(
         self,
@@ -1819,7 +2217,7 @@ class ZeroTtsGgmlEngine:
         *,
         voice: str | None = None,
         seed: int | None = None,
-    ) -> Iterator[np.ndarray]:
+    ) -> _ZeroTtsDeferredStream:
         """Yield audio for text that has already passed through the configured normalizer.
 
         Args:
@@ -1830,33 +2228,106 @@ class ZeroTtsGgmlEngine:
         Yields:
             Decoded audio chunks as float32 numpy arrays.
         """
-        if not self._prepare_synthesis_session(text, voice, seed):
-            return
+        return _ZeroTtsDeferredStream(self, text, voice, seed)
 
-        stream = self._codec.streaming_decoder()
+    def _infer_stream_session(
+        self,
+        text: str,
+        stop_event: threading.Event | None = None,
+        owner: object | None = None,
+        done: threading.Event | None = None,
+    ) -> Iterator[np.ndarray]:
+        """Yield audio for a prepared native synthesis session."""
+        owner_token = threading.current_thread() if owner is None else owner
+        pipelined = self.pipelined
+        stream: MossStreamingDecoder | None = None
+        producer_started = threading.Event()
+        producer_finished = threading.Event()
+        decoder_closed = threading.Event()
+        completion_lock = threading.Lock()
+        completed = False
+
+        def complete_pipelined_session(*, log_timings: bool) -> None:
+            """Release the reservation once both the producer and decoder finish."""
+            nonlocal completed
+            with completion_lock:
+                if completed or not (producer_finished.is_set() and decoder_closed.is_set()):
+                    return
+                completed = True
+                try:
+                    if log_timings:
+                        # Counters are stable because native generation stopped.
+                        self._log_native_timings(len(text), force=True)
+                finally:
+                    if done is not None:
+                        done.set()
+                    # The cleanup thread may have failed to start; the last
+                    # participant frees the detached context now that both the
+                    # producer and decoder have finished.
+                    self._claim_pending_context()
+
         try:
-            if not self.pipelined:
-                yield from self._infer_stream_sequential(stream)
+            # Decoder creation is inside cleanup so a failure still releases the
+            # reservation taken during preparation.
+            stream = self._codec.streaming_decoder()
+            if stop_event is not None and stop_event.is_set():
+                # Cancellation arrived while the decoder was created; skip
+                # startup so iteration ends cleanly instead of raising.
+                return
+            if not pipelined:
+                yield from self._infer_stream_sequential(stream, stop_event)
             else:
-                yield from self._infer_stream_pipelined(stream)
+                yield from self._infer_stream_pipelined(
+                    stream,
+                    stop_event,
+                    owner_token,
+                    done,
+                    started=producer_started,
+                    producer_finished=producer_finished,
+                    on_producer_exit=lambda: complete_pipelined_session(log_timings=False),
+                )
         finally:
-            stream.close()
-            self._log_native_timings(len(text))
+            try:
+                if stream is not None:
+                    stream.close()
+            finally:
+                decoder_closed.set()
+                if not pipelined:
+                    # Read the counters before the operation event can release it.
+                    try:
+                        self._log_native_timings(len(text), force=True)
+                    finally:
+                        if done is not None:
+                            done.set()
+                elif producer_started.is_set():
+                    complete_pipelined_session(log_timings=True)
+                elif done is not None:
+                    # Decoder creation or reservation transfer failed before a
+                    # producer took over, so this session still owns the event.
+                    done.set()
+                # A timed-out producer keeps the reservation for shutdown so a
+                # detached native call cannot overlap a new session. Its own exit
+                # signals completion once decoder cleanup has finished.
+                self._release_context(owner_token, force=not pipelined)
 
-    def _read_native_timings(self) -> _ZeroTtsTimings | None:
+    def _read_native_timings(self, ctx: ctypes.c_void_p | None = None) -> _ZeroTtsTimings | None:
         """Read the raw native timing counters for the current context.
+
+        Args:
+            ctx: Optional context captured when the reservation was acquired.
 
         Returns:
             Native timing counters, or None when the native context is closed.
         """
-        if self._ctx is None:
+        context = self._ctx if ctx is None else ctx
+        if context is None:
             return None
         text_ms = ctypes.c_double()
         frame_ms = ctypes.c_double()
         advance_ms = ctypes.c_double()
         frames = ctypes.c_int()
         self._lib.zerotts_timings(
-            self._ctx,
+            context,
             ctypes.byref(text_ms),
             ctypes.byref(frame_ms),
             ctypes.byref(advance_ms),
@@ -1864,7 +2335,7 @@ class ZeroTtsGgmlEngine:
         )
         return _ZeroTtsTimings(text_ms.value, frame_ms.value, advance_ms.value, frames.value)
 
-    def _log_native_timings(self, text_chars: int) -> None:
+    def _log_native_timings(self, text_chars: int, *, force: bool = False) -> None:
         """Log native stage timings for the segment that just finished.
 
         Counters are reset when a segment starts, so each line covers one
@@ -1876,15 +2347,21 @@ class ZeroTtsGgmlEngine:
         The native counters are plain fields written by zerotts_frame and
         zerotts_advance without synchronization. Reading them while the
         producer worker is still running would race with those writes, so skip
-        the read when the worker outlived the shutdown timeout.
+        the read when the worker outlived the shutdown timeout unless the
+        caller knows generation has stopped.
 
         Args:
             text_chars: Character count of the synthesized segment.
+            force: Read counters even when a completed worker record remains.
         """
         if not _LOGGER.isEnabledFor(logging.DEBUG) or self._ctx is None:
             return
         busy_worker = self._busy_worker
-        if busy_worker is not None and busy_worker.is_alive():
+        if (
+            not force
+            and busy_worker is not None
+            and self._worker_active(busy_worker, self._busy_done)
+        ):
             return
         timings = self._read_native_timings()
         if timings is None:
@@ -1917,55 +2394,162 @@ class ZeroTtsGgmlEngine:
         del voice
         return text if self._normalize_fn is None else self._normalize_fn(text)
 
-    def _defer_context_cleanup(
-        self, busy_worker: threading.Thread, ctx_to_free: ctypes.c_void_p
-    ) -> None:
-        """Schedule asynchronous native context deallocation after worker thread termination.
+    def _claim_pending_context(self, worker: threading.Thread | None = None) -> None:
+        """Free a detached native context exactly once, optionally only for one worker."""
+        with self._busy_lock:
+            record = self._pending_cleanup
+            if record is None or (worker is not None and record.worker is not worker):
+                return
+            if record.done is not None and not record.done.is_set():
+                # The operation still owns the native context until completion.
+                return
+            self._pending_cleanup = None
+        self._lib.zerotts_free(record.ctx)
+
+    def _defer_context_cleanup(self, record: _PendingContextCleanup) -> None:
+        """Schedule asynchronous native context deallocation after the operation ends.
 
         Args:
-            busy_worker: Still-active worker thread.
-            ctx_to_free: Native context pointer to release.
+            record: Detached context and the worker that must finish using it.
         """
-        lib = self._lib
 
         def _deferred_cleanup() -> None:
-            """Wait for worker exit before deallocating native context."""
-            busy_worker.join()
-            lib.zerotts_free(ctx_to_free)
+            """Wait for context ownership to end before deallocating native context."""
+            if record.done is not None:
+                record.done.wait()
+            else:
+                record.worker.join()
+            self._claim_pending_context(record.worker)
 
-        self._cleanup_thread = threading.Thread(
-            target=_deferred_cleanup,
-            name="ZeroTtsDeferredContextFree",
-            daemon=True,
-        )
-        self._cleanup_thread.start()
+        try:
+            thread = threading.Thread(
+                target=_deferred_cleanup,
+                name="ZeroTtsDeferredContextFree",
+                daemon=True,
+            )
+            thread.start()
+        except Exception:
+            # Keep the pending record so a later close() or worker completion
+            # can still free the detached context exactly once.
+            _LOGGER.exception(
+                "Failed to start ZeroTTS deferred context cleanup; "
+                "keeping the native context for a later close()"
+            )
+            return
+        self._cleanup_thread = thread
 
-    def _handle_unresponsive_worker(self, busy_worker: threading.Thread) -> None:
+    def _finish_pending_cleanup(self, current: threading.Thread) -> None:
+        """Claim a detached context after a later shutdown confirms the worker stopped."""
+        with self._busy_lock:
+            record = self._pending_cleanup
+        if record is None:
+            return
+        cleanup_thread = self._cleanup_thread
+        if cleanup_thread is not None and cleanup_thread.is_alive():
+            # The scheduled cleanup already owns the claim.
+            return
+        if record.worker is current:
+            self._claim_pending_context(current)
+            return
+        if record.done is not None:
+            record.done.wait(timeout=_WORKER_SHUTDOWN_TIMEOUT_SECONDS)
+            completed = record.done.is_set()
+        else:
+            record.worker.join(timeout=_WORKER_SHUTDOWN_TIMEOUT_SECONDS)
+            completed = not record.worker.is_alive()
+        if completed:
+            self._claim_pending_context(record.worker)
+        else:
+            # Retry scheduling; a failed start leaves the record for a later close().
+            self._defer_context_cleanup(record)
+
+    def _handle_unresponsive_worker(
+        self,
+        busy_worker: threading.Thread,
+        busy_done: threading.Event | None,
+    ) -> None:
         """Handle a worker thread that failed to stop within shutdown timeout.
 
         Args:
             busy_worker: The active worker thread that did not terminate.
+            busy_done: Optional event signaling operation completion.
         """
         _LOGGER.warning(
             "ZeroTTS synthesis worker still executing after %g seconds; "
             "scheduling deferred native context deallocation",
             _WORKER_SHUTDOWN_TIMEOUT_SECONDS,
         )
-        ctx_to_free = self._ctx
-        self._ctx = None
-        self._busy_worker = None
-        if ctx_to_free is not None:
-            self._defer_context_cleanup(busy_worker, ctx_to_free)
+        record: _PendingContextCleanup | None = None
+        with self._busy_lock:
+            ctx_to_free = self._ctx
+            self._ctx = None
+            self._busy_owner = None
+            self._busy_worker = None
+            self._busy_done = None
+            self._busy_session = None
+            self._busy_session_owner = None
+            if ctx_to_free is not None:
+                record = _PendingContextCleanup(ctx_to_free, busy_worker, busy_done)
+                self._pending_cleanup = record
+        if record is not None:
+            self._defer_context_cleanup(record)
 
     def close(self) -> None:
         """Release native model resources and tensor buffers."""
-        busy_worker = getattr(self, "_busy_worker", None)
-        if busy_worker is not None and busy_worker.is_alive():
-            busy_worker.join(timeout=_WORKER_SHUTDOWN_TIMEOUT_SECONDS)
-            if busy_worker.is_alive():
-                self._handle_unresponsive_worker(busy_worker)
-                return
+        current = threading.current_thread()
+        with self._busy_lock:
+            self._shutting_down = True
+        session_error: BaseException | None = None
+        try:
+            self._close_suspended_session()
+        except BaseException as exc:
+            session_error = exc
+        try:
+            self._finish_native_close(current)
+        except BaseException:
+            if session_error is None:
+                raise
+            # The native context is already cleaned up; keep the decoder error
+            # as the error the caller sees.
+            _LOGGER.exception("ZeroTTS cleanup failed after a session close error")
+        if session_error is not None:
+            raise session_error
+
+    def _finish_native_close(self, current: threading.Thread) -> None:
+        """Wait for active native work and free the context after session shutdown."""
+        # Read the worker and its completion event together so both belong to
+        # the same reservation when deciding whether shutdown must wait.
+        with self._busy_lock:
+            busy_worker = self._busy_worker
+            busy_done = self._busy_done
+        if busy_worker is not None and busy_worker is not current:
+            if busy_worker.is_alive() and (busy_done is None or not busy_done.is_set()):
+                if busy_done is not None:
+                    busy_done.wait(timeout=_WORKER_SHUTDOWN_TIMEOUT_SECONDS)
+                else:
+                    busy_worker.join(timeout=_WORKER_SHUTDOWN_TIMEOUT_SECONDS)
+            with self._busy_lock:
+                # Recheck the reservation before clearing or detaching it.
+                same_reservation = self._busy_worker is busy_worker
+                completed = same_reservation and not self._worker_active(busy_worker, busy_done)
+            if completed:
+                self._clear_busy_worker(busy_worker)
+        with self._busy_lock:
+            busy_worker = self._busy_worker
+            busy_done = self._busy_done
+        if busy_worker is not None and self._worker_active(busy_worker, busy_done):
+            self._handle_unresponsive_worker(busy_worker, busy_done)
+            return
+        ctx_to_free: ctypes.c_void_p | None
+        with self._busy_lock:
+            done = self._busy_done
+            self._busy_owner = None
             self._busy_worker = None
-        if getattr(self, "_ctx", None) is not None:
-            self._lib.zerotts_free(self._ctx)
+            self._busy_done = None
+            ctx_to_free = self._ctx
             self._ctx = None
+        if done is not None:
+            done.set()
+        if ctx_to_free is not None:
+            self._lib.zerotts_free(ctx_to_free)
+        self._finish_pending_cleanup(current)

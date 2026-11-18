@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import gc
 import logging
 import os
 import queue
@@ -11,7 +12,7 @@ import shutil
 import signal
 import subprocess
 import threading
-from collections.abc import Generator
+from collections.abc import Generator, Iterator
 from pathlib import Path
 from typing import Any, ClassVar
 from unittest.mock import MagicMock, Mock, call, patch
@@ -42,10 +43,12 @@ from wyoming_vietnamese.errors import SynthesisOutputLimitError, SynthesisTextLi
 from wyoming_vietnamese.tts import warm_up_tts
 from wyoming_vietnamese.tts_model import ZEROTTS_VOICES
 from wyoming_vietnamese.zerotts_engine import (
+    _BUSY_WAIT_SLICE_SECONDS,
     _ZEROTTS_RUNTIME_DEPENDENCIES,
     ZeroTtsGgmlEngine,
     _build_zerotts_ggml_lib,
     _load_zerotts_candidate,
+    _PendingContextCleanup,
     _unload_cdll,
     _ZeroTtsHParams,
     get_zerotts_candidate_lib_paths,
@@ -858,6 +861,20 @@ def _setup_engine_fixture(
     return engine, fake_cdll, fake_stream_decoder, fake_tokenizer
 
 
+def _pin_pipeline_threads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the resolved CPU budget to two so pipelining stays enabled on any host."""
+
+    def resolve_two_threads(_configured: int, *, only_physical_cores: bool = False) -> int:
+        """Return a fixed two-thread budget."""
+        del only_physical_cores
+        return 2
+
+    monkeypatch.setattr(
+        "wyoming_vietnamese.zerotts_engine.resolve_cpu_threads",
+        resolve_two_threads,
+    )
+
+
 def test_zerotts_engine_lifecycle_and_inference(tmp_path: Path) -> None:
     """Test full ZeroTtsGgmlEngine lifecycle including voice lookup, inference, and close."""
     engine, fake_cdll, fake_stream_decoder, fake_tokenizer = _setup_engine_fixture(tmp_path)
@@ -911,10 +928,11 @@ def test_zerotts_engine_lifecycle_and_inference(tmp_path: Path) -> None:
     assert fake_cdll.zerotts_begin.called
     assert fake_stream_decoder.close.called
 
-    # Empty tokens early exit
+    # Empty body tokens report an empty segment before ZeroTTS wraps BOS and EOT.
     fake_tokenizer.return_value = []
-    empty_chunks = list(engine.infer_stream("", voice="Mai Chi"))
-    assert not empty_chunks
+    empty_iterator = engine.infer_stream("", voice="Mai Chi")
+    assert list(empty_iterator) == []
+    assert getattr(empty_iterator, "empty_text", False) is True
     fake_tokenizer.return_value = [1, 2, 3]
 
     # Multi-voice warmup in ZeroTTS engine
@@ -1107,8 +1125,9 @@ def test_zerotts_engine_skips_native_timings_when_worker_outlives_shutdown(
             stream = engine.infer_stream("Xin chào Việt Nam", voice="Mai Chi")
             assert next(stream) is not None
             assert blocked_event.wait(timeout=2.0)
-            if isinstance(stream, Generator):
-                stream.close()
+            close = getattr(stream, "close", None)
+            assert callable(close)
+            close()
             assert engine._busy_worker is not None
             assert engine._busy_worker.is_alive()
     finally:
@@ -1145,6 +1164,218 @@ def test_zerotts_engine_token_limit_and_segmentation(tmp_path: Path) -> None:
 
     with pytest.raises(SynthesisTextLimitError):
         engine._prepare_synthesis_session(long_text, None, None)
+
+
+def test_zerotts_engine_reports_empty_body_before_wrapped_ids(tmp_path: Path) -> None:
+    """Test wrapped BOS/EOT IDs alone do not start a native session."""
+    engine, fake_cdll, _, fake_tokenizer = _setup_engine_fixture(tmp_path)
+    fake_tokenizer.encode_body.side_effect = lambda text: []
+    fake_tokenizer.return_value = np.asarray([1, 2], dtype=np.int32)
+
+    iterator = engine.infer_stream_normalized("Xin chào", voice="Mai Chi")
+    assert list(iterator) == []
+    assert getattr(iterator, "empty_text", False) is True
+    fake_cdll.zerotts_begin.assert_not_called()
+
+
+def test_zerotts_engine_treats_punctuation_only_text_as_empty(tmp_path: Path) -> None:
+    """Test punctuation encoded to body IDs is still treated as empty text."""
+    engine, fake_cdll, fake_stream_decoder, fake_tokenizer = _setup_engine_fixture(tmp_path)
+    fake_tokenizer.encode_body.side_effect = lambda text: [1, 2, 3]
+
+    iterator = engine.infer_stream_normalized("...", voice="Mai Chi")
+    assert list(iterator) == []
+    assert getattr(iterator, "empty_text", False) is True
+    fake_cdll.zerotts_begin.assert_not_called()
+    fake_stream_decoder.close.assert_not_called()
+
+
+def test_zerotts_engine_cancellation_before_begin_releases_reservation(tmp_path: Path) -> None:
+    """Test cancellation before native setup exhausts the stream without starting it."""
+    engine, fake_cdll, fake_stream_decoder, _ = _setup_engine_fixture(tmp_path)
+    stream = engine.infer_stream_normalized("Xin chào", voice="Mai Chi")
+    stream._stop_event.set()
+
+    with pytest.raises(StopIteration):
+        next(stream)
+    assert getattr(stream, "empty_text", False) is False
+    assert engine._busy_owner is None
+    fake_cdll.zerotts_begin.assert_not_called()
+    fake_stream_decoder.close.assert_not_called()
+    with pytest.raises(StopIteration):
+        next(stream)
+
+
+def test_zerotts_engine_validates_voice_before_empty_body(tmp_path: Path) -> None:
+    """Test an unsupported voice is rejected even when the body is empty."""
+    engine, fake_cdll, _, fake_tokenizer = _setup_engine_fixture(tmp_path)
+    fake_tokenizer.encode_body.side_effect = lambda text: []
+
+    iterator = engine.infer_stream_normalized("...", voice="unknown")
+    with pytest.raises(ValueError, match="Unsupported ZeroTTS voice"):
+        list(iterator)
+    fake_cdll.zerotts_begin.assert_not_called()
+
+
+def test_zerotts_engine_deferred_stream_does_not_retry_failed_preparation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test a failed preparation exhausts the stream without retrying it."""
+    engine, _, _, _ = _setup_engine_fixture(tmp_path)
+    calls = 0
+
+    def failing_prepare(
+        text: str,
+        voice: str | None,
+        seed: int | None,
+        owner: object | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> bool:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("preparation failed")
+
+    monkeypatch.setattr(engine, "_prepare_synthesis_session", failing_prepare)
+    stream = engine.infer_stream_normalized("Xin chào", voice="Mai Chi")
+    with pytest.raises(RuntimeError, match="preparation failed"):
+        next(stream)
+    with pytest.raises(StopIteration):
+        next(stream)
+    assert calls == 1
+
+
+def test_zerotts_engine_deferred_stream_does_not_retry_failed_session(
+    tmp_path: Path,
+) -> None:
+    """Test a codec failure partway releases the session for a fresh stream."""
+    engine, _, fake_stream_decoder, _ = _setup_engine_fixture(tmp_path)
+    decode_calls = 0
+
+    def failing_decode(codes: np.ndarray) -> np.ndarray:
+        nonlocal decode_calls
+        decode_calls += 1
+        if decode_calls > 1:
+            raise RuntimeError("codec failed")
+        return np.zeros(960, dtype=np.float32)
+
+    fake_stream_decoder.decode_chunk.side_effect = failing_decode
+    stream = engine.infer_stream_normalized("Xin chào", voice="Mai Chi")
+    first = next(stream)
+    assert first.size == 960
+    with pytest.raises(RuntimeError, match="codec failed"):
+        next(stream)
+    assert fake_stream_decoder.close.called
+    assert engine._busy_owner is None
+    with pytest.raises(StopIteration):
+        next(stream)
+
+    # The failed reservation is gone, so a fresh synthesis stream can start.
+    fake_stream_decoder.decode_chunk.side_effect = None
+    fake_stream_decoder.decode_chunk.return_value = np.zeros(960, dtype=np.float32)
+    fresh = engine.infer_stream_normalized("Tạm biệt", voice="Mai Chi")
+    assert next(fresh).size == 960
+    fresh.close()
+
+
+def test_zerotts_engine_decoder_failure_releases_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test decoder creation failure frees the reservation for a fresh stream."""
+    engine, _, fake_stream_decoder, _ = _setup_engine_fixture(tmp_path)
+    fail_decoder = True
+
+    def decoder() -> object:
+        """Raise once, then return the fake streaming decoder."""
+        if fail_decoder:
+            raise RuntimeError("decoder failed")
+        return fake_stream_decoder
+
+    monkeypatch.setattr(engine._codec, "streaming_decoder", decoder)
+    stream = engine.infer_stream_normalized("Xin chào", voice="Mai Chi")
+
+    with pytest.raises(RuntimeError, match="decoder failed"):
+        next(stream)
+    assert engine._busy_owner is None
+    with pytest.raises(StopIteration):
+        next(stream)
+
+    fail_decoder = False
+    fresh = engine.infer_stream_normalized("Tạm biệt", voice="Mai Chi")
+    assert next(fresh).size == 960
+    fresh.close()
+
+
+def test_zerotts_engine_deferred_stream_close_during_preparation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test closing while preparation runs prevents the first audio chunk."""
+    engine, _, _, _ = _setup_engine_fixture(tmp_path)
+    stream = engine.infer_stream_normalized("Xin chào", voice="Mai Chi")
+    original_prepare = engine._prepare_synthesis_session
+
+    def prepare_and_close(
+        text: str,
+        voice: str | None,
+        seed: int | None,
+        owner: object | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> threading.Event | None:
+        prepared = original_prepare(text, voice, seed, owner=owner, stop_event=stop_event)
+        stream.close()
+        return prepared
+
+    monkeypatch.setattr(engine, "_prepare_synthesis_session", prepare_and_close)
+    with pytest.raises(StopIteration):
+        next(stream)
+
+
+def test_zerotts_engine_deferred_stream_close_prevents_preparation(tmp_path: Path) -> None:
+    """Test closing before iteration stops the stream without starting a session."""
+    engine, fake_cdll, _, _ = _setup_engine_fixture(tmp_path)
+    stream = engine.infer_stream("Xin chào", voice="Mai Chi")
+    close = getattr(stream, "close", None)
+    assert callable(close)
+    close()
+
+    with pytest.raises(StopIteration):
+        next(stream)
+    fake_cdll.zerotts_begin.assert_not_called()
+
+
+def test_zerotts_engine_defers_session_preparation_until_iteration(tmp_path: Path) -> None:
+    """Test creating a later iterator does not prepare or replace the first session."""
+    engine, fake_cdll, _, _ = _setup_engine_fixture(tmp_path)
+    step_counter = {"val": 0}
+
+    def fake_begin(ctx: object, text_ids: object, text_len: object, voice_emb: object) -> int:
+        step_counter["val"] = 0
+        return 0
+
+    def fake_frame(
+        ctx: int,
+        forbid_eoa: bool,
+        sp: object,
+        cu: float,
+        au: object,
+        codes: object,
+        is_eoa: ctypes.c_void_p,
+    ) -> int:
+        step_counter["val"] += 1
+        if step_counter["val"] >= 3:
+            ctypes.cast(is_eoa, ctypes.POINTER(ctypes.c_int)).contents.value = 1
+        return 0
+
+    fake_cdll.zerotts_begin.side_effect = fake_begin
+    fake_cdll.zerotts_frame.side_effect = fake_frame
+
+    first = engine.infer_stream("Xin chào Việt Nam", voice="Mai Chi")
+    second = engine.infer_stream("Tạm biệt", voice="Mai Chi")
+    fake_cdll.zerotts_begin.assert_not_called()
+
+    assert list(first)
+    assert fake_cdll.zerotts_begin.call_count == 1
+    assert list(second)
+    assert fake_cdll.zerotts_begin.call_count == 2
 
 
 def test_zerotts_engine_splits_overlong_single_word(tmp_path: Path) -> None:
@@ -1348,6 +1579,14 @@ class _TrackedThread(threading.Thread):
         self.created_threads.append(self)
 
 
+class _FailingStartThread(threading.Thread):
+    """Thread that fails before its target can run."""
+
+    def start(self) -> None:
+        """Fail startup before the producer can execute."""
+        raise RuntimeError("start failed")
+
+
 def test_zerotts_engine_pipelined_early_consumer_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1358,8 +1597,9 @@ def test_zerotts_engine_pipelined_early_consumer_exit(
     stream = engine.infer_stream("Xin chào Việt Nam", voice="Mai Chi")
     for _chunk in stream:
         break
-    if isinstance(stream, Generator):
-        stream.close()
+    close = getattr(stream, "close", None)
+    if callable(close):
+        close()
     assert fake_stream_decoder.close.called
     assert len(_TrackedThread.created_threads) == 1
     worker_thread = _TrackedThread.created_threads[0]
@@ -1378,26 +1618,348 @@ def test_zerotts_engine_pipelined_cancellation_bounded_shutdown(
     )
 
     unblock_event = threading.Event()
+    started = threading.Event()
     call_count = 0
 
     def slow_execute_frame_step(*args: object, **kwargs: object) -> None:
         nonlocal call_count
         call_count += 1
         if call_count >= 3:
-            unblock_event.wait(timeout=2.0)
+            started.set()
+            unblock_event.wait()
 
     monkeypatch.setattr(engine, "_execute_frame_step", slow_execute_frame_step)
 
-    with caplog.at_level("WARNING"):
-        stream = engine.infer_stream("Xin chào Việt Nam", voice="Mai Chi")
-        chunk = next(stream)
-        assert chunk is not None
-        if isinstance(stream, Generator):
-            stream.close()
-        unblock_event.set()
+    first_chunk: list[object] = []
+    first_error: list[BaseException] = []
 
+    def consume_first_chunk(stream: Iterator[np.ndarray]) -> None:
+        """Read the first chunk without blocking the test thread forever."""
+        try:
+            first_chunk.append(next(stream))
+        except BaseException as exc:
+            first_error.append(exc)
+
+    try:
+        with caplog.at_level("WARNING"):
+            stream = engine.infer_stream("Xin chào Việt Nam", voice="Mai Chi")
+            consumer = threading.Thread(
+                target=consume_first_chunk,
+                args=(stream,),
+                name="ZeroTtsFirstChunk",
+                daemon=True,
+            )
+            consumer.start()
+            consumer.join(timeout=2.0)
+            assert not consumer.is_alive(), "first chunk did not arrive within 2.0s"
+            assert not first_error
+            assert first_chunk
+            assert first_chunk[0] is not None
+            assert started.wait(timeout=2.0)
+            close = getattr(stream, "close", None)
+            assert callable(close)
+            close_thread = threading.Thread(
+                target=close,
+                name="ZeroTtsClose",
+                daemon=True,
+            )
+            close_thread.start()
+            close_thread.join(timeout=2.0)
+            assert not close_thread.is_alive(), "close() did not return within 2.0s"
+
+        assert fake_stream_decoder.close.called
+        assert "did not terminate within" in caplog.text
+    finally:
+        unblock_event.set()
+        busy_worker = engine._busy_worker
+        if busy_worker is not None:
+            busy_worker.join(timeout=2.0)
+
+
+def test_zerotts_engine_deferred_stream_close_during_blocked_begin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test close is bounded while next() is blocked starting the native session."""
+    engine, fake_cdll, _, _ = _setup_engine_fixture(tmp_path)
+    monkeypatch.setattr(
+        "wyoming_vietnamese.zerotts_engine._WORKER_SHUTDOWN_TIMEOUT_SECONDS",
+        0.05,
+    )
+
+    started = threading.Event()
+    unblock = threading.Event()
+
+    def blocking_begin(*args: object, **kwargs: object) -> int:
+        """Block native session startup until the test releases it."""
+        started.set()
+        unblock.wait(timeout=2.0)
+        return 0
+
+    fake_cdll.zerotts_begin.side_effect = blocking_begin
+    stream = engine.infer_stream("Xin chào", voice="Mai Chi")
+
+    outcome: list[object] = []
+
+    def consume() -> None:
+        """Drive the blocked stream from a separate thread."""
+        try:
+            outcome.append(next(stream))
+        except BaseException as exc:
+            outcome.append(exc)
+
+    next_thread = threading.Thread(target=consume, daemon=True)
+    next_thread.start()
+    assert started.wait(timeout=1.0)
+
+    other = engine.infer_stream("Câu khác", voice="Mai Chi")
+    with pytest.raises(RuntimeError, match="still executing"):
+        next(other)
+
+    close_thread = threading.Thread(target=stream.close)
+    close_thread.start()
+    close_thread.join(timeout=1.0)
+    assert not close_thread.is_alive()
+
+    unblock.set()
+    next_thread.join(timeout=2.0)
+    assert not next_thread.is_alive()
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], StopIteration)
+
+
+def test_zerotts_engine_waiting_reservation_observes_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test a stream waiting for the context stops when its cancellation event is set."""
+    engine, _, _, _ = _setup_engine_fixture(tmp_path)
+    monkeypatch.setattr(
+        "wyoming_vietnamese.zerotts_engine._WORKER_SHUTDOWN_TIMEOUT_SECONDS",
+        1.0,
+    )
+
+    release = threading.Event()
+    worker = threading.Thread(target=release.wait, daemon=True)
+    worker.start()
+    entered_wait = threading.Event()
+    wait_timeouts: list[float | None] = []
+
+    class _SignalingEvent(threading.Event):
+        """Event that records each timeout the reservation waiter blocks for."""
+
+        def wait(self, timeout: float | None = None) -> bool:
+            """Record the slice before blocking the waiter."""
+            wait_timeouts.append(timeout)
+            entered_wait.set()
+            return super().wait(timeout)
+
+    engine._set_busy_worker(worker, _SignalingEvent())
+    stop_event = threading.Event()
+    outcome: list[BaseException] = []
+
+    def reserve() -> None:
+        """Attempt a reservation that must observe cancellation."""
+        try:
+            engine._acquire_context(object(), stop_event)
+        except BaseException as exc:
+            outcome.append(exc)
+
+    try:
+        waiter = threading.Thread(target=reserve, daemon=True)
+        waiter.start()
+        assert entered_wait.wait(timeout=1.0), "waiter did not enter the busy wait"
+        stop_event.set()
+        waiter.join(timeout=2.0)
+        assert not waiter.is_alive()
+        assert len(outcome) == 1
+        assert isinstance(outcome[0], StopIteration)
+        assert wait_timeouts
+        assert all(
+            timeout is not None and timeout <= _BUSY_WAIT_SLICE_SECONDS for timeout in wait_timeouts
+        )
+    finally:
+        release.set()
+        worker.join(timeout=1.0)
+        with engine._busy_lock:
+            engine._busy_owner = None
+            engine._busy_worker = None
+            engine._busy_done = None
+
+
+def test_zerotts_engine_deferred_stream_close_during_sequential_decode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test close is bounded while sequential decoding uses the native context."""
+    engine, _, fake_stream_decoder, _ = _setup_engine_fixture(tmp_path)
+    engine.pipelined = False
+    monkeypatch.setattr(
+        "wyoming_vietnamese.zerotts_engine._WORKER_SHUTDOWN_TIMEOUT_SECONDS",
+        0.05,
+    )
+
+    started = threading.Event()
+    unblock = threading.Event()
+    original_decode = engine._decode_audio_chunk
+
+    def blocking_decode(*args: Any, **kwargs: Any) -> Any:
+        """Block one sequential codec decode until the test releases it."""
+        started.set()
+        unblock.wait(timeout=2.0)
+        return original_decode(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "_decode_audio_chunk", blocking_decode)
+    stream = engine.infer_stream("Xin chào", voice="Mai Chi")
+
+    def consume() -> None:
+        """Drive the blocked stream from a separate thread."""
+        list(stream)
+
+    next_thread = threading.Thread(target=consume, daemon=True)
+    next_thread.start()
+    assert started.wait(timeout=1.0)
+
+    other = engine.infer_stream("Câu khác", voice="Mai Chi")
+    with pytest.raises(RuntimeError, match="still executing"):
+        next(other)
+
+    close_thread = threading.Thread(target=stream.close)
+    close_thread.start()
+    close_thread.join(timeout=1.0)
+    assert not close_thread.is_alive()
+
+    unblock.set()
+    next_thread.join(timeout=2.0)
+    assert not next_thread.is_alive()
     assert fake_stream_decoder.close.called
-    assert "did not terminate within" in caplog.text
+
+
+def test_zerotts_engine_deferred_stream_close_during_active_next(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test close during an active next() signals stop and returns within the bound."""
+    _pin_pipeline_threads(monkeypatch)
+    engine, _, fake_stream_decoder, _ = _setup_engine_fixture(tmp_path)
+    monkeypatch.setattr(
+        "wyoming_vietnamese.zerotts_engine._WORKER_SHUTDOWN_TIMEOUT_SECONDS",
+        0.05,
+    )
+
+    started = threading.Event()
+    unblock = threading.Event()
+
+    def blocking_execute_frame_step(*args: object, **kwargs: object) -> None:
+        """Block the producer until the test releases it."""
+        started.set()
+        unblock.wait()
+
+    monkeypatch.setattr(engine, "_execute_frame_step", blocking_execute_frame_step)
+
+    stream = engine.infer_stream("Xin chào Việt Nam", voice="Mai Chi")
+
+    def consume() -> None:
+        """Drive the stream from a separate thread."""
+        list(stream)
+
+    next_thread = threading.Thread(target=consume, daemon=True)
+    next_thread.start()
+
+    try:
+        assert started.wait(timeout=1.0)
+        with caplog.at_level("WARNING"):
+            close_thread = threading.Thread(target=stream.close)
+            close_thread.start()
+            close_thread.join(timeout=1.0)
+            assert not close_thread.is_alive()
+
+            next_thread.join(timeout=2.0)
+            assert not next_thread.is_alive()
+            assert "did not terminate within" in caplog.text
+
+        assert engine._busy_worker is not None
+        assert engine._busy_worker.is_alive()
+    finally:
+        unblock.set()
+        next_thread.join(timeout=2.0)
+        busy_worker = engine._busy_worker
+        if busy_worker is not None:
+            busy_worker.join(timeout=2.0)
+
+    assert not next_thread.is_alive()
+    assert fake_stream_decoder.close.called
+
+
+def test_zerotts_engine_close_during_decoder_creation_skips_producer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test cancellation while the decoder starts ends iteration without a producer."""
+    engine, fake_cdll, fake_stream_decoder, _ = _setup_engine_fixture(tmp_path)
+    monkeypatch.setattr(
+        "wyoming_vietnamese.zerotts_engine._WORKER_SHUTDOWN_TIMEOUT_SECONDS",
+        0.05,
+    )
+    started = threading.Event()
+    unblock = threading.Event()
+    real_thread = threading.Thread
+
+    def blocking_decoder() -> object:
+        """Block decoder creation until the test releases it."""
+        started.set()
+        assert unblock.wait(timeout=2.0)
+        return fake_stream_decoder
+
+    monkeypatch.setattr(engine._codec, "streaming_decoder", blocking_decoder)
+    _TrackedThread.created_threads = []
+    monkeypatch.setattr(threading, "Thread", _TrackedThread)
+    stream = engine.infer_stream("Xin chào", voice="Mai Chi")
+    outcome: list[BaseException] = []
+
+    def consume() -> None:
+        """Drive the blocked first step from a separate thread."""
+        try:
+            next(stream)
+        except BaseException as exc:
+            outcome.append(exc)
+
+    consumer = real_thread(target=consume, daemon=True)
+    consumer.start()
+    try:
+        assert started.wait(timeout=1.0)
+        stream.close()
+    finally:
+        unblock.set()
+        consumer.join(timeout=2.0)
+
+    assert not consumer.is_alive()
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], StopIteration)
+    assert fake_stream_decoder.close.called
+    assert not _TrackedThread.created_threads
+    fake_cdll.zerotts_frame.assert_not_called()
+    assert engine._busy_owner is None
+
+
+def test_zerotts_engine_start_failure_releases_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test a producer that cannot start surfaces the error and frees the reservation."""
+    _pin_pipeline_threads(monkeypatch)
+    engine, _, fake_stream_decoder, _ = _setup_engine_fixture(tmp_path)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(threading, "Thread", _FailingStartThread)
+        stream = engine.infer_stream("Xin chào", voice="Mai Chi")
+        with pytest.raises(RuntimeError, match="start failed"):
+            next(stream)
+
+        assert fake_stream_decoder.close.called
+        assert engine._busy_owner is None
+        with pytest.raises(StopIteration):
+            next(stream)
+
+    fresh = engine.infer_stream("Tạm biệt", voice="Mai Chi")
+    try:
+        assert next(fresh) is not None
+    finally:
+        fresh.close()
 
 
 def test_zerotts_engine_pipelined_cancellation_blocks_subsequent_concurrent_synthesis(
@@ -1426,8 +1988,9 @@ def test_zerotts_engine_pipelined_cancellation_blocks_subsequent_concurrent_synt
     assert chunk is not None
     assert engine._busy_worker is not None
     assert engine._busy_worker.is_alive()
-    if isinstance(stream, Generator):
-        stream.close()
+    close = getattr(stream, "close", None)
+    if callable(close):
+        close()
 
     assert engine._busy_worker is not None
     assert engine._busy_worker.is_alive()
@@ -1438,6 +2001,13 @@ def test_zerotts_engine_pipelined_cancellation_blocks_subsequent_concurrent_synt
     unblock_event.set()
     engine._busy_worker.join(timeout=1.0)
     assert not engine._busy_worker.is_alive()
+
+    # The producer's exit must release the stale reservation after decoder cleanup.
+    fresh = engine.infer_stream("Câu tiếp theo", voice="Mai Chi")
+    try:
+        assert next(fresh) is not None
+    finally:
+        fresh.close()
 
 
 def test_zerotts_engine_pipelined_producer_exception_partway(
@@ -1581,6 +2151,261 @@ def test_zerotts_engine_close_unresponsive_worker_does_not_hang(
     engine._cleanup_thread.join(timeout=2.0)
     assert not engine._cleanup_thread.is_alive()
     assert fake_cdll.zerotts_free.call_count == 1
+
+
+def test_zerotts_engine_close_recovers_context_when_cleanup_thread_start_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test a failed cleanup-thread start keeps the context for a later close."""
+    engine, fake_cdll, _, _ = _setup_engine_fixture(tmp_path)
+    monkeypatch.setattr(
+        "wyoming_vietnamese.zerotts_engine._WORKER_SHUTDOWN_TIMEOUT_SECONDS",
+        0.05,
+    )
+    started = threading.Event()
+    unblock = threading.Event()
+
+    def unresponsive_work() -> None:
+        started.set()
+        unblock.wait(timeout=2.0)
+
+    worker = threading.Thread(target=unresponsive_work)
+    worker.start()
+    assert started.wait(timeout=1.0)
+    engine._set_busy_worker(worker)
+
+    real_thread = threading.Thread
+
+    class _FailingCleanupThread(real_thread):
+        """Fail only when the deferred context cleanup thread is started."""
+
+        def start(self) -> None:
+            """Reject startup for the deferred cleanup thread."""
+            if self.name == "ZeroTtsDeferredContextFree":
+                raise RuntimeError("can't start new thread")
+            super().start()
+
+    monkeypatch.setattr(threading, "Thread", _FailingCleanupThread)
+    try:
+        with caplog.at_level("ERROR"):
+            engine.close()
+    finally:
+        monkeypatch.setattr(threading, "Thread", real_thread)
+
+    assert fake_cdll.zerotts_free.call_count == 0
+    assert engine._pending_cleanup is not None
+    assert "keeping the native context for a later close()" in caplog.text
+
+    unblock.set()
+    worker.join(timeout=2.0)
+    engine.close()
+    assert fake_cdll.zerotts_free.call_count == 1
+    assert engine._pending_cleanup is None
+
+    engine.close()
+    assert fake_cdll.zerotts_free.call_count == 1
+
+
+def test_zerotts_engine_pending_cleanup_waits_for_completion_event(tmp_path: Path) -> None:
+    """Test a detached context with an event is freed only after the event is set."""
+    engine, fake_cdll, _, _ = _setup_engine_fixture(tmp_path)
+    ctx = engine._ctx
+    assert ctx is not None
+    done = threading.Event()
+
+    def hold_until_done() -> None:
+        """Keep the worker incomplete until the operation event is set."""
+        done.wait()
+
+    worker = threading.Thread(target=hold_until_done, daemon=True)
+    worker.start()
+    engine._ctx = None
+    engine._pending_cleanup = _PendingContextCleanup(ctx, worker, done)
+
+    engine._claim_pending_context(worker)
+    assert fake_cdll.zerotts_free.call_count == 0
+    assert engine._pending_cleanup is not None
+
+    done.set()
+    worker.join(timeout=1.0)
+    engine._claim_pending_context()
+    assert fake_cdll.zerotts_free.call_count == 1
+    assert engine._pending_cleanup is None
+
+
+def test_zerotts_engine_waits_for_operation_not_idle_executor_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test a finished operation frees the context even when its thread stays alive."""
+    engine, fake_cdll, _, _ = _setup_engine_fixture(tmp_path)
+    monkeypatch.setattr(
+        "wyoming_vietnamese.zerotts_engine._WORKER_SHUTDOWN_TIMEOUT_SECONDS",
+        0.05,
+    )
+
+    def fake_frame(*args: Any, **kwargs: Any) -> int:
+        """End the session on the first synthesized frame."""
+        is_eoa = args[6] if len(args) > 6 else kwargs.get("is_eoa")
+        eoa_target = getattr(is_eoa, "_obj", is_eoa)
+        if isinstance(eoa_target, ctypes.c_int):
+            eoa_target.value = 1
+        return 0
+
+    fake_cdll.zerotts_frame.side_effect = fake_frame
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def persistent_worker() -> None:
+        """Stay alive beyond the operation that used the context."""
+        started.set()
+        release.wait()
+
+    worker = threading.Thread(target=persistent_worker, daemon=True)
+    worker.start()
+    assert started.wait(timeout=1.0)
+    done = threading.Event()
+    done.set()
+    engine._set_busy_worker(worker, done)
+    try:
+        chunks = list(engine.infer_stream("Xin chào", voice="Mai Chi"))
+    finally:
+        release.set()
+        worker.join(timeout=2.0)
+
+    assert chunks
+    assert fake_cdll.zerotts_begin.called
+    assert engine._busy_worker is None
+
+
+def test_zerotts_engine_close_defers_free_until_pending_operation_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test close frees the context once a timed-out operation signals completion."""
+    engine, fake_cdll, _, _ = _setup_engine_fixture(tmp_path)
+    monkeypatch.setattr(
+        "wyoming_vietnamese.zerotts_engine._WORKER_SHUTDOWN_TIMEOUT_SECONDS",
+        0.05,
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def pending_work() -> None:
+        """Stay alive until the test releases the executor thread."""
+        started.set()
+        release.wait(timeout=2.0)
+
+    worker = threading.Thread(target=pending_work, daemon=True)
+    worker.start()
+    assert started.wait(timeout=1.0)
+    done = threading.Event()
+    engine._set_busy_worker(worker, done)
+    try:
+        close_thread = threading.Thread(target=engine.close)
+        close_thread.start()
+        close_thread.join(timeout=1.0)
+        assert not close_thread.is_alive()
+        assert fake_cdll.zerotts_free.call_count == 0
+        assert engine._ctx is None
+        assert engine._cleanup_thread is not None
+
+        done.set()
+        engine._cleanup_thread.join(timeout=2.0)
+        assert not engine._cleanup_thread.is_alive()
+        assert fake_cdll.zerotts_free.call_count == 1
+        assert worker.is_alive()
+    finally:
+        release.set()
+        worker.join(timeout=2.0)
+
+
+def test_zerotts_engine_close_closes_a_suspended_sequential_session(tmp_path: Path) -> None:
+    """Test close on the owning thread closes a paused session instead of joining itself."""
+    engine, fake_cdll, fake_stream_decoder, _ = _setup_engine_fixture(tmp_path)
+    engine.pipelined = False
+    stream = engine.infer_stream("Xin chào Việt Nam", voice="Mai Chi")
+    assert next(stream) is not None
+    assert engine._busy_worker is threading.current_thread()
+
+    engine.close()
+
+    assert engine._ctx is None
+    assert engine._busy_worker is None
+    assert fake_stream_decoder.close.called
+    assert fake_cdll.zerotts_free.call_count == 1
+    with pytest.raises(StopIteration):
+        next(stream)
+
+
+def test_zerotts_engine_close_frees_context_when_decoder_close_fails(tmp_path: Path) -> None:
+    """Test a decoder close error does not skip native context cleanup."""
+    engine, fake_cdll, fake_stream_decoder, _ = _setup_engine_fixture(tmp_path)
+    engine.pipelined = False
+    stream = engine.infer_stream("Xin chào Việt Nam", voice="Mai Chi")
+    assert next(stream) is not None
+    fake_stream_decoder.close.side_effect = RuntimeError("decoder close failed")
+
+    with pytest.raises(RuntimeError, match="decoder close failed"):
+        engine.close()
+
+    assert engine._ctx is None
+    assert engine._busy_worker is None
+    assert engine._busy_session is None
+    assert fake_cdll.zerotts_free.call_count == 1
+
+
+def test_zerotts_engine_rejects_a_second_stream_on_the_same_thread(tmp_path: Path) -> None:
+    """Test a stream cannot reuse a context reserved by another stream on its thread."""
+    engine, _, _, _ = _setup_engine_fixture(tmp_path)
+    engine.pipelined = False
+    first = engine.infer_stream("Xin chào", voice="Mai Chi")
+    assert next(first) is not None
+
+    second = engine.infer_stream("Câu khác", voice="Mai Chi")
+    with pytest.raises(RuntimeError, match="still executing"):
+        next(second)
+
+    first.close()
+    third = engine.infer_stream("Câu khác", voice="Mai Chi")
+    assert next(third) is not None
+    third.close()
+
+
+def test_zerotts_engine_close_from_another_thread_closes_a_suspended_session(
+    tmp_path: Path,
+) -> None:
+    """Test shutdown on another thread cancels and closes a suspended session."""
+    engine, fake_cdll, fake_stream_decoder, _ = _setup_engine_fixture(tmp_path)
+    engine.pipelined = False
+    stream = engine.infer_stream("Xin chào Việt Nam", voice="Mai Chi")
+    assert next(stream) is not None
+
+    close_thread = threading.Thread(target=engine.close)
+    close_thread.start()
+    close_thread.join(timeout=2.0)
+
+    assert not close_thread.is_alive()
+    assert engine._ctx is None
+    assert engine._busy_worker is None
+    assert fake_stream_decoder.close.called
+    assert fake_cdll.zerotts_free.call_count == 1
+    with pytest.raises(StopIteration):
+        next(stream)
+
+
+def test_zerotts_engine_abandoned_stream_closes_on_finalize(tmp_path: Path) -> None:
+    """Test dropping a suspended stream closes its session and reservation."""
+    engine, _, fake_stream_decoder, _ = _setup_engine_fixture(tmp_path)
+    engine.pipelined = False
+    stream = engine.infer_stream("Xin chào Việt Nam", voice="Mai Chi")
+    assert next(stream) is not None
+
+    del stream
+    gc.collect()
+
+    assert fake_stream_decoder.close.called
+    assert engine._busy_worker is None
+    assert engine._ctx is not None
 
 
 def test_zerotts_engine_null_voice_embedding_is_flat(tmp_path: Path) -> None:

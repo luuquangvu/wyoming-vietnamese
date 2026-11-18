@@ -6,13 +6,13 @@ readme = "README.md"
 requires-python = ">=3.14"
 license = { text = "MIT" }
 dependencies = [
-  "huggingface-hub>=2.3.0",
-  "numpy>=2.5.4",
+  "huggingface-hub>=2.4.0",
+  "numpy>=2.5.5",
   "piper-phonemize>=1.5.9",
   "psutil>=7.2.2",
   "sherpa-onnx>=2.0.1",
   "sherpa-onnx-core>=2.0.1",
-  "wyoming>=1.10.2",
+  "wyoming>=1.11.0",
   "zerotts>=0.1.5",
 ]
 

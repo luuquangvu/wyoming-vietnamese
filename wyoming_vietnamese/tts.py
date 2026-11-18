@@ -8,6 +8,7 @@ import os
 import queue
 import re
 import threading
+import unicodedata
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Executor
@@ -16,7 +17,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from time import monotonic, perf_counter
-from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, runtime_checkable
 
 import numpy as np
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
@@ -177,6 +178,10 @@ class _SherpaOfflineTts(Protocol):
         ...
 
 
+class _NoPhonemesError(RuntimeError):
+    """Mark text that contains nothing the phonemizer can pronounce."""
+
+
 class _NghiDone:
     """Mark completion in the bounded NghiTTS callback queue."""
 
@@ -253,6 +258,7 @@ class _NghiAudioIterator(Iterator[np.ndarray]):
         self._queue: queue.Queue[np.ndarray | Exception | _NghiDone] = queue.Queue(maxsize=2)
         self._stop = threading.Event()
         self._emitted_audio = False
+        self._empty_text = False
         self._closed = False
         self._thread = threading.Thread(
             target=self._run,
@@ -302,7 +308,15 @@ class _NghiAudioIterator(Iterator[np.ndarray]):
     def _run(self) -> None:
         """Run the blocking Sherpa call and terminate the iterator exactly once."""
         try:
-            phoneme_codepoints = _phonemize_nghitts(self._text, self._language)
+            try:
+                phoneme_codepoints = _phonemize_nghitts(self._text, self._language)
+            except _NoPhonemesError:
+                if _has_speakable_text(self._text):
+                    # Missing phonemes for speakable text is an engine failure,
+                    # not an empty segment. Let the caller surface it.
+                    raise
+                self._empty_text = True
+                return
             generated = self._tts.generate(
                 self._text,
                 _nghitts_generation_config(phoneme_codepoints, sid=self._speaker_id),
@@ -318,6 +332,11 @@ class _NghiAudioIterator(Iterator[np.ndarray]):
             self._put(_NGHI_DONE)
             if self._guard is not None:
                 self._guard.release(self)
+
+    @property
+    def empty_text(self) -> bool:
+        """Return whether the worker found no text it could phonemize."""
+        return self._empty_text
 
     def close(self) -> None:
         """Stop after the current native unit and release queued callback chunks."""
@@ -647,6 +666,8 @@ class _TTSProduction:
     pcm_seconds: float = 0.0
     cleanup_seconds: float = 0.0
     cache_parts: list[bytes] | None = None
+    # Nonblocking hook that stops the active engine stream before native cleanup.
+    cancel_native: Callable[[], None] | None = None
 
 
 class _OutputBackpressureError(RuntimeError):
@@ -673,6 +694,141 @@ def _next_pcm_chunk(
     return True, audio_bytes, engine_seconds, perf_counter() - pcm_started
 
 
+async def _acquire_output_slot(
+    output_slots: asyncio.Semaphore,
+    abort: asyncio.Event,
+    pause_done: asyncio.Event,
+    timeout: float,
+    pause_progress: asyncio.Event | None = None,
+) -> bool:
+    """Acquire one slot, excluding a pending leading pause from the timeout."""
+    if abort.is_set():
+        return False
+    if not output_slots.locked():
+        await output_slots.acquire()
+        return True
+    acquire_task = asyncio.ensure_future(output_slots.acquire())
+    abort_task = asyncio.ensure_future(abort.wait())
+    pending_tasks: set[asyncio.Future[bool] | asyncio.Task[Literal[True]]] = {
+        acquire_task,
+        abort_task,
+    }
+    progress_task: asyncio.Task[Literal[True]] | None = None
+    pause_task: asyncio.Task[Literal[True]] | None = None
+    try:
+        if pause_progress is not None:
+            # Watch writes during and after the pause.
+            progress_task = asyncio.ensure_future(pause_progress.wait())
+            pending_tasks.add(progress_task)
+        if not pause_done.is_set():
+            pause_task = asyncio.ensure_future(pause_done.wait())
+            pending_tasks.add(pause_task)
+            while True:
+                done, _ = await asyncio.wait(
+                    pending_tasks,
+                    timeout=timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if acquire_task in done:
+                    return True
+                if abort_task in done:
+                    return False
+                if pause_task in done:
+                    break
+                if (
+                    progress_task is not None
+                    and pause_progress is not None
+                    and progress_task in done
+                ):
+                    if pause_done.is_set():
+                        break
+                    # The pause spans several writes that are still advancing.
+                    # Give the whole pause another full budget before treating
+                    # queue pressure as a stalled client.
+                    pause_progress.clear()
+                    pending_tasks.discard(progress_task)
+                    progress_task = asyncio.ensure_future(pause_progress.wait())
+                    pending_tasks.add(progress_task)
+                    continue
+                if not done:
+                    # The pause stopped making progress; start the normal slot
+                    # timeout now so a stalled pause cannot pin the inference lock.
+                    break
+        slot_tasks: set[asyncio.Future[bool] | asyncio.Task[Literal[True]]] = {
+            acquire_task,
+            abort_task,
+        }
+        if pause_task is not None and not pause_done.is_set():
+            slot_tasks.add(pause_task)
+        if progress_task is not None:
+            # Post-pause writes still count as progress.
+            slot_tasks.add(progress_task)
+        while True:
+            done, _ = await asyncio.wait(
+                slot_tasks,
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if acquire_task in done:
+                return True
+            if abort_task in done:
+                return False
+            if pause_task is not None and pause_task in done:
+                # The pause completed during the slot wait; give the slot a
+                # fresh timeout before deciding it has remained full.
+                slot_tasks.discard(pause_task)
+                continue
+            if progress_task is not None and progress_task in done:
+                slot_tasks.discard(progress_task)
+                if pause_done.is_set():
+                    if pause_task is not None:
+                        slot_tasks.discard(pause_task)
+                    if pause_progress is not None:
+                        # First post-pause PCM write: renew the slot budget.
+                        pause_progress.clear()
+                        pending_tasks.discard(progress_task)
+                        progress_task = asyncio.ensure_future(pause_progress.wait())
+                        pending_tasks.add(progress_task)
+                        slot_tasks.add(progress_task)
+                    continue
+                if pause_progress is not None:
+                    # Progress resumed after the pause budget expired; extend it
+                    # instead of failing before the pause can complete.
+                    pause_progress.clear()
+                    pending_tasks.discard(progress_task)
+                    progress_task = asyncio.ensure_future(pause_progress.wait())
+                    pending_tasks.add(progress_task)
+                    slot_tasks.add(progress_task)
+                    continue
+            if pause_done.is_set() and pause_task is not None and pause_task in slot_tasks:
+                # Pause completion raced with the timeout; renew the slot budget.
+                slot_tasks.discard(pause_task)
+                continue
+            if pause_progress is not None and pause_progress.is_set():
+                # The signal can arrive after wait() timed out but before the
+                # pending task is scheduled; renew instead of failing.
+                pause_progress.clear()
+                if progress_task is not None:
+                    # The old waiter may still be pending on the cleared event.
+                    progress_task.cancel()
+                    slot_tasks.discard(progress_task)
+                    pending_tasks.discard(progress_task)
+                progress_task = asyncio.ensure_future(pause_progress.wait())
+                pending_tasks.add(progress_task)
+                slot_tasks.add(progress_task)
+                continue
+            raise _OutputBackpressureError("TTS output queue remained full past the write timeout")
+    finally:
+        for task in pending_tasks:
+            if not task.done():
+                task.cancel()
+
+
+def _has_speakable_text(text: str) -> bool:
+    """Return whether text contains any letter or digit for the engine to speak."""
+    return any(char.isalnum() for char in text)
+
+
 def _audio_to_pcm_bytes(audio: np.ndarray) -> bytes:
     """Convert arbitrary numeric audio safely into clipped little-endian PCM16."""
     samples = np.asarray(audio, dtype=np.float32).ravel()
@@ -688,6 +844,9 @@ def _audio_to_pcm_bytes(audio: np.ndarray) -> bytes:
 _SENTENCE_END_CHARS = frozenset(".!?…")
 _CLAUSE_END_CHARS = frozenset(",;:\u2013\u2014-")
 _LINE_BREAK_CHARS = frozenset("\n")
+_CARRIAGE_RETURN = "\r"
+# CR also ends a line; quote lookahead must not cross it.
+_QUOTE_LINE_BREAK_CHARS = _LINE_BREAK_CHARS | frozenset(_CARRIAGE_RETURN)
 # Union used to keep an incremental scan from resuming inside one delimiter run.
 _ALL_DELIMITER_CHARS = _SENTENCE_END_CHARS | _CLAUSE_END_CHARS | _LINE_BREAK_CHARS
 # Subset of the delimiters above that also separate digits: "33,8", "1.000", "10:30".
@@ -697,10 +856,56 @@ _TOKEN_JOINING_CHARS = frozenset("\u2013\u2014-")
 # Administrative prefix abbreviations whose periods precede a proper noun or number:
 # "TP. HCM", "Q. 1". Aligned with zerotts.text_norm.vi_normalizer._PREFIX_ABBR.
 _PREFIX_ABBR = frozenset({"TP", "Q", "P", "H", "TX", "TT", "KP"})
-# Closing punctuation may follow a boundary character; rstrip() requires text.
-_TRAILING_WRAPPER_CHARS = "\"')]}\u00bb\u201d\u2019"
+# Wrapper characters. ASCII quotes are ambiguous; the rest only close.
+_ASCII_DOUBLE_QUOTE = '"'
+_ASCII_SINGLE_QUOTE = "'"
+_CURLY_DOUBLE_CLOSE = "\u201d"
+_CURLY_SINGLE_CLOSE = "\u2019"
+_OPEN_BRACKET_CHARS = frozenset("([{\u00ab")
+_CLOSE_BRACKET_CHARS = frozenset(")]}\u00bb")
+_AMBIGUOUS_WRAPPER_CHARS = frozenset((_ASCII_DOUBLE_QUOTE, _ASCII_SINGLE_QUOTE))
+_TRAILING_WRAPPER_CHARS = "".join(
+    sorted(
+        _AMBIGUOUS_WRAPPER_CHARS
+        | _CLOSE_BRACKET_CHARS
+        | frozenset((_CURLY_DOUBLE_CLOSE, _CURLY_SINGLE_CLOSE))
+    )
+)
+_BRACKET_PAIRS = {"(": ")", "[": "]", "{": "}", "\u00ab": "\u00bb"}
+_BRACKET_CLOSERS = {closer: opener for opener, closer in _BRACKET_PAIRS.items()}
+_CURLY_QUOTE_PAIRS = {"\u201c": "\u201d", "\u2018": "\u2019"}
+_CURLY_QUOTE_CLOSERS = {closer: opener for opener, closer in _CURLY_QUOTE_PAIRS.items()}
+# Characters that may immediately precede an opening quotation mark.
+_QUOTE_OPENER_PRECEDERS = _OPEN_BRACKET_CHARS | _SENTENCE_END_CHARS | frozenset(":;,\u2013\u2014-")
 # Shortest clause a punctuation boundary may produce, and shortest standalone final tail.
 _MIN_CLAUSE_CHARS = 15
+# Bound wrapper tracking so one unmatched opener cannot keep rescanning the
+# stream or hold every later sentence. A wrapper open across more text than
+# this is treated as stray rather than waiting for a closer that may never come.
+_WRAPPER_TRACK_MAX_CHARS = 1024
+
+
+def _is_combining_mark(char: str) -> bool:
+    """Return whether a character is an attached combining mark."""
+    return unicodedata.category(char).startswith("M")
+
+
+def _adjacent_base_char(text: str, index: int, step: int) -> str:
+    """Return the base character beside an index, skipping attached combining marks."""
+    while 0 <= index < len(text) and _is_combining_mark(text[index]):
+        index += step
+    return text[index] if 0 <= index < len(text) else ""
+
+
+def _quote_starts_word(text: str, index: int) -> bool:
+    """Return whether an ambiguous quote opens a word rather than closing one."""
+    next_char = _adjacent_base_char(text, index + 1, 1)
+    if not (next_char.isalnum() or next_char in _OPEN_BRACKET_CHARS):
+        return False
+    if index == 0:
+        return True
+    before = text[index - 1]
+    return before.isspace() or before in _QUOTE_OPENER_PRECEDERS
 
 
 def _delimiter_pattern(boundary_chars: frozenset[str]) -> re.Pattern[str]:
@@ -712,6 +917,20 @@ def _delimiter_pattern(boundary_chars: frozenset[str]) -> re.Pattern[str]:
 _PARAGRAPH_DELIM_RE = _delimiter_pattern(_LINE_BREAK_CHARS)
 _SENTENCE_DELIM_RE = _delimiter_pattern(_SENTENCE_END_CHARS)
 _CLAUSE_DELIM_RE = _delimiter_pattern(_CLAUSE_END_CHARS)
+_LEADING_LINE_BREAK_RE = re.compile(r"\s*\n")
+
+
+def _is_clause_boundary(match: re.Match[str]) -> bool:
+    """Return whether a delimiter match is clause punctuation rather than a sentence end."""
+    return all(char in _CLAUSE_END_CHARS for char in match.group(1))
+
+
+def _sentence_is_established(window: str, start: int) -> bool:
+    """Return whether buffered text after a clause boundary already ends a sentence."""
+    return any(
+        not _is_intra_token_separator(window, match)
+        for match in _SENTENCE_DELIM_RE.finditer(window, start)
+    )
 
 
 def _is_numeric_separator(text: str, start: int, end: int) -> bool:
@@ -803,17 +1022,127 @@ def _silence_pcm(milliseconds: int, sample_rate: int) -> bytes:
     return bytes(samples * TtsAudio.SAMPLE_WIDTH * TtsAudio.SAMPLE_CHANNELS)
 
 
-def _boundary_kind(text: str, separator: str = "") -> str:
+_BoundaryKind = Literal["paragraph", "sentence", "clause", "none"]
+_BOUNDARY_STRENGTH: dict[_BoundaryKind, int] = {
+    "none": 0,
+    "clause": 1,
+    "sentence": 2,
+    "paragraph": 3,
+}
+
+
+@dataclass(frozen=True)
+class _PendingPause:
+    """Pause owed before the next speakable segment and its boundary kind."""
+
+    pcm: bytes = b""
+    kind: _BoundaryKind = "none"
+
+
+_EMPTY_PENDING_PAUSE = _PendingPause()
+
+
+def _boundary_kind(text: str, separator: str = "") -> _BoundaryKind:
     """Classify the punctuation that a synthesized segment ends on."""
     if any(char in separator for char in _LINE_BREAK_CHARS):
         return "paragraph"
-    trimmed = text.rstrip().rstrip(_TRAILING_WRAPPER_CHARS).rstrip()
-    if not trimmed:
+    end = len(text)
+    while end and text[end - 1].isspace():
+        end -= 1
+    while end and text[end - 1] in _TRAILING_WRAPPER_CHARS:
+        end -= 1
+        while end and text[end - 1].isspace():
+            end -= 1
+    if not end:
         return "none"
-    last_char = trimmed[-1]
+    last_char = text[end - 1]
     if last_char in _SENTENCE_END_CHARS:
         return "sentence"
     return "clause" if last_char in _CLAUSE_END_CHARS else "none"
+
+
+def _starts_with_line_break(text: str) -> bool:
+    """Return whether leading whitespace is followed by an LF paragraph break."""
+    return _LEADING_LINE_BREAK_RE.match(text) is not None
+
+
+def _has_unclosed_opening_wrapper(text: str) -> bool:
+    """Return whether text opens a wrapper that a later chunk could still close."""
+    stack: list[str] = []
+    for index, char in enumerate(text):
+        if char in _OPEN_BRACKET_CHARS:
+            stack.append(char)
+        elif char in _BRACKET_CLOSERS:
+            opener = _BRACKET_CLOSERS[char]
+            if stack and stack[-1] == opener:
+                stack.pop()
+        elif char in _CURLY_QUOTE_PAIRS:
+            stack.append(char)
+        elif char in _CURLY_QUOTE_CLOSERS:
+            opener = _CURLY_QUOTE_CLOSERS[char]
+            if stack and stack[-1] == opener:
+                stack.pop()
+        elif char in _AMBIGUOUS_WRAPPER_CHARS:
+            if _quote_starts_word(text, index):
+                next_char = _adjacent_base_char(text, index + 1, 1)
+                if char == _ASCII_SINGLE_QUOTE and next_char.isdigit():
+                    # A decade or measurement mark, not an opening quotation.
+                    continue
+                stack.append(char)
+            elif stack and stack[-1] == char:
+                stack.pop()
+    return bool(stack)
+
+
+def _tail_is_settled(
+    text: str,
+    separator: str = "",
+    *,
+    unclosed_wrapper: bool | None = None,
+) -> bool:
+    """Return whether later text cannot change the final token's classification."""
+    stripped = text.rstrip()
+    if not stripped:
+        return False
+    if any(char in _LINE_BREAK_CHARS for char in separator):
+        # A line break is a hard boundary.
+        return True
+    if unclosed_wrapper:
+        # The final sentence stays open until every wrapper it started closes.
+        return False
+    if stripped[-1] in _AMBIGUOUS_WRAPPER_CHARS:
+        # A final straight quote may still open the next word.
+        return False
+    last = stripped[-1]
+    if last not in _ALL_DELIMITER_CHARS:
+        return True
+    index = len(stripped) - 1
+    while index >= 0 and stripped[index] in _ALL_DELIMITER_CHARS:
+        index -= 1
+    token_end = index + 1
+    while index >= 0 and stripped[index].isalnum():
+        index -= 1
+    token = stripped[index + 1 : token_end]
+    trailing_delimiters = len(stripped) - token_end
+    if (
+        last in _NUMERIC_SEPARATOR_CHARS
+        and token.isdigit()
+        and not separator
+        and trailing_delimiters == 1
+    ):
+        # Without following whitespace, one separator may still join a later
+        # digit into a number. A run such as "42..." is already a sentence end.
+        return False
+    if last == "." and _is_abbreviation_token(token) and not separator:
+        # Without following whitespace, a later uppercase token may still make
+        # this period an abbreviation.
+        return False
+    if last not in _TOKEN_JOINING_CHARS or not token or bool(separator):
+        # A later chunk may still attach the closer of an opening wrapper.
+        if unclosed_wrapper is not None:
+            return not unclosed_wrapper
+        return not _has_unclosed_opening_wrapper(stripped)
+    return False
 
 
 class StreamClauseDetector:
@@ -836,14 +1165,63 @@ class StreamClauseDetector:
         # Whitespace discarded after the most recent boundary, kept so a merged
         # final tail can be restored without rewriting the requested text.
         self.trailing_separator = ""
-        # Delimiter matches before this offset were settled by earlier scans and cannot
-        # change when more text arrives, so each streaming chunk only rescans the tail.
-        self._scan_offset = 0
+        # Emitted text inside a wrapper that has not closed yet. It keeps a
+        # wrapper opened in an earlier sentence attached to the held final one.
+        # Tracking restarts after a paragraph break and is bounded in size.
+        self._unclosed_wrapper_text = ""
 
     def add_chunk_with_separators(self, text: str) -> list[tuple[str, str]]:
-        """Buffer incoming streaming text and yield clauses with their trailing separators."""
+        """Buffer streaming text and emit segments whose boundary is settled.
+
+        The buffer is re-split with the same algorithm as batch synthesis. Only
+        an ambiguous final token is held back until more text or the final flush
+        resolves it.
+        """
         self.buffer += text
-        return self._drain()
+        wrapper_open = self._wrapper_is_open()
+        pairs, remainder = self._split()
+        if not pairs:
+            return []
+        last_text, last_separator = pairs[-1]
+        hold_last = not remainder.strip() and not _tail_is_settled(
+            last_text, last_separator, unclosed_wrapper=wrapper_open
+        )
+        emitted = pairs[:-1] if hold_last else pairs
+        self._update_unclosed_wrapper(wrapper_open, emitted)
+        if hold_last:
+            # Hold a final ambiguous token until the next chunk can classify it.
+            self.buffer = f"{last_text}{last_separator}{remainder}"
+            return emitted
+        self.buffer = remainder
+        return pairs
+
+    def _wrapper_is_open(self) -> bool:
+        """Return whether a tracked wrapper is still open within the bounded scope."""
+        tracked = f"{self._unclosed_wrapper_text}{self.buffer}"
+        # A wrapper cannot span a paragraph break, and a stray opener before one
+        # must not keep holding sentences in later paragraphs.
+        last_break = tracked.rfind("\n")
+        if last_break >= 0:
+            tracked = tracked[last_break + 1 :]
+        if len(tracked) > _WRAPPER_TRACK_MAX_CHARS:
+            # One unmatched opener should not degrade the rest of the stream.
+            return False
+        return _has_unclosed_opening_wrapper(tracked)
+
+    def _update_unclosed_wrapper(self, wrapper_open: bool, emitted: list[tuple[str, str]]) -> None:
+        """Retain emitted text while an opening wrapper still awaits its closer."""
+        if not wrapper_open:
+            self._unclosed_wrapper_text = ""
+            return
+        emitted_text = "".join(f"{text}{separator}" for text, separator in emitted)
+        last_break = emitted_text.rfind("\n")
+        if last_break >= 0:
+            # Keep only the text after the paragraph break.
+            self._unclosed_wrapper_text = emitted_text[last_break + 1 :]
+        else:
+            self._unclosed_wrapper_text += emitted_text
+        if len(self._unclosed_wrapper_text) > _WRAPPER_TRACK_MAX_CHARS:
+            self._unclosed_wrapper_text = ""
 
     def add_chunk(self, text: str) -> Iterable[str]:
         """Buffer incoming streaming text and yield synthesis-ready clauses."""
@@ -853,8 +1231,37 @@ class StreamClauseDetector:
         """Flush all remaining text at stream end."""
         text = self.buffer.strip()
         self.buffer = ""
-        self._scan_offset = 0
+        self._unclosed_wrapper_text = ""
         return text
+
+    @staticmethod
+    def _merge_final_tail(
+        pairs: list[tuple[str, str]],
+        remainder: str,
+        min_clause_chars: int,
+    ) -> list[tuple[str, str]]:
+        """Append a final remainder or re-attach a short tail to the last clause."""
+        if (
+            not pairs
+            or len(remainder) >= min_clause_chars
+            or _boundary_kind(pairs[-1][0], pairs[-1][1]) in ("paragraph", "sentence")
+        ):
+            pairs.append((remainder, ""))
+            return pairs
+        # Re-attach a short tail using the separator the boundary discarded, so the
+        # engine receives the requested text rather than a reconstruction of it.
+        last_clause, last_sep = pairs[-1]
+        pairs[-1] = (f"{last_clause}{last_sep}{remainder}", "")
+        return pairs
+
+    def finish_with_separators(self) -> list[tuple[str, str]]:
+        """Split every remaining segment and flush the final remainder."""
+        pairs, remainder = self._split()
+        self.buffer = ""
+        self._unclosed_wrapper_text = ""
+        if not remainder.strip():
+            return pairs
+        return self._merge_final_tail(pairs, remainder.strip(), self.min_clause_chars)
 
     @staticmethod
     def split_clause_text_with_separators(
@@ -865,22 +1272,11 @@ class StreamClauseDetector:
         if not trimmed:
             return []
         detector = StreamClauseDetector(split_clauses=split_clauses)
-        pairs = detector.add_chunk_with_separators(trimmed)
-        remainder = detector.finish()
-        if not remainder:
+        detector.buffer = trimmed
+        pairs, remainder = detector._split()
+        if not remainder.strip():
             return pairs
-        if (
-            not pairs
-            or len(remainder) >= detector.min_clause_chars
-            or _boundary_kind(pairs[-1][0], pairs[-1][1]) in ("paragraph", "sentence")
-        ):
-            pairs.append((remainder, ""))
-            return pairs
-        # Re-attach a short tail using the separator the boundary discarded, so the
-        # engine receives the requested text rather than a reconstruction of it.
-        last_clause, last_sep = pairs[-1]
-        pairs[-1] = (f"{last_clause}{last_sep}{remainder}", "")
-        return pairs
+        return detector._merge_final_tail(pairs, remainder.strip(), detector.min_clause_chars)
 
     @staticmethod
     def split_clause_text(text: str, split_clauses: bool = True) -> list[str]:
@@ -892,26 +1288,66 @@ class StreamClauseDetector:
             )
         ]
 
-    def _drain(self) -> list[tuple[str, str]]:
-        """Extract configured text boundaries without length-based splitting."""
-        yielded: list[tuple[str, str]] = []
+    def _split(self) -> tuple[list[tuple[str, str]], str]:
+        """Split the buffered text into completed pairs and the remaining tail."""
+        pairs: list[tuple[str, str]] = []
         while self.buffer:
             match = self._find_natural_boundary()
             if match is None:
                 break
+            end_pos = self._resolve_boundary(match)
+            pair = self._commit_boundary(self.buffer, end_pos)
+            if pair is not None:
+                pairs.append(pair)
+        return pairs, self.buffer
 
-            window = self.buffer
-            end_pos = match.end()
-            head = window[:end_pos]
-            leading = len(head) - len(head.lstrip())
-            piece = head.strip()
-            self.buffer = window[end_pos:].lstrip()
-            self.trailing_separator = window[leading + len(piece) : len(window) - len(self.buffer)]
-            # The remainder is a fresh window, so its first delimiter must be rescanned.
-            self._scan_offset = 0
-            if piece:
-                yielded.append((piece, self.trailing_separator))
-        return yielded
+    def _resolve_boundary(self, match: re.Match[str]) -> int:
+        """Resolve closing wrappers at one boundary."""
+        if any(char in _LINE_BREAK_CHARS for char in match.group(1)):
+            return match.end()
+        # Keep closing wrappers with the preceding sentence.
+        return self._scan_trailing_wrappers(self.buffer, match.end(1), match.end())
+
+    def _scan_trailing_wrappers(
+        self,
+        window: str,
+        delimiter_end: int,
+        base_end: int,
+    ) -> int:
+        """Return the boundary extended across any closing wrappers that follow it."""
+        wrapper_end = delimiter_end
+        scan_pos = delimiter_end
+        while scan_pos < len(window):
+            char = window[scan_pos]
+            if char.isspace() and char not in _QUOTE_LINE_BREAK_CHARS:
+                scan_pos += 1
+                continue
+            if char not in _TRAILING_WRAPPER_CHARS:
+                break
+            if char in _AMBIGUOUS_WRAPPER_CHARS and _quote_starts_word(window, scan_pos):
+                # A quote after a boundary starts the next sentence instead.
+                break
+            scan_pos += 1
+            wrapper_end = scan_pos
+        if wrapper_end == delimiter_end:
+            return base_end
+        end_pos = wrapper_end
+        while end_pos < len(window) and window[end_pos].isspace():
+            end_pos += 1
+        return end_pos
+
+    def _commit_boundary(
+        self,
+        window: str,
+        end_pos: int,
+    ) -> tuple[str, str] | None:
+        """Commit one boundary and return its stripped text and separator."""
+        head = window[:end_pos]
+        leading = len(head) - len(head.lstrip())
+        piece = head.strip()
+        self.buffer = window[end_pos:].lstrip()
+        self.trailing_separator = window[leading + len(piece) : len(window) - len(self.buffer)]
+        return (piece, self.trailing_separator) if piece else None
 
     def _first_text_boundary(self, matches: Iterable[re.Match[str]]) -> re.Match[str] | None:
         """Return the earliest delimiter that ends a clause rather than joining a token."""
@@ -920,45 +1356,14 @@ class StreamClauseDetector:
             None,
         )
 
-    def _resume_offset(self, *match_groups: Sequence[re.Match[str]]) -> int:
-        """Return the first position whose boundary decision may still change.
-
-        Every delimiter with an older sibling has fixed context: a token scan that
-        follows it stops at that sibling. Only the last candidate of each pattern can
-        be waiting at the end of the buffer for more text, so scanning resumes there.
-        The offset is widened to the start of its delimiter run because a run split
-        by the resume point would be classified one character at a time.
-        """
-        last_starts = [matches[-1].start() for matches in match_groups if matches]
-        offset = min(last_starts, default=len(self.buffer))
-        while offset > 0 and self.buffer[offset - 1] in _ALL_DELIMITER_CHARS:
-            offset -= 1
-        return offset
-
     def _find_natural_boundary(self) -> re.Match[str] | None:
         """Find the earliest paragraph, sentence, or sufficiently long clause delimiter."""
-        paragraph_matches = list(_PARAGRAPH_DELIM_RE.finditer(self.buffer, self._scan_offset))
-        sentence_matches = list(_SENTENCE_DELIM_RE.finditer(self.buffer, self._scan_offset))
-        clause_matches = (
-            list(_CLAUSE_DELIM_RE.finditer(self.buffer, self._scan_offset))
-            if self.split_clauses
-            else []
-        )
+        paragraph_matches = list(_PARAGRAPH_DELIM_RE.finditer(self.buffer))
+        sentence_matches = list(_SENTENCE_DELIM_RE.finditer(self.buffer))
+        clause_matches = list(_CLAUSE_DELIM_RE.finditer(self.buffer)) if self.split_clauses else []
         clause_candidates = [
             match for match in clause_matches if match.end() >= self.min_clause_chars
         ]
-        # A trailing short clause can still grow to the minimum as its trailing
-        # whitespace arrives, so it stays resumable without being a boundary yet.
-        clause_resume = [
-            match
-            for match in clause_matches
-            if match.end() >= self.min_clause_chars or match.end() == len(self.buffer)
-        ]
-        self._scan_offset = self._resume_offset(
-            paragraph_matches,
-            sentence_matches,
-            clause_resume,
-        )
         if candidates := [
             match
             for match in (
@@ -1195,49 +1600,43 @@ class TTSEventHandler(SafeAsyncEventHandler):
         self.stream_text_chars = raw_stream_chars
 
         detector = self.sentence_boundary
+        buffered_text = bool(detector.buffer.strip())
         clauses = detector.add_chunk_with_separators(stream_chunk.text)
+        if (
+            self._pending_pause.kind != "none"
+            and not buffered_text
+            and _starts_with_line_break(stream_chunk.text)
+        ):
+            # A paragraph break split into a later chunk still separates the segments.
+            self._pending_pause = self._pending_pause_for_kind("paragraph")
         if not clauses:
             return True
 
         try:
-            normalized_clauses = [
-                (
-                    self._normalize_for_limit(clause, self.stream_voice_name),
-                    (
-                        self._normalize_for_limit(separator, self.stream_voice_name)
-                        if separator
-                        else ""
-                    ),
-                    separator,
-                )
-                for clause, separator in clauses
-            ]
+            normalized_clauses, normalized_clause_chars = self._prepare_stream_segments(clauses)
         except Exception:
             _LOGGER.exception("TTS stream text normalization failed")
             return await self._fail_stream("Speech synthesis failed", "inference-failed")
 
-        normalized_clause_chars = sum(
-            len(clause) + len(normalized_separator)
-            for clause, normalized_separator, _ in normalized_clauses
-        )
         if self.stream_normalized_chars + normalized_clause_chars > self.max_text_chars:
             return await self._fail_stream(_ERR_TEXT_TOO_LONG, "text-too-long")
 
         self.stream_normalized_chars += normalized_clause_chars
-        for normalized_clause, _, separator in normalized_clauses:
+        for normalized_clause, _, separator, boundary_kind in normalized_clauses:
             self.stream_segment_count += 1
             _LOGGER.debug(
                 "TTS step=sentence-ready segment=%d text_chars=%d",
                 self.stream_segment_count,
                 len(normalized_clause),
             )
-            if not await self._synthesize(
+            production = await self._synthesize_with_pending_pause(
                 normalized_clause,
-                self.stream_voice_name,
                 send_start=not self.stream_audio_started,
                 send_stop=False,
                 separator=separator,
-            ):
+                boundary_kind=boundary_kind,
+            )
+            if production is None:
                 await self.write_event(SynthesizeStopped().event())
                 self._reset_stream()
                 return False
@@ -1260,41 +1659,27 @@ class TTSEventHandler(SafeAsyncEventHandler):
 
         stop_started = perf_counter()
         self.stream_lifecycle_served = True
-        final_text = self.sentence_boundary.finish()
+        clause_pairs = self.sentence_boundary.finish_with_separators()
         _LOGGER.debug(
             "TTS step=text-stream-stop chunks=%d completed_segments=%d final_text_chars=%d",
             self.stream_chunk_count,
             self.stream_segment_count,
-            len(final_text),
+            sum(len(clause) for clause, _ in clause_pairs),
         )
-        if final_text:
-            clause_pairs = StreamClauseDetector.split_clause_text_with_separators(
-                final_text, split_clauses=self.chunks_are_sentences
-            )
+        if clause_pairs:
             try:
-                normalized_clauses = [
-                    (
-                        self._normalize_for_limit(clause, self.stream_voice_name),
-                        (
-                            self._normalize_for_limit(separator, self.stream_voice_name)
-                            if separator
-                            else ""
-                        ),
-                        separator,
-                    )
-                    for clause, separator in clause_pairs
-                ]
+                normalized_clauses, normalized_clause_chars = self._prepare_stream_segments(
+                    clause_pairs
+                )
             except Exception:
                 _LOGGER.exception("TTS final stream text normalization failed")
                 return await self._fail_stream("Speech synthesis failed", "inference-failed")
-            normalized_clause_chars = sum(
-                len(clause) + len(normalized_separator)
-                for clause, normalized_separator, _ in normalized_clauses
-            )
             if self.stream_normalized_chars + normalized_clause_chars > self.max_text_chars:
                 return await self._fail_stream(_ERR_TEXT_TOO_LONG, "text-too-long")
             self.stream_normalized_chars += normalized_clause_chars
-            for idx, (normalized_clause, _, separator) in enumerate(normalized_clauses):
+            for idx, (normalized_clause, _, separator, boundary_kind) in enumerate(
+                normalized_clauses
+            ):
                 self.stream_segment_count += 1
                 is_last_clause = idx == len(clause_pairs) - 1
                 _LOGGER.debug(
@@ -1303,24 +1688,31 @@ class TTSEventHandler(SafeAsyncEventHandler):
                     len(normalized_clause),
                     is_last_clause,
                 )
-                if not await self._synthesize(
+                production = await self._synthesize_with_pending_pause(
                     normalized_clause,
-                    self.stream_voice_name,
                     send_start=not self.stream_audio_started,
                     send_stop=is_last_clause,
                     separator=separator,
-                ):
+                    boundary_kind=boundary_kind,
+                )
+                if production is None:
                     await self.write_event(SynthesizeStopped().event())
                     self._reset_stream()
                     return False
                 self.stream_audio_started = True
-        elif self.stream_audio_started:
+        elif not self.stream_audio_started:
+            return await self._fail_stream("Synthesis text must not be empty", "empty-text")
+
+        if not self.stream_audio_bytes:
+            return await self._fail_stream("Speech synthesis failed", "inference-failed")
+
+        if not self.stream_audio_stopped:
             write_started = perf_counter()
             await self.write_event(AudioStop().event())
             self.stream_output_seconds += perf_counter() - write_started
-        else:
-            return await self._fail_stream("Synthesis text must not be empty", "empty-text")
+            self.stream_audio_stopped = True
 
+        self._pending_pause = _EMPTY_PENDING_PAUSE
         write_started = perf_counter()
         await self.write_event(SynthesizeStopped().event())
         self.stream_output_seconds += perf_counter() - write_started
@@ -1372,6 +1764,26 @@ class TTSEventHandler(SafeAsyncEventHandler):
             raise TypeError("TTS normalizer must return text")
         return normalized
 
+    def _prepare_stream_segments(
+        self,
+        clauses: Iterable[tuple[str, str]],
+    ) -> tuple[list[tuple[str, str, str, _BoundaryKind]], int]:
+        """Normalize streamed clauses and classify their original boundary kinds."""
+        normalized_clauses: list[tuple[str, str, str, _BoundaryKind]] = [
+            (
+                self._normalize_for_limit(clause, self.stream_voice_name),
+                (self._normalize_for_limit(separator, self.stream_voice_name) if separator else ""),
+                separator,
+                _boundary_kind(clause, separator),
+            )
+            for clause, separator in clauses
+        ]
+        normalized_clause_chars = sum(
+            len(clause) + len(normalized_separator)
+            for clause, normalized_separator, _, _ in normalized_clauses
+        )
+        return normalized_clauses, normalized_clause_chars
+
     def _resolve_voice_name(self, voice: SynthesizeVoice | None) -> str | None:
         """Validate Wyoming voice selectors and resolve a preset voice name."""
         if voice is None:
@@ -1406,20 +1818,79 @@ class TTSEventHandler(SafeAsyncEventHandler):
         """Draw one pause of the configured length as PCM silence."""
         return _silence_pcm(base_ms, self.sample_rate)
 
-    def _boundary_silence_pcm(self, text: str, separator: str = "") -> bytes:
-        """Return padding for a completed segment when another segment follows.
-
-        Non-final segments end at a recognized sentence, clause, or line boundary;
-        the boundary type selects the configured pause.
-        """
-        kind = _boundary_kind(text, separator)
+    def _pending_pause_for_kind(self, kind: _BoundaryKind) -> _PendingPause:
+        """Build the pause and tracked boundary for a completed segment."""
         if kind == "paragraph":
-            return self._silence_pcm(self.paragraph_silence_ms)
+            return _PendingPause(self._silence_pcm(self.paragraph_silence_ms), "paragraph")
         if kind == "clause":
-            return self._silence_pcm(self.clause_silence_ms)
-        return self._silence_pcm(self.sentence_silence_ms)
+            return _PendingPause(self._silence_pcm(self.clause_silence_ms), "clause")
+        return _PendingPause(self._silence_pcm(self.sentence_silence_ms), "sentence")
 
-    async def _write_silence(self, silence: bytes) -> float:
+    def _boundary_silence_pcm(self, text: str, separator: str = "") -> bytes:
+        """Return padding for a completed segment when another segment follows."""
+        return self._pending_pause_for_kind(_boundary_kind(text, separator)).pcm
+
+    def _take_pending_pause(self) -> _PendingPause:
+        """Return and clear the pause owed before the next speakable segment."""
+        pause = self._pending_pause
+        self._pending_pause = _EMPTY_PENDING_PAUSE
+        return pause
+
+    def _update_pending_pause(
+        self,
+        previous: _PendingPause,
+        kind: _BoundaryKind,
+        audio_bytes: int,
+    ) -> None:
+        """Keep a pause only while a later segment may still produce audio."""
+        if not self.chunks_are_sentences:
+            self._pending_pause = _EMPTY_PENDING_PAUSE
+            return
+        if not audio_bytes:
+            # An empty segment cannot speak the pause it consumed. Keep the strongest
+            # boundary seen so far, but never create a leading pause from nothing.
+            if previous.kind == "none":
+                self._pending_pause = previous
+                return
+            strongest = (
+                kind
+                if _BOUNDARY_STRENGTH[kind] > _BOUNDARY_STRENGTH[previous.kind]
+                else previous.kind
+            )
+            self._pending_pause = self._pending_pause_for_kind(strongest)
+            return
+        self._pending_pause = self._pending_pause_for_kind(kind)
+
+    async def _synthesize_with_pending_pause(
+        self,
+        text: str,
+        *,
+        send_start: bool,
+        send_stop: bool,
+        separator: str,
+        boundary_kind: _BoundaryKind,
+    ) -> _TTSProduction | None:
+        """Synthesize one streamed segment with the pause owed before it."""
+        pending = self._take_pending_pause()
+        production = await self._synthesize(
+            text,
+            self.stream_voice_name,
+            send_start=send_start,
+            send_stop=send_stop,
+            separator=separator,
+            leading_silence=pending.pcm,
+            write_pause=False,
+        )
+        if production is not None:
+            self._update_pending_pause(pending, boundary_kind, production.total_bytes)
+        return production
+
+    async def _write_silence(
+        self,
+        silence: bytes,
+        *,
+        progress: asyncio.Event | None = None,
+    ) -> float:
         """Write padding silence as protocol audio chunks and report elapsed time."""
         write_started = perf_counter()
         for offset in range(0, len(silence), TtsAudio.CHUNK_SIZE):
@@ -1431,6 +1902,8 @@ class TTSEventHandler(SafeAsyncEventHandler):
                     audio=silence[offset : offset + TtsAudio.CHUNK_SIZE],
                 ).event()
             )
+            if progress is not None:
+                progress.set()
         return perf_counter() - write_started
 
     def _effective_voice_name(self, voice_name: str | None) -> str | None:
@@ -1461,7 +1934,10 @@ class TTSEventHandler(SafeAsyncEventHandler):
         send_start: bool = True,
         send_stop: bool = True,
         separator: str = "",
+        leading_silence: bytes = b"",
+        write_pause: bool = True,
         _allow_token_split: bool = True,
+        _allow_empty_segment: bool = False,
     ) -> _TTSProduction | None:
         """Pipeline inference and bounded network output around the shared lock."""
         segment_started = perf_counter()
@@ -1489,15 +1965,20 @@ class TTSEventHandler(SafeAsyncEventHandler):
             if len(token_segments) > 1:
                 aggregate = _TTSProduction()
                 aggregate.inference_api = "token-segments"
+                pending_pause = leading_silence
                 for index, token_segment in enumerate(token_segments):
                     is_last = index == len(token_segments) - 1
+                    part_send_start = send_start and index == 0
                     part = await self._synthesize(
                         token_segment,
                         voice_name,
-                        send_start=send_start and index == 0,
-                        send_stop=send_stop and is_last,
+                        send_start=part_send_start,
+                        send_stop=False,
                         separator=separator if is_last else "",
+                        leading_silence=pending_pause,
+                        write_pause=write_pause if is_last and not send_stop else False,
                         _allow_token_split=False,
+                        _allow_empty_segment=True,
                     )
                     if part is None:
                         return None
@@ -1506,6 +1987,29 @@ class TTSEventHandler(SafeAsyncEventHandler):
                     aggregate.engine_seconds += part.engine_seconds
                     aggregate.pcm_seconds += part.pcm_seconds
                     aggregate.cleanup_seconds += part.cleanup_seconds
+                    if not is_last and part.total_bytes:
+                        pending_pause = (
+                            self._boundary_silence_pcm(token_segment)
+                            if self.chunks_are_sentences
+                            else b""
+                        )
+                if not aggregate.total_bytes and not self.is_streaming and not _allow_empty_segment:
+                    # Every part was empty. The aggregate owns the terminal event
+                    # so one-shot synthesis fails instead of reporting success.
+                    with suppress(ProtocolWriteError):
+                        await self._write_audio_failure(
+                            "Speech synthesis failed",
+                            "inference-failed",
+                            audio_started=send_start,
+                        )
+                    return None
+                if send_stop and (not self.is_streaming or aggregate.total_bytes):
+                    try:
+                        await self.write_event(AudioStop().event())
+                    except ProtocolWriteError:
+                        return None
+                    if self.is_streaming:
+                        self.stream_audio_stopped = True
                 _LOGGER.debug(
                     "TTS step=token-segments segment_count=%d text_chars=%d total_bytes=%d",
                     len(token_segments),
@@ -1546,6 +2050,12 @@ class TTSEventHandler(SafeAsyncEventHandler):
         output_queue: asyncio.Queue[bytes | None] | None = None
         output_slots: asyncio.Semaphore | None = None
         abort_production: asyncio.Event | None = None
+        # The pause waits for the first PCM chunk so an accepted empty segment
+        # cannot emit padding or drop the boundary owed to the next segment.
+        pause_done = asyncio.Event()
+        pause_progress = asyncio.Event() if leading_silence else None
+        if not leading_silence:
+            pause_done.set()
         try:
             if self.writer.is_closing():
                 _LOGGER.debug(
@@ -1616,7 +2126,10 @@ class TTSEventHandler(SafeAsyncEventHandler):
                         output_queue,
                         output_slots,
                         abort_production,
+                        pause_done,
+                        pause_progress,
                         production,
+                        allow_empty_segment=_allow_empty_segment,
                     ),
                     loop=asyncio.get_running_loop(),
                     name="TTS inference producer",
@@ -1637,6 +2150,9 @@ class TTSEventHandler(SafeAsyncEventHandler):
                 audio_started = True
 
             if cached_audio is not None:
+                if cached_audio and leading_silence:
+                    output_seconds += await self._write_silence(leading_silence)
+                    pause_bytes += len(leading_silence)
                 for offset in range(0, len(cached_audio), TtsAudio.CHUNK_SIZE):
                     chunk = cached_audio[offset : offset + TtsAudio.CHUNK_SIZE]
                     if chunk:
@@ -1654,10 +2170,26 @@ class TTSEventHandler(SafeAsyncEventHandler):
                         if first_audio_at is None:
                             first_audio_at = perf_counter()
             elif output_queue is not None and output_slots is not None and producer is not None:
+                leading_pause_pending = bool(leading_silence)
+                first_chunk_after_pause = leading_pause_pending
                 while True:
                     chunk = await output_queue.get()
                     if chunk is None:
                         break
+                    slot_held = True
+                    if leading_pause_pending:
+                        # Release the first PCM slot before the pause.
+                        output_slots.release()
+                        slot_held = False
+                        try:
+                            output_seconds += await self._write_silence(
+                                leading_silence,
+                                progress=pause_progress,
+                            )
+                            pause_bytes += len(leading_silence)
+                        finally:
+                            pause_done.set()
+                        leading_pause_pending = False
                     try:
                         write_started = perf_counter()
                         await self.write_event(
@@ -1669,25 +2201,41 @@ class TTSEventHandler(SafeAsyncEventHandler):
                             ).event()
                         )
                         output_seconds += perf_counter() - write_started
+                        if first_chunk_after_pause:
+                            # Completed write is progress for the slot wait.
+                            first_chunk_after_pause = False
+                            if pause_progress is not None:
+                                pause_progress.set()
                     finally:
-                        output_slots.release()
+                        if slot_held:
+                            output_slots.release()
                     output_chunk_count += 1
                     if first_audio_at is None:
                         first_audio_at = perf_counter()
                 await producer
 
-            if not send_stop and self.chunks_are_sentences:
+            if (
+                write_pause
+                and production.total_bytes
+                and not send_stop
+                and self.chunks_are_sentences
+            ):
                 pause_pcm = self._boundary_silence_pcm(text, separator)
-                pause_bytes = len(pause_pcm)
+                pause_bytes += len(pause_pcm)
                 output_seconds += await self._write_silence(pause_pcm)
 
-            if send_stop:
+            if send_stop and (not self.is_streaming or production.total_bytes):
                 write_started = perf_counter()
                 await self.write_event(AudioStop().event())
                 output_seconds += perf_counter() - write_started
+                if self.is_streaming:
+                    self.stream_audio_stopped = True
 
             if cache_key is not None and cached_audio is None:
-                if production.cache_parts is None:
+                if not production.total_bytes:
+                    production.cache_parts = None
+                    cache_status = "miss-empty"
+                elif production.cache_parts is None:
                     cache_status = "miss-too-large"
                 else:
                     cached_result = b"".join(production.cache_parts)
@@ -1710,6 +2258,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
                     output_queue,
                     output_slots,
                     abort_production,
+                    cancel_native=production.cancel_native,
                 )
             _LOGGER.warning(
                 "TTS output failed: segment=%d api=%s detail=%s",
@@ -1730,6 +2279,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
                     output_queue,
                     output_slots,
                     abort_production,
+                    cancel_native=production.cancel_native,
                 )
             raise
         except SynthesisOutputLimitError:
@@ -1744,6 +2294,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
                     output_queue,
                     output_slots,
                     abort_production,
+                    cancel_native=production.cancel_native,
                 )
             _LOGGER.warning(
                 "TTS output exceeded the engine duration limit: segment=%d api=%s audio_bytes=%d",
@@ -1770,6 +2321,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
                     output_queue,
                     output_slots,
                     abort_production,
+                    cancel_native=production.cancel_native,
                 )
             _LOGGER.exception(
                 "TTS inference failed: segment=%d api=%s queue_ms=%.3f engine_ms=%.3f "
@@ -1847,7 +2399,11 @@ class TTSEventHandler(SafeAsyncEventHandler):
         output_queue: asyncio.Queue[bytes | None],
         output_slots: asyncio.Semaphore,
         abort: asyncio.Event,
+        pause_done: asyncio.Event,
+        pause_progress: asyncio.Event | None,
         production: _TTSProduction,
+        *,
+        allow_empty_segment: bool = False,
     ) -> None:
         """Run engine iteration under the inference lock and fill a bounded queue."""
         iterator: Iterator[np.ndarray] | None = None
@@ -1913,6 +2469,14 @@ class TTSEventHandler(SafeAsyncEventHandler):
                 iterator = await run_native(infer_normalized)
             finally:
                 production.engine_seconds += perf_counter() - engine_started
+            request_stop = getattr(iterator, "request_stop", None)
+            if callable(request_stop):
+
+                def cancel_native() -> None:
+                    """Stop the active stream without blocking the event loop."""
+                    request_stop()
+
+                production.cancel_native = cancel_native
 
             while not abort.is_set():
                 worker_step_started = perf_counter()
@@ -1930,6 +2494,9 @@ class TTSEventHandler(SafeAsyncEventHandler):
                 if not has_chunk:
                     break
                 if audio_bytes is None:
+                    continue
+                if not audio_bytes:
+                    # An empty array is not speech and must not attract sentence silence.
                     continue
                 if (
                     self.chunks_are_sentences
@@ -1953,22 +2520,25 @@ class TTSEventHandler(SafeAsyncEventHandler):
                     chunk = audio_bytes[offset : offset + TtsAudio.CHUNK_SIZE]
                     if not chunk:
                         continue
-                    try:
-                        await asyncio.wait_for(
-                            output_slots.acquire(),
-                            timeout=self.write_timeout,
-                        )
-                    except TimeoutError as err:
-                        raise _OutputBackpressureError(
-                            "TTS output queue remained full past the write timeout"
-                        ) from err
+                    if not await _acquire_output_slot(
+                        output_slots,
+                        abort,
+                        pause_done,
+                        self.write_timeout,
+                        pause_progress,
+                    ):
+                        break
                     if abort.is_set():
                         output_slots.release()
                         break
                     output_queue.put_nowait(chunk)
 
             if not abort.is_set() and not production.total_bytes:
-                raise RuntimeError("TTS engine returned no audio")
+                empty_segment = bool(getattr(iterator, "empty_text", False)) or not (
+                    _has_speakable_text(text)
+                )
+                if not (empty_segment and (self.is_streaming or allow_empty_segment)):
+                    raise RuntimeError("TTS engine returned no audio")
         finally:
             cleanup_started = perf_counter()
             try:
@@ -1981,6 +2551,7 @@ class TTSEventHandler(SafeAsyncEventHandler):
                 # The executor future can outlive task cancellation. Awaiting it above
                 # keeps the shared lock held until no native call can still be running.
                 production.cleanup_seconds = perf_counter() - cleanup_started
+                production.cancel_native = None
                 self.inference_lock.release()
                 output_queue.put_nowait(None)
         if cancelled:
@@ -2006,9 +2577,14 @@ class TTSEventHandler(SafeAsyncEventHandler):
         output_queue: asyncio.Queue[bytes | None],
         output_slots: asyncio.Semaphore,
         abort: asyncio.Event,
+        *,
+        cancel_native: Callable[[], None] | None = None,
     ) -> None:
-        """Stop queueing, preserve native-call cleanup, and consume task failures."""
+        """Stop queueing, signal native work, preserve cleanup, and consume failures."""
         abort.set()
+        if cancel_native is not None:
+            with suppress(Exception):
+                cancel_native()
         self._drain_audio_queue(output_queue, output_slots)
         try:
             async with asyncio.timeout(Timeout.ABORT):
@@ -2092,12 +2668,14 @@ class TTSEventHandler(SafeAsyncEventHandler):
         self.stream_normalized_chars = 0
         self.stream_empty_events = 0
         self.stream_audio_bytes = 0
+        self.stream_audio_stopped = False
         self.stream_queue_seconds = 0.0
         self.stream_engine_seconds = 0.0
         self.stream_pcm_seconds = 0.0
         self.stream_output_seconds = 0.0
         self.stream_synthesis_seconds = 0.0
         self.stream_voice_name = None
+        self._pending_pause = _EMPTY_PENDING_PAUSE
         self.sentence_boundary = StreamClauseDetector(
             split_clauses=getattr(self, "chunks_are_sentences", True)
         )
@@ -2541,7 +3119,7 @@ def _phonemize_nghitts(text: str, language: str) -> list[list[int]]:
     if phoneme_codepoints := [row for row in phoneme_codepoints if row]:
         return phoneme_codepoints
 
-    raise RuntimeError("NghiTTS phonemizer returned no phonemes")
+    raise _NoPhonemesError("NghiTTS phonemizer returned no phonemes")
 
 
 def _nghitts_generation_config(
