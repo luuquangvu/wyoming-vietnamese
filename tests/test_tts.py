@@ -53,11 +53,14 @@ from wyoming_vietnamese.tts import (
     StreamClauseDetector,
     TTSEngine,
     TTSEventHandler,
+    _acquire_output_slot,
     _audio_to_pcm_bytes,
     _boundary_kind,
     _next_pcm_chunk,
     _NghiAudioIterator,
     _nghitts_generation_config,
+    _NoPhonemesError,
+    _OutputBackpressureError,
     _phonemize_nghitts,
     _SherpaGenerationConfig,
     _silence_pcm,
@@ -77,6 +80,8 @@ from wyoming_vietnamese.tts_model import (
     ZEROTTS_VOICES,
     get_voice,
 )
+
+_PROTOCOL_CHUNK_SAMPLES = TtsAudio.CHUNK_SIZE // TtsAudio.SAMPLE_WIDTH
 
 
 class FakeTTS:
@@ -118,6 +123,140 @@ class FakeTTS:
         self.closed = True
 
 
+class EmptyTextIterator(Iterator[np.ndarray]):
+    """Report a segment that contains no text the engine can pronounce."""
+
+    empty_text = True
+
+    def __iter__(self) -> EmptyTextIterator:
+        """Return this empty iterator."""
+        return self
+
+    def __next__(self) -> np.ndarray:
+        """Finish immediately."""
+        raise StopIteration
+
+
+class EmptyPunctuationTTS(FakeTTS):
+    """Fake engine that yields audio unless text is explicitly or structurally empty."""
+
+    def __init__(
+        self,
+        chunks: list[np.ndarray] | None = None,
+        *,
+        empty_texts: set[str] | None = None,
+    ) -> None:
+        """Initialize the explicitly empty segment set."""
+        super().__init__(chunks)
+        self.empty_texts = empty_texts or set()
+
+    def normalize(self, text: str, *, voice: str | None = None) -> str:
+        """Return text unchanged for the normalized-engine protocol."""
+        del voice
+        return text
+
+    def infer_stream_normalized(
+        self, text: str, *, voice: str | None = None
+    ) -> Iterator[np.ndarray]:
+        """Record the segment and report explicit or punctuation-only text as empty."""
+        self.calls.append((text, voice))
+        if text in self.empty_texts or not any(char.isalnum() for char in text):
+            return EmptyTextIterator()
+        return iter(self.chunks)
+
+
+class PunctuationNormalizingTTS(EmptyPunctuationTTS):
+    """Fake engine whose normalizer turns clause punctuation into sentence punctuation."""
+
+    def normalize(self, text: str, *, voice: str | None = None) -> str:
+        """Rewrite commas so normalized text disagrees with the original boundary."""
+        del voice
+        return text.replace(",", ".")
+
+
+class SilentPunctuationTTS(FakeTTS):
+    """Fake engine that reports no marker but yields no audio for punctuation-only text."""
+
+    def infer_stream(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+        **kwargs: object,
+    ) -> Iterator[np.ndarray]:
+        """Yield speech only when the segment contains a letter or digit."""
+        self.calls.append((text, voice))
+        self.options.append(kwargs)
+        if any(char.isalnum() for char in text):
+            yield from self.chunks
+
+
+class EmptyArrayTTS(FakeTTS):
+    """Fake engine that yields only zero-length arrays for punctuation-only text."""
+
+    def infer_stream(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+        **kwargs: object,
+    ) -> Iterator[np.ndarray]:
+        """Yield no speech for punctuation and the configured chunks otherwise."""
+        self.calls.append((text, voice))
+        self.options.append(kwargs)
+        if any(char.isalnum() for char in text):
+            yield from self.chunks
+            return
+        yield np.array([], dtype=np.float32)
+        yield np.array([], dtype=np.float32)
+
+
+class EmptyLeadingArrayTTS(FakeTTS):
+    """Fake engine that emits zero-length arrays before every speech chunk."""
+
+    def infer_stream(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+        **kwargs: object,
+    ) -> Iterator[np.ndarray]:
+        """Ignore empty arrays when speech follows in the same segment."""
+        self.calls.append((text, voice))
+        self.options.append(kwargs)
+        yield np.array([], dtype=np.float32)
+        yield np.array([], dtype=np.float32)
+        yield from self.chunks
+
+
+class SlotPressureTTS(FakeTTS):
+    """Yield a small first segment and a second segment that fills the output queue."""
+
+    def __init__(self, overflow_chunks: int = 1) -> None:
+        """Initialize the segment counter and queue overflow size."""
+        super().__init__()
+        self._segment_count = 0
+        self._overflow_chunks = overflow_chunks
+
+    def infer_stream(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+        **kwargs: object,
+    ) -> Iterator[np.ndarray]:
+        """Yield one tiny chunk and then chunks beyond the queue capacity."""
+        self.calls.append((text, voice))
+        self.options.append(kwargs)
+        self._segment_count += 1
+        if self._segment_count == 1:
+            yield np.array([0.5], dtype=np.float32)
+            return
+        chunk = np.full(_PROTOCOL_CHUNK_SAMPLES, 0.5, dtype=np.float32)
+        for _ in range(TtsAudio.OUTPUT_QUEUE_CHUNKS + self._overflow_chunks):
+            yield chunk
+
+
 class BlockingTTS(FakeTTS):
     """Fake engine that blocks its first native chunk until the test releases it."""
 
@@ -144,6 +283,80 @@ class BlockingTTS(FakeTTS):
         self.started.set()
         self.release.wait()
         yield np.zeros(1, dtype=np.float32)
+
+
+class StopAwareBlockingTTS(FakeTTS):
+    """Fake engine whose native iterator stops when the handler signals abort."""
+
+    class _Iterator(Iterator[np.ndarray]):
+        """Block the first native step until a stop request releases it."""
+
+        def __init__(self) -> None:
+            """Initialize the start and stop gates."""
+            self.started = threading.Event()
+            self.stopped = threading.Event()
+            self.stop_calls = 0
+
+        def __iter__(self) -> StopAwareBlockingTTS._Iterator:
+            """Return this iterator."""
+            return self
+
+        def request_stop(self) -> None:
+            """Record a nonblocking stop request and release the blocked step."""
+            self.stop_calls += 1
+            self.stopped.set()
+
+        def __next__(self) -> np.ndarray:
+            """Block until the test or the abort handler stops iteration."""
+            self.started.set()
+            self.stopped.wait(timeout=2.0)
+            raise StopIteration
+
+    def __init__(self) -> None:
+        """Initialize the shared stop-aware iterator."""
+        super().__init__([np.zeros(1, dtype=np.float32)])
+        self.iterator = StopAwareBlockingTTS._Iterator()
+
+    def infer_stream(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+        **kwargs: object,
+    ) -> Iterator[np.ndarray]:
+        """Return the iterator whose first native step blocks."""
+        self.calls.append((text, voice))
+        self.options.append(kwargs)
+        return self.iterator
+
+
+class BlockingSecondSegmentTTS(FakeTTS):
+    """Fake engine that blocks the second segment before yielding its audio."""
+
+    def __init__(self) -> None:
+        """Initialize the second-segment gate."""
+        super().__init__([np.array([0.5], dtype=np.float32)])
+        self.second_started = threading.Event()
+        self.release_second = threading.Event()
+        self._segment_count = 0
+
+    def infer_stream(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+        **kwargs: object,
+    ) -> Iterator[np.ndarray]:
+        """Yield the first segment and block inside the second segment."""
+        self.calls.append((text, voice))
+        self.options.append(kwargs)
+        self._segment_count += 1
+        if self._segment_count == 1:
+            yield from self.chunks
+            return
+        self.second_started.set()
+        self.release_second.wait()
+        yield from self.chunks
 
 
 class TokenLimitedFakeTTS(FakeTTS):
@@ -186,6 +399,44 @@ class TokenLimitedFakeTTS(FakeTTS):
         """Return text unchanged."""
         del voice
         return text
+
+
+class SilentFirstTokenPartTTS(TokenLimitedFakeTTS):
+    """Token-limited fake whose first token part contains no speech."""
+
+    def split_text_by_tokens(
+        self,
+        text: str,
+        max_tokens: int | None = None,
+    ) -> tuple[str, ...]:
+        """Split into a silent leading part and the remaining text."""
+        del max_tokens
+        return ("...", text)
+
+    def infer_stream_normalized(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+    ) -> Iterator[np.ndarray]:
+        """Report punctuation-only parts as having no pronounceable text."""
+        self.calls.append((text, voice))
+        if any(char.isalnum() for char in text):
+            return iter(self.chunks)
+        return EmptyTextIterator()
+
+
+class SilentLastTokenPartTTS(SilentFirstTokenPartTTS):
+    """Token-limited fake whose last token part contains no speech."""
+
+    def split_text_by_tokens(
+        self,
+        text: str,
+        max_tokens: int | None = None,
+    ) -> tuple[str, ...]:
+        """Split into the speakable text and a silent trailing part."""
+        del max_tokens
+        return (text, "...")
 
 
 class OutputLimitFakeTTS(FakeTTS):
@@ -418,6 +669,28 @@ class GatedWriter(MemoryWriter):
         await self.gate.wait()
 
 
+class PauseGateWriter(MemoryWriter):
+    """Provide a writer that can hold the next drain until released."""
+
+    def __init__(self) -> None:
+        """Initialize the writer with an open gate."""
+        super().__init__()
+        self.blocked = asyncio.Event()
+        self.gate = asyncio.Event()
+        self._block_next = False
+
+    def block_next_drain(self) -> None:
+        """Hold the next drain until the test releases the gate."""
+        self._block_next = True
+
+    async def drain(self) -> None:
+        """Block once when requested to simulate a slow leading-pause write."""
+        if self._block_next:
+            self._block_next = False
+            self.blocked.set()
+            await self.gate.wait()
+
+
 def test_audio_to_pcm_clips_and_sanitizes() -> None:
     """Test audio to pcm clips and sanitizes."""
     pcm = np.frombuffer(
@@ -613,6 +886,288 @@ async def test_tts_streams_text_by_sentence_and_ignores_compatibility_request() 
     ]
 
 
+async def test_tts_stream_completes_when_segment_has_no_speakable_text() -> None:
+    """Test an explicitly empty segment keeps the pause for the next readable segment."""
+    engine = EmptyPunctuationTTS(
+        [np.array([0.5], dtype=np.float32)],
+        empty_texts={"Không đọc."},
+    )
+    handler, writer = make_handler(engine, paragraph_silence_ms=100)
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Câu cuối.\nKhông đọc.").event()) is True
+    assert engine.calls == [("Câu cuối.", None), ("Không đọc.", None)]
+    assert await handler.handle_event(SynthesizeChunk(text=" Tiếp theo.").event()) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+
+    assert engine.calls == [("Câu cuối.", None), ("Không đọc.", None), ("Tiếp theo.", None)]
+    event_types = [event.type for event in written_events(writer)]
+    assert "error" not in event_types
+    assert event_types[-2:] == ["audio-stop", "synthesize-stopped"]
+    speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+    paragraph_silence = bytes(round(engine.sample_rate * 0.100) * TtsAudio.SAMPLE_WIDTH)
+    assert written_audio(writer) == speech + paragraph_silence + speech
+
+
+async def test_tts_defers_pause_for_an_accepted_empty_segment_until_audio() -> None:
+    """Test a silent accepted segment keeps its stronger pause for the next speech."""
+    engine = EmptyPunctuationTTS(
+        [np.array([0.5], dtype=np.float32)],
+        empty_texts={"Không đọc."},
+    )
+    handler, writer = make_handler(
+        engine,
+        sentence_silence_ms=100,
+        paragraph_silence_ms=200,
+    )
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Câu một. Không đọc.\n").event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text=" Tiếp theo.").event()) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+
+    speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+    paragraph_pause = _silence_pcm(200, engine.sample_rate)
+    assert engine.calls == [
+        ("Câu một.", None),
+        ("Không đọc.", None),
+        ("Tiếp theo.", None),
+    ]
+    assert "error" not in [event.type for event in written_events(writer)]
+    assert written_audio(writer) == speech + paragraph_pause + speech
+
+
+async def test_tts_does_not_leave_padding_after_a_silent_final_segment() -> None:
+    """Test a silent accepted final segment does not write the pending pause."""
+    engine = EmptyPunctuationTTS(
+        [np.array([0.5], dtype=np.float32)],
+        empty_texts={"Không đọc."},
+    )
+    handler, writer = make_handler(
+        engine,
+        sentence_silence_ms=100,
+        paragraph_silence_ms=200,
+    )
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Câu một. Không đọc.").event()) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+
+    speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+    assert "error" not in [event.type for event in written_events(writer)]
+    assert written_audio(writer) == speech
+
+
+async def test_tts_stream_continues_after_unmarked_punctuation_segment() -> None:
+    """Test a punctuation-only segment without an empty marker does not abort the stream."""
+    engine = SilentPunctuationTTS([np.array([0.5], dtype=np.float32)])
+    handler, writer = make_handler(engine, paragraph_silence_ms=100)
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Câu cuối.\n...").event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text=" Tiếp theo.").event()) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+
+    assert engine.calls == [("Câu cuối.", None), ("...", None), ("Tiếp theo.", None)]
+    event_types = [event.type for event in written_events(writer)]
+    assert "error" not in event_types
+    speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+    paragraph_silence = _silence_pcm(100, engine.sample_rate)
+    assert written_audio(writer) == speech + paragraph_silence + speech
+
+
+async def test_tts_upgrades_an_empty_segment_boundary_to_paragraph() -> None:
+    """Test an empty punctuation segment can strengthen the pending pause."""
+    engine = EmptyPunctuationTTS([np.array([0.5], dtype=np.float32)])
+    handler, writer = make_handler(
+        engine,
+        paragraph_silence_ms=100,
+        sentence_silence_ms=50,
+    )
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Câu một.").event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="...\n").event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Câu hai.").event()) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+
+    speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+    paragraph_silence = bytes(round(engine.sample_rate * 0.100) * TtsAudio.SAMPLE_WIDTH)
+    assert "error" not in [event.type for event in written_events(writer)]
+    assert written_audio(writer) == speech + paragraph_silence + speech
+
+
+async def test_tts_does_not_pad_before_first_speech_after_an_empty_segment() -> None:
+    """Test a leading empty paragraph segment cannot create a pause out of nothing."""
+    engine = EmptyPunctuationTTS([np.array([0.5], dtype=np.float32)])
+    handler, writer = make_handler(engine, paragraph_silence_ms=100)
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="...\n").event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Câu hai.").event()) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+
+    speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+    assert "error" not in [event.type for event in written_events(writer)]
+    assert written_audio(writer) == speech
+
+
+async def test_tts_upgrades_an_empty_segment_boundary_to_sentence() -> None:
+    """Test an empty punctuation segment can strengthen a clause pause to a sentence."""
+    engine = EmptyPunctuationTTS([np.array([0.5], dtype=np.float32)])
+    handler, writer = make_handler(
+        engine,
+        sentence_silence_ms=100,
+        clause_silence_ms=50,
+    )
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Câu thứ nhất rất dài,").event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="...").event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Câu hai.").event()) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+
+    speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+    sentence_silence = bytes(round(engine.sample_rate * 0.100) * TtsAudio.SAMPLE_WIDTH)
+    assert "error" not in [event.type for event in written_events(writer)]
+    assert written_audio(writer) == speech + sentence_silence + speech
+
+
+async def test_tts_stream_skips_a_segment_of_empty_arrays() -> None:
+    """Test empty arrays are ignored when speech follows in the same segment."""
+    engine = EmptyLeadingArrayTTS([np.array([0.5], dtype=np.float32)])
+    handler, writer = make_handler(engine, sentence_silence_ms=100)
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Câu một.").event()) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+
+    assert "error" not in [event.type for event in written_events(writer)]
+    assert written_audio(writer) == _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+
+
+async def test_tts_rejects_stream_with_only_empty_arrays() -> None:
+    """Test empty waveforms without an explicit empty-text signal fail inference."""
+    engine = EmptyArrayTTS([np.array([0.5], dtype=np.float32)])
+    handler, writer = make_handler(engine)
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="...").event()) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is False
+    events = written_events(writer)
+    assert any(
+        event.type == "error" and event.data["code"] == "inference-failed" for event in events
+    )
+
+
+async def test_tts_rejects_speakable_stream_with_only_empty_arrays() -> None:
+    """Test a speakable segment made only of empty arrays fails on its chunk."""
+    engine = EmptyArrayTTS([np.array([], dtype=np.float32), np.array([], dtype=np.float32)])
+    handler, writer = make_handler(engine)
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Xin chào.").event()) is False
+    events = written_events(writer)
+    assert any(
+        event.type == "error" and event.data["code"] == "inference-failed" for event in events
+    )
+
+
+async def test_tts_rejects_stream_with_only_silent_speech() -> None:
+    """Test a speakable segment that produces no audio still fails inference."""
+    engine = FakeTTS(chunks=[])
+    handler, writer = make_handler(engine)
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Xin chào.").event()) is False
+    events = written_events(writer)
+    assert any(
+        event.type == "error" and event.data["code"] == "inference-failed" for event in events
+    )
+
+
+async def test_tts_rejects_stream_with_only_unpronounceable_text() -> None:
+    """Test a stream that never produces audio fails instead of completing silently."""
+    engine = EmptyPunctuationTTS([np.array([0.5], dtype=np.float32)])
+    handler, writer = make_handler(engine)
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="...").event()) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is False
+    assert [event.type for event in written_events(writer)] == [
+        "audio-start",
+        "error",
+        "audio-stop",
+        "synthesize-stopped",
+    ]
+
+
+async def test_tts_rejects_stream_with_only_unpronounceable_final_text() -> None:
+    """Test an unpronounceable final tail fails without a duplicate audio-stop."""
+    engine = EmptyPunctuationTTS([np.array([0.5], dtype=np.float32)])
+    handler, writer = make_handler(engine)
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text=",").event()) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is False
+    assert [event.type for event in written_events(writer)] == [
+        "audio-start",
+        "error",
+        "audio-stop",
+        "synthesize-stopped",
+    ]
+
+
+async def test_tts_replays_pending_pause_before_cached_segment() -> None:
+    """Test a cached segment still receives the pause held across an empty segment."""
+    cache = BoundedLruCache[bytes, bytes](
+        max_entries=10,
+        max_bytes=1024 * 1024,
+        max_item_bytes=1024 * 1024,
+        max_idle_seconds=60,
+    )
+    engine = EmptyPunctuationTTS([np.array([0.5], dtype=np.float32)])
+    first_handler, first_writer = make_handler(
+        engine,
+        cache=cache,
+        paragraph_silence_ms=100,
+    )
+    assert await first_handler.handle_event(SynthesizeStart().event()) is True
+    assert await first_handler.handle_event(SynthesizeChunk(text="Câu cuối.\n...").event()) is True
+    assert await first_handler.handle_event(SynthesizeChunk(text=" Tiếp theo.").event()) is True
+    assert await first_handler.handle_event(SynthesizeStop().event()) is True
+
+    expected = written_audio(first_writer)
+    assert engine.calls == [("Câu cuối.", None), ("...", None), ("Tiếp theo.", None)]
+
+    second_handler, second_writer = make_handler(
+        engine,
+        cache=cache,
+        paragraph_silence_ms=100,
+    )
+    assert await second_handler.handle_event(SynthesizeStart().event()) is True
+    assert await second_handler.handle_event(SynthesizeChunk(text="Câu cuối.\n...").event()) is True
+    assert await second_handler.handle_event(SynthesizeChunk(text=" Tiếp theo.").event()) is True
+    assert await second_handler.handle_event(SynthesizeStop().event()) is True
+
+    assert engine.calls == [
+        ("Câu cuối.", None),
+        ("...", None),
+        ("Tiếp theo.", None),
+        ("...", None),
+    ]
+    assert written_audio(second_writer) == expected
+
+
+async def test_tts_defers_pending_pause_until_the_next_audio_chunk() -> None:
+    """Test a pending pause waits for speech so a silent segment cannot emit padding."""
+    engine = BlockingSecondSegmentTTS()
+    handler, writer = make_handler(engine, sentence_silence_ms=100)
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Câu một.").event()) is True
+
+    request = asyncio.create_task(handler.handle_event(SynthesizeChunk(text=" Câu hai.").event()))
+    try:
+        assert await asyncio.to_thread(engine.second_started.wait, 1)
+        speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+        pause = _silence_pcm(100, engine.sample_rate)
+        # The second inference is blocked before producing PCM, so the pause
+        # owed to it has not been written yet.
+        assert written_audio(writer) == speech
+    finally:
+        engine.release_second.set()
+    assert await asyncio.wait_for(request, timeout=1) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+    assert written_audio(writer) == speech + pause + speech
+
+
 def written_audio(writer: asyncio.StreamWriter) -> bytes:
     """Concatenate the PCM payload of every written audio chunk."""
     return b"".join(
@@ -628,6 +1183,8 @@ def test_boundary_kind_classifies_trailing_punctuation() -> None:
     assert _boundary_kind("Thật sao?!  ") == "sentence"
     assert _boundary_kind('Anh ấy nói "vâng."') == "sentence"
     assert _boundary_kind("Ngày mai,") == "clause"
+    assert _boundary_kind("Ngày mai, ] )") == "clause"
+    assert _boundary_kind("Xin chào. ] )") == "sentence"
     assert _boundary_kind("Sài Gòn \u2013") == "clause"
     assert _boundary_kind("Sài Gòn \u2014") == "clause"
     assert _boundary_kind("Tuyến đường Sài Gòn\u2013") == "clause"
@@ -777,6 +1334,64 @@ async def test_tts_pads_paragraph_silence_when_newline_arrives_in_later_chunk() 
     assert written_audio(writer) == speech + paragraph_silence + speech
 
 
+async def test_tts_pads_paragraph_silence_when_leading_newline_arrives_in_later_chunk() -> None:
+    """Test a paragraph break at the start of a chunk upgrades the pending pause."""
+    engine = FakeTTS([np.array([0.5], dtype=np.float32)])
+    handler, writer = make_handler(
+        engine,
+        paragraph_silence_ms=100,
+        sentence_silence_ms=50,
+        clause_silence_ms=20,
+    )
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Câu một.").event()) is True
+
+    assert await handler.handle_event(SynthesizeChunk(text="\nCâu hai.").event()) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+
+    speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+    paragraph_silence = bytes(round(engine.sample_rate * 0.100) * TtsAudio.SAMPLE_WIDTH)
+    assert written_audio(writer) == speech + paragraph_silence + speech
+
+
+async def test_tts_upgrades_a_zero_length_sentence_pause_to_paragraph() -> None:
+    """Test a tracked sentence boundary upgrades even when its pause has no bytes."""
+    engine = FakeTTS([np.array([0.5], dtype=np.float32)])
+    handler, writer = make_handler(
+        engine,
+        paragraph_silence_ms=100,
+        sentence_silence_ms=0,
+    )
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Câu một.").event()) is True
+
+    assert await handler.handle_event(SynthesizeChunk(text="\nCâu hai.").event()) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+
+    speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+    paragraph_silence = bytes(round(engine.sample_rate * 0.100) * TtsAudio.SAMPLE_WIDTH)
+    assert written_audio(writer) == speech + paragraph_silence + speech
+
+
+async def test_tts_upgrades_to_paragraph_when_nbsp_precedes_a_line_break() -> None:
+    """Test non-breaking whitespace before a line break still upgrades the pause."""
+    engine = FakeTTS([np.array([0.5], dtype=np.float32)])
+    handler, writer = make_handler(
+        engine,
+        paragraph_silence_ms=100,
+        sentence_silence_ms=50,
+    )
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Câu một.").event()) is True
+
+    assert await handler.handle_event(SynthesizeChunk(text="\u00a0\nCâu hai.").event()) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+
+    speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+    paragraph_silence = bytes(round(engine.sample_rate * 0.100) * TtsAudio.SAMPLE_WIDTH)
+    assert written_audio(writer) == speech + paragraph_silence + speech
+
+
 async def test_tts_pads_paragraph_silence_when_crlf_split_across_chunks() -> None:
     """Test paragraph silence is padded when CRLF is split across chunk boundaries."""
     engine = FakeTTS([np.array([0.5], dtype=np.float32)])
@@ -823,6 +1438,31 @@ async def test_tts_pads_paragraph_silence_when_repeated_newlines_span_chunks() -
     speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
     paragraph_silence = bytes(round(engine.sample_rate * 0.100) * TtsAudio.SAMPLE_WIDTH)
     assert written_audio(writer) == speech + paragraph_silence + speech
+
+
+@pytest.mark.parametrize(
+    "chunks",
+    [("Câu một.\rCâu hai.",), ("Câu một.\r", "Câu hai.")],
+)
+async def test_tts_classifies_lone_carriage_return_as_a_sentence_pause(
+    chunks: tuple[str, ...],
+) -> None:
+    """Test a lone CR keeps its sentence classification across chunk boundaries."""
+    engine = FakeTTS([np.array([0.5], dtype=np.float32)])
+    handler, writer = make_handler(
+        engine,
+        paragraph_silence_ms=100,
+        sentence_silence_ms=50,
+        clause_silence_ms=20,
+    )
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    for chunk in chunks:
+        assert await handler.handle_event(SynthesizeChunk(text=chunk).event()) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+
+    speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+    sentence_silence = bytes(round(engine.sample_rate * 0.050) * TtsAudio.SAMPLE_WIDTH)
+    assert written_audio(writer) == speech + sentence_silence + speech
 
 
 async def test_tts_pads_sentence_pause_between_streamed_segments() -> None:
@@ -946,6 +1586,34 @@ async def test_tts_logs_aggregate_timings_without_chunk_noise(
         and "real_time_factor=" in message
         for message in messages
     )
+
+
+async def test_tts_logs_all_written_pause_bytes(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test the completion log counts a leading pause that was actually written."""
+    engine = FakeTTS([np.array([0.5], dtype=np.float32)])
+    handler, writer = make_handler(engine, sentence_silence_ms=100)
+    with caplog.at_level(logging.DEBUG, logger="wyoming_vietnamese.tts"):
+        await handler.handle_event(SynthesizeStart().event())
+        await handler.handle_event(SynthesizeChunk(text="Câu một.").event())
+        await handler.handle_event(SynthesizeChunk(text="Câu hai.").event())
+        await handler.handle_event(SynthesizeStop().event())
+
+    pause = _silence_pcm(100, engine.sample_rate)
+    pause_values = []
+    for record in caplog.records:
+        message = record.getMessage()
+        if "TTS step=segment-complete" not in message:
+            continue
+        pause_values.extend(
+            int(field.partition("=")[2])
+            for field in message.split()
+            if field.startswith("pause_bytes=")
+        )
+    assert pause_values == [0, len(pause)]
+    speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+    assert written_audio(writer) == speech + pause + speech
 
 
 @pytest.mark.parametrize(
@@ -1078,6 +1746,30 @@ async def test_tts_contains_empty_or_failed_inference(engine: FakeTTS) -> None:
     ]
 
 
+async def test_tts_rejects_output_made_only_of_empty_arrays() -> None:
+    """Test empty arrays cannot turn generated sentence silence into speech."""
+    engine = FakeTTS([np.array([], dtype=np.float32), np.array([], dtype=np.float32)])
+    handler, writer = make_handler(engine, sentence_silence_ms=100)
+    assert await handler.handle_event(Synthesize(text="...").event()) is False
+    assert [event.type for event in written_events(writer)] == [
+        "audio-start",
+        "error",
+        "audio-stop",
+    ]
+
+
+async def test_tts_rejects_one_shot_with_no_pronounceable_text() -> None:
+    """Test a one-shot request with no phonemes fails instead of reporting silence."""
+    engine = EmptyPunctuationTTS([np.array([0.5], dtype=np.float32)])
+    handler, writer = make_handler(engine)
+    assert await handler.handle_event(Synthesize(text="...").event()) is False
+    assert [event.type for event in written_events(writer)] == [
+        "audio-start",
+        "error",
+        "audio-stop",
+    ]
+
+
 async def test_tts_reports_busy_queue() -> None:
     """Test tts reports busy queue."""
     lock = asyncio.Lock()
@@ -1177,6 +1869,418 @@ async def test_tts_stalled_client_releases_the_lock_for_a_long_segment() -> None
     await stalled_request
 
 
+async def test_tts_leading_pause_releases_the_first_pcm_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test a slow leading pause does not starve a producer that has filled the queue."""
+    engine = SlotPressureTTS()
+    writer = PauseGateWriter()
+    handler, stream = make_handler(
+        engine,
+        writer=writer,
+        write_timeout=2,
+        paragraph_silence_ms=300,
+    )
+    producer_tasks: list[asyncio.Task[Any]] = []
+    original_produce = TTSEventHandler._produce_audio
+
+    async def record_producer(handler_self: TTSEventHandler, *args: Any, **kwargs: Any) -> None:
+        """Record the producer task before it can finish."""
+        task = asyncio.current_task()
+        if task is not None:
+            producer_tasks.append(task)
+        await original_produce(handler_self, *args, **kwargs)
+
+    monkeypatch.setattr(TTSEventHandler, "_produce_audio", record_producer)
+
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Câu một.\n").event()) is True
+
+    producer_tasks.clear()
+    writer.block_next_drain()
+    # Punctuation-only text keeps the leading pause on the fallback consumer
+    # path, where the first PCM slot must be released before the pause write.
+    request = asyncio.create_task(handler.handle_event(SynthesizeChunk(text="...\n").event()))
+    failed = True
+    try:
+        await asyncio.wait_for(writer.blocked.wait(), timeout=1)
+        assert len(producer_tasks) == 1
+        producer = producer_tasks[0]
+        await asyncio.wait_for(asyncio.shield(producer), timeout=1)
+        assert producer.done()
+        failed = False
+    finally:
+        writer.gate.set()
+        if failed:
+            request.cancel()
+            with suppress(Exception, asyncio.CancelledError):
+                await request
+
+    assert await request is True
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+
+    pause = _silence_pcm(300, engine.sample_rate)
+    large_chunk = _audio_to_pcm_bytes(np.full(_PROTOCOL_CHUNK_SAMPLES, 0.5, dtype=np.float32))
+    expected = (
+        _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+        + pause
+        + large_chunk * (TtsAudio.OUTPUT_QUEUE_CHUNKS + 1)
+    )
+    assert "error" not in [event.type for event in written_events(stream)]
+    assert written_audio(stream) == expected
+
+
+async def test_tts_blocked_leading_pause_releases_the_inference_lock() -> None:
+    """Test a pause-blocked producer frees the lock and still completes after the client resumes."""
+    lock = asyncio.Lock()
+    engine = SlotPressureTTS(overflow_chunks=0)
+    writer = PauseGateWriter()
+    first, stream = make_handler(
+        engine,
+        lock=lock,
+        writer=writer,
+        write_timeout=1,
+        queue_timeout=0.05,
+        paragraph_silence_ms=300,
+    )
+    assert await first.handle_event(SynthesizeStart().event()) is True
+    assert await first.handle_event(SynthesizeChunk(text="Câu một.\n").event()) is True
+
+    writer.block_next_drain()
+    # Punctuation-only text reaches the engine as PCM but is not known to be
+    # speakable, so the producer starts before the blocked pause write.
+    request = asyncio.create_task(first.handle_event(SynthesizeChunk(text="...\n").event()))
+    try:
+        await asyncio.wait_for(writer.blocked.wait(), timeout=1)
+        for _ in range(500):
+            if len(engine.calls) == 2:
+                break
+            await asyncio.sleep(0.001)
+        assert engine.calls == [("Câu một.", None), ("...", None)]
+        for _ in range(500):
+            if not lock.locked():
+                break
+            await asyncio.sleep(0.001)
+        assert lock.locked() is False
+        assert not request.done()
+
+        second_engine = FakeTTS([np.array([0.5], dtype=np.float32)])
+        second, second_writer = make_handler(second_engine, lock=lock, queue_timeout=0.05)
+        await asyncio.wait_for(
+            second.handle_event(Synthesize(text="Second").event()),
+            timeout=1,
+        )
+        assert [event.type for event in written_events(second_writer)] == [
+            "audio-start",
+            "audio-chunk",
+            "audio-stop",
+        ]
+    except BaseException:
+        writer.gate.set()
+        with suppress(Exception, asyncio.CancelledError):
+            await asyncio.wait_for(request, timeout=5)
+        raise
+
+    writer.gate.set()
+    assert await asyncio.wait_for(request, timeout=5) is True
+    assert await first.handle_event(SynthesizeStop().event()) is True
+
+    pause = _silence_pcm(300, engine.sample_rate)
+    large_chunk = _audio_to_pcm_bytes(np.full(_PROTOCOL_CHUNK_SAMPLES, 0.5, dtype=np.float32))
+    expected = (
+        _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+        + pause
+        + large_chunk * TtsAudio.OUTPUT_QUEUE_CHUNKS
+    )
+    assert "error" not in [event.type for event in written_events(stream)]
+    assert written_audio(stream) == expected
+
+
+async def test_tts_backpressure_timeout_releases_the_inference_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test a stalled leading pause times out backpressure and frees the lock."""
+    import wyoming_vietnamese.tts as tts_module
+
+    real_slot = tts_module._acquire_output_slot
+
+    async def short_slot(
+        output_slots: asyncio.Semaphore,
+        abort: asyncio.Event,
+        pause_done: asyncio.Event,
+        timeout: float,
+        pause_progress: asyncio.Event | None = None,
+    ) -> bool:
+        """Use a short slot timeout while the pause write keeps its longer budget."""
+        del timeout
+        return await real_slot(output_slots, abort, pause_done, 0.02, pause_progress)
+
+    monkeypatch.setattr(tts_module, "_acquire_output_slot", short_slot)
+    lock = asyncio.Lock()
+    engine = SlotPressureTTS(overflow_chunks=2)
+    writer = PauseGateWriter()
+    first, stream = make_handler(
+        engine,
+        lock=lock,
+        writer=writer,
+        write_timeout=1,
+        queue_timeout=0.05,
+        paragraph_silence_ms=300,
+    )
+    assert await first.handle_event(SynthesizeStart().event()) is True
+    assert await first.handle_event(SynthesizeChunk(text="Câu một.\n").event()) is True
+
+    writer.block_next_drain()
+    # Punctuation-only text keeps the leading pause on the fallback consumer
+    # path so the producer slot timeout is still exercised.
+    request = asyncio.create_task(first.handle_event(SynthesizeChunk(text="...\n").event()))
+    try:
+        await asyncio.wait_for(writer.blocked.wait(), timeout=1)
+        for _ in range(500):
+            if not lock.locked():
+                break
+            await asyncio.sleep(0.001)
+        assert lock.locked() is False
+
+        second_engine = FakeTTS([np.array([0.5], dtype=np.float32)])
+        second, second_writer = make_handler(second_engine, lock=lock, queue_timeout=0.05)
+        await asyncio.wait_for(
+            second.handle_event(Synthesize(text="Second").event()),
+            timeout=1,
+        )
+        assert [event.type for event in written_events(second_writer)] == [
+            "audio-start",
+            "audio-chunk",
+            "audio-stop",
+        ]
+    finally:
+        writer.gate.set()
+        with suppress(Exception, asyncio.CancelledError):
+            await asyncio.wait_for(request, timeout=5)
+
+    assert "error" in [event.type for event in written_events(stream)]
+
+
+async def test_acquire_output_slot_uses_an_available_slot() -> None:
+    """Test an immediately available slot is acquired without waiting."""
+    slots = asyncio.Semaphore(1)
+    abort = asyncio.Event()
+    pause_done = asyncio.Event()
+    assert await _acquire_output_slot(slots, abort, pause_done, timeout=10) is True
+    assert slots.locked() is True
+    slots.release()
+
+
+async def test_acquire_output_slot_bounds_a_stalled_pause() -> None:
+    """Test a stalled leading pause cannot keep the producer waiting indefinitely."""
+    slots = asyncio.Semaphore(0)
+    abort = asyncio.Event()
+    pause_done = asyncio.Event()
+    acquire = asyncio.create_task(_acquire_output_slot(slots, abort, pause_done, timeout=0.02))
+
+    with pytest.raises(_OutputBackpressureError):
+        await asyncio.wait_for(acquire, timeout=1)
+
+
+async def test_acquire_output_slot_renews_timeout_after_pause_wait() -> None:
+    """Test a slot freed after the original deadline is still acquired."""
+    slots = asyncio.Semaphore(0)
+    abort = asyncio.Event()
+    pause_done = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    timeout = 0.2
+    started = loop.time()
+    acquire = asyncio.create_task(_acquire_output_slot(slots, abort, pause_done, timeout=timeout))
+
+    await asyncio.sleep(timeout)
+    pause_done.set()
+    await asyncio.sleep(timeout * 0.1)
+    assert loop.time() - started > timeout
+    assert not acquire.done()
+
+    slots.release()
+    assert await asyncio.wait_for(acquire, timeout=1) is True
+
+
+async def test_acquire_output_slot_extends_while_pause_makes_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test a multi-write pause is not mistaken for a stalled client."""
+    slots = asyncio.Semaphore(0)
+    abort = asyncio.Event()
+    pause_done = asyncio.Event()
+    progress = asyncio.Event()
+    timeout = 0.05
+    real_wait = asyncio.wait
+    elapsed = 0.0
+    deliveries = 0
+
+    async def ticking_wait(tasks: Any, **kwargs: Any) -> Any:
+        """Deliver progress at each known pause wait."""
+        nonlocal elapsed, deliveries
+        if kwargs.get("timeout") is not None and not pause_done.is_set():
+            elapsed += timeout
+            deliveries += 1
+            progress.set()
+            await asyncio.sleep(0)
+            done = {task for task in tasks if task.done()}
+            return done, set(tasks) - done
+        return await real_wait(tasks, **kwargs)
+
+    monkeypatch.setattr(asyncio, "wait", ticking_wait)
+    acquire = asyncio.create_task(_acquire_output_slot(slots, abort, pause_done, timeout, progress))
+
+    for _ in range(1000):
+        if elapsed > timeout and deliveries > 1:
+            break
+        await asyncio.sleep(0)
+    assert deliveries > 1
+    assert elapsed > timeout
+    assert not acquire.done()
+
+    pause_done.set()
+    slots.release()
+    assert await asyncio.wait_for(acquire, timeout=1) is True
+
+
+async def test_acquire_output_slot_renews_timeout_after_pause_completion_in_slot_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test a pause completing during the slot wait starts a fresh slot timeout."""
+    slots = asyncio.Semaphore(0)
+    abort = asyncio.Event()
+    pause_done = asyncio.Event()
+    timeout = 0.2
+    slot_wait_started = asyncio.Event()
+    wait_calls = 0
+    real_wait = asyncio.wait
+
+    async def tracked_wait(tasks: Any, **kwargs: Any) -> Any:
+        """Record each wait and signal when the slot wait begins."""
+        nonlocal wait_calls
+        wait_calls += 1
+        if wait_calls == 2:
+            # Slot wait has begun.
+            slot_wait_started.set()
+        return await real_wait(tasks, **kwargs)
+
+    monkeypatch.setattr(asyncio, "wait", tracked_wait)
+    acquire = asyncio.create_task(_acquire_output_slot(slots, abort, pause_done, timeout=timeout))
+
+    await asyncio.wait_for(slot_wait_started.wait(), timeout=1)
+    pause_done.set()
+    for _ in range(100):
+        if wait_calls >= 3:
+            break
+        await asyncio.sleep(0)
+    # Pause completion started a fresh wait.
+    assert wait_calls >= 3
+    assert not acquire.done()
+
+    slots.release()
+    assert await asyncio.wait_for(acquire, timeout=1) is True
+
+
+async def test_acquire_output_slot_renews_timeout_when_write_progress_follows_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test a completed post-pause write renews the slot wait budget."""
+    slots = asyncio.Semaphore(0)
+    abort = asyncio.Event()
+    pause_done = asyncio.Event()
+    pause_done.set()
+    pause_progress = asyncio.Event()
+    timeout = 0.1
+    real_wait = asyncio.wait
+    delivered = False
+    renewed = asyncio.Event()
+
+    async def progress_wait(tasks: Any, **kwargs: Any) -> Any:
+        """Deliver post-pause progress at the original slot deadline."""
+        nonlocal delivered
+        if kwargs.get("timeout") is not None and not delivered:
+            delivered = True
+            pause_progress.set()
+            await asyncio.sleep(0)
+            done = {task for task in tasks if task.done()}
+            return done, set(tasks) - done
+        if kwargs.get("timeout") is not None:
+            renewed.set()
+        return await real_wait(tasks, **kwargs)
+
+    monkeypatch.setattr(asyncio, "wait", progress_wait)
+    acquire = asyncio.create_task(
+        _acquire_output_slot(slots, abort, pause_done, timeout, pause_progress)
+    )
+
+    assert delivered is False
+    await asyncio.wait_for(renewed.wait(), timeout=1)
+    assert not acquire.done()
+
+    slots.release()
+    assert await asyncio.wait_for(acquire, timeout=1) is True
+
+
+async def test_acquire_output_slot_wakes_on_abort_during_pause() -> None:
+    """Test aborting a pending pause wakes the producer without waiting for a slot."""
+    slots = asyncio.Semaphore(0)
+    abort = asyncio.Event()
+    pause_done = asyncio.Event()
+    acquire = asyncio.create_task(_acquire_output_slot(slots, abort, pause_done, timeout=10))
+
+    await asyncio.sleep(0)
+    abort.set()
+    assert await asyncio.wait_for(acquire, timeout=1) is False
+
+
+async def test_acquire_output_slot_enforces_backpressure_after_pause() -> None:
+    """Test the normal timeout still raises once the pause has completed."""
+    slots = asyncio.Semaphore(0)
+    abort = asyncio.Event()
+    pause_done = asyncio.Event()
+    acquire = asyncio.create_task(_acquire_output_slot(slots, abort, pause_done, timeout=0.02))
+
+    await asyncio.sleep(0)
+    pause_done.set()
+    with pytest.raises(_OutputBackpressureError):
+        await asyncio.wait_for(acquire, timeout=1)
+
+
+async def test_acquire_output_slot_consumes_progress_after_a_timeout_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test progress set as the slot wait times out renews the budget instead of failing."""
+    slots = asyncio.Semaphore(0)
+    abort = asyncio.Event()
+    pause_done = asyncio.Event()
+    pause_done.set()
+    progress = asyncio.Event()
+    real_wait = asyncio.wait
+    calls = 0
+    first_tasks: set[asyncio.Future[Any]] = set()
+
+    async def racing_wait(tasks: Any, **kwargs: Any) -> Any:
+        """Set progress while leaving its task pending for one timeout."""
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_tasks.update(tasks)
+            progress.set()
+            return set(), set(tasks)
+        slots.release()
+        return await real_wait(tasks, **kwargs)
+
+    monkeypatch.setattr(asyncio, "wait", racing_wait)
+    acquire = asyncio.create_task(
+        _acquire_output_slot(slots, abort, pause_done, timeout=0.05, pause_progress=progress)
+    )
+
+    assert await asyncio.wait_for(acquire, timeout=1) is True
+    await asyncio.sleep(0)
+    assert calls >= 2
+    assert all(task.done() for task in first_tasks)
+
+
 async def test_tts_producer_cancellation_frees_the_lock_and_the_consumer() -> None:
     """Test cancelling inference never strands the shared lock or its waiting consumer."""
     lock = asyncio.Lock()
@@ -1230,6 +2334,28 @@ async def test_tts_producer_cancellation_keeps_lock_until_native_call_finishes()
     engine.release.set()
     with suppress(asyncio.CancelledError):
         await asyncio.wait_for(request, timeout=5)
+    assert lock.locked() is False
+
+
+async def test_tts_abort_signals_the_active_native_stream() -> None:
+    """Test abort stops a blocked native stream before waiting for its next call."""
+    lock = asyncio.Lock()
+    engine = StopAwareBlockingTTS()
+    handler, _ = make_handler(engine, lock=lock)
+    request = asyncio.create_task(handler.handle_event(Synthesize(text="Blocking").event()))
+
+    for _ in range(500):
+        if engine.iterator.started.is_set():
+            break
+        await asyncio.sleep(0.001)
+    assert engine.iterator.started.is_set()
+    assert lock.locked() is True
+
+    request.cancel()
+
+    with suppress(asyncio.CancelledError):
+        await asyncio.wait_for(request, timeout=5)
+    assert engine.iterator.stop_calls >= 1
     assert lock.locked() is False
 
 
@@ -1324,6 +2450,100 @@ async def test_tts_splits_token_bounded_text_without_changing_lifecycle() -> Non
     assert event_types.count("audio-start") == 1
     assert event_types.count("audio-stop") == 1
     assert "error" not in event_types
+
+
+async def test_tts_one_shot_skips_an_empty_token_part() -> None:
+    """Test an explicitly empty token part does not abort one-shot synthesis."""
+    engine = SilentFirstTokenPartTTS([np.array([0.5], dtype=np.float32)])
+    handler, writer = make_handler(engine)
+    await handler.handle_event(Synthesize(text="Xin chào").event())
+
+    assert engine.calls == [("...", None), ("Xin chào", None)]
+    events = written_events(writer)
+    assert "error" not in [event.type for event in events]
+    assert written_audio(writer) == _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+
+
+async def test_tts_one_shot_fails_when_every_token_part_is_empty() -> None:
+    """Test an aggregate of only empty token parts reports inference failure."""
+    engine = SilentFirstTokenPartTTS([np.array([0.5], dtype=np.float32)])
+    handler, writer = make_handler(engine)
+
+    assert await handler.handle_event(Synthesize(text="...").event()) is False
+
+    events = written_events(writer)
+    assert [event.type for event in events] == ["audio-start", "error", "audio-stop"]
+    assert events[1].data["code"] == "inference-failed"
+    assert written_audio(writer) == b""
+
+
+async def test_tts_keeps_pending_pause_for_the_first_token_part_with_audio() -> None:
+    """Test a silent token part does not consume the pause owed to the next part."""
+    engine = SilentFirstTokenPartTTS([np.array([0.5], dtype=np.float32)])
+    handler, writer = make_handler(engine, paragraph_silence_ms=100)
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Câu một.\n").event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Hai.").event()) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+
+    speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+    pause = _silence_pcm(100, engine.sample_rate)
+    assert engine.calls == [
+        ("...", None),
+        ("Câu một.", None),
+        ("...", None),
+        ("Hai.", None),
+    ]
+    assert "error" not in [event.type for event in written_events(writer)]
+    assert written_audio(writer) == speech + pause + speech
+
+
+async def test_tts_uses_original_boundary_kind_before_normalization() -> None:
+    """Test the pause follows the detector boundary, not rewritten normalized text."""
+    engine = PunctuationNormalizingTTS([np.array([0.5], dtype=np.float32)])
+    handler, writer = make_handler(
+        engine,
+        clause_silence_ms=50,
+        sentence_silence_ms=100,
+        paragraph_silence_ms=150,
+    )
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert (
+        await handler.handle_event(SynthesizeChunk(text="Một hai ba bốn năm sáu bảy tám,").event())
+        is True
+    )
+    assert await handler.handle_event(SynthesizeChunk(text=" Tiếp theo.").event()) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+
+    assert engine.calls[0][0] == "Một hai ba bốn năm sáu bảy tám."
+    speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+    clause_pause = _silence_pcm(50, engine.sample_rate)
+    assert written_audio(writer) == speech + clause_pause + speech
+
+
+async def test_tts_discards_internal_pause_after_a_silent_token_part() -> None:
+    """Test an internal pause is dropped when no later token part speaks."""
+    engine = SilentLastTokenPartTTS([np.array([0.5], dtype=np.float32)])
+    handler, writer = make_handler(
+        engine,
+        sentence_silence_ms=50,
+        paragraph_silence_ms=100,
+    )
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Câu một.\n").event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Hai.").event()) is True
+    assert await handler.handle_event(SynthesizeStop().event()) is True
+
+    speech = _audio_to_pcm_bytes(np.array([0.5], dtype=np.float32))
+    paragraph_pause = _silence_pcm(100, engine.sample_rate)
+    assert engine.calls == [
+        ("Câu một.", None),
+        ("...", None),
+        ("Hai.", None),
+        ("...", None),
+    ]
+    assert "error" not in [event.type for event in written_events(writer)]
+    assert written_audio(writer) == speech + paragraph_pause + speech
 
 
 async def test_tts_token_segmentation_runs_on_inference_executor() -> None:
@@ -2643,6 +3863,81 @@ def test_phonemize_nghitts_rejects_empty_output(
     assert "Xin chào." not in str(error.value)
 
 
+def test_nghitts_iterator_treats_missing_phonemes_as_empty_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test a punctuation-only segment finishes without calling native synthesis."""
+
+    def raise_no_phonemes(text: str, language: str) -> list[list[int]]:
+        """Reject the segment the way eSpeak does for punctuation-only text."""
+        del text, language
+        raise _NoPhonemesError("NghiTTS phonemizer returned no phonemes")
+
+    monkeypatch.setattr("wyoming_vietnamese.tts._phonemize_nghitts", raise_no_phonemes)
+    native = FakeSherpaTTS()
+    engine = NghiTTSEngine(native, DEFAULT_NGHITTS_VOICE)
+
+    worker = engine.infer_stream_normalized("...")
+    assert isinstance(worker, _NghiAudioIterator)
+    assert not list(worker)
+    assert worker.empty_text is True
+    assert native.calls == []
+
+
+def test_nghitts_iterator_rejects_missing_phonemes_for_speakable_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test a phonemizer failure on speakable text is not treated as empty."""
+
+    def raise_no_phonemes(text: str, language: str) -> list[list[int]]:
+        """Fail every segment regardless of its content."""
+        del text, language
+        raise _NoPhonemesError("NghiTTS phonemizer returned no phonemes")
+
+    monkeypatch.setattr("wyoming_vietnamese.tts._phonemize_nghitts", raise_no_phonemes)
+    native = FakeSherpaTTS()
+    engine = NghiTTSEngine(native, DEFAULT_NGHITTS_VOICE)
+
+    worker = engine.infer_stream_normalized("Xin chào.")
+    assert isinstance(worker, _NghiAudioIterator)
+    with pytest.raises(_NoPhonemesError):
+        list(worker)
+    assert worker.empty_text is False
+    assert native.calls == []
+
+
+async def test_tts_stream_rejects_missing_phonemes_for_speakable_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test a speakable phonemizer failure reaches the Wyoming error path."""
+
+    def raise_no_phonemes(text: str, language: str) -> list[list[int]]:
+        """Fail every segment regardless of its content."""
+        del text, language
+        raise _NoPhonemesError("NghiTTS phonemizer returned no phonemes")
+
+    monkeypatch.setattr("wyoming_vietnamese.tts._phonemize_nghitts", raise_no_phonemes)
+    engine = NghiTTSEngine(FakeSherpaTTS(), DEFAULT_NGHITTS_VOICE)
+    handler, writer = make_handler(engine)
+
+    assert await handler.handle_event(SynthesizeStart().event()) is True
+    assert await handler.handle_event(SynthesizeChunk(text="Xin chào.").event()) is False
+    events = written_events(writer)
+    assert any(
+        event.type == "error" and event.data["code"] == "inference-failed" for event in events
+    )
+
+
+def test_phonemize_nghitts_real_vietnamese_punctuation() -> None:
+    """Test the bundled eSpeak voice reads words but rejects punctuation-only text."""
+    from zerotts.text_norm import normalize_vi_text
+
+    assert normalize_vi_text("...") == "..."
+    with pytest.raises(_NoPhonemesError):
+        _phonemize_nghitts("...", "vi")
+    assert _phonemize_nghitts(normalize_vi_text("Tiếp theo."), "vi")
+
+
 def test_nghitts_generation_config_sets_phoneme_codepoints(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2982,6 +4277,548 @@ def test_stream_clause_detector_splits_adjacent_letters_without_abbreviation() -
     assert detector.finish() == ""
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        'Anh ấy nói: "Tôi đi."',
+        "Anh ấy nói: “Tôi đi.”",
+        "Anh ấy nói: 'Tôi đi.'",
+        'Anh nói: "A “B.”"',
+        'Anh nói: “A "B."”',
+        "Anh nói: \"Tôi nói 'A.'\"",
+        'Anh ấy nói: "Tôi đi. "',
+        "Đây là câu cuối (xem thêm.)",
+    ],
+)
+def test_stream_clause_detector_keeps_closing_wrappers_with_sentence(text: str) -> None:
+    """Test a closing quote or bracket never becomes a punctuation-only segment."""
+    assert StreamClauseDetector.split_clause_text_with_separators(text) == [(text, "")]
+
+    detector = StreamClauseDetector()
+    pairs = detector.add_chunk_with_separators(text)
+    pairs += detector.finish_with_separators()
+    assert pairs == [(text, "")]
+
+
+def _stream_pairs(detector: StreamClauseDetector, text: str) -> list[tuple[str, str]]:
+    """Return every segment emitted by one chunk plus the final flush."""
+    return [*detector.add_chunk_with_separators(text), *detector.finish_with_separators()]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ('Chào."Bạn khỏe?"', [("Chào.", ""), ('"Bạn khỏe?"', "")]),
+        ("Chào.'Bạn khỏe?'", [("Chào.", ""), ("'Bạn khỏe?'", "")]),
+    ],
+)
+def test_stream_clause_detector_leaves_opening_wrapper_with_next_sentence(
+    text: str, expected: list[tuple[str, str]]
+) -> None:
+    """Test an opening quote after a boundary starts the next sentence instead."""
+    assert StreamClauseDetector.split_clause_text_with_separators(text) == expected
+
+    detector = StreamClauseDetector()
+    assert _stream_pairs(detector, text) == expected
+    assert detector.finish() == ""
+
+
+def test_stream_clause_detector_keeps_a_quote_before_a_bracket_with_the_bracket() -> None:
+    """Test a quote before an opening bracket starts a span that includes the bracket."""
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators("'A. '(B.)'") == [
+        ("'A.", " "),
+    ]
+    assert detector.finish_with_separators() == [("'(B.)'", "")]
+
+
+def test_stream_clause_detector_attaches_wrappers_separated_by_nbsp() -> None:
+    """Test non-breaking whitespace between closing wrappers keeps them together."""
+    text = 'Anh nói "Tôi đi (xong.)\u00a0"'
+    detector = StreamClauseDetector()
+    pairs = detector.add_chunk_with_separators(text)
+    pairs += detector.finish_with_separators()
+    assert pairs == [(text, "")]
+
+
+def test_stream_clause_detector_treats_word_final_apostrophe_as_text() -> None:
+    """Test a possessive apostrophe does not keep a sentence boundary pending."""
+    detector = StreamClauseDetector()
+    assert _stream_pairs(detector, "James' team.") == [("James' team.", "")]
+
+
+def test_stream_clause_detector_closes_nested_single_quote_before_punctuation() -> None:
+    """Test a nested single closer is not mistaken for a possessive apostrophe."""
+    text = "'Anh nói 'A'.' Tiếp theo."
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators(text) == [
+        ("'Anh nói 'A'.'", " "),
+        ("Tiếp theo.", ""),
+    ]
+    assert detector.finish() == ""
+
+
+def test_stream_clause_detector_keeps_straight_possessive_inside_a_quote() -> None:
+    """Test a possessive apostrophe does not close the surrounding quotation."""
+    text = "'James' team!'"
+    detector = StreamClauseDetector()
+    assert _stream_pairs(detector, text) == [(text, "")]
+    assert detector.finish() == ""
+
+
+def test_stream_clause_detector_skips_word_internal_straight_apostrophes() -> None:
+    """Test a word-internal apostrophe is not mistaken for the closing quote."""
+    text = "'James' team's win!'"
+    detector = StreamClauseDetector()
+    assert _stream_pairs(detector, text) == [(text, "")]
+    assert detector.finish() == ""
+
+
+def test_stream_clause_detector_treats_decomposed_apostrophe_as_word_internal() -> None:
+    """Test a combining mark keeps a decomposed word's apostrophe inside the word."""
+    text = "Anh nói: 'Cafe\u0301's menu.'"
+    detector = StreamClauseDetector()
+    assert _stream_pairs(detector, text) == [(text, "")]
+    assert detector.finish() == ""
+
+
+def test_stream_clause_detector_ignores_word_internal_curly_apostrophes() -> None:
+    """Test a word-internal apostrophe does not close the surrounding span."""
+    text = "\u2018James team\u2019s win.\u2019"
+    detector = StreamClauseDetector()
+    assert _stream_pairs(detector, text) == [(text, "")]
+    assert detector.finish() == ""
+
+
+def test_stream_clause_detector_emits_a_balanced_curly_span_before_a_following_clause() -> None:
+    """Test a balanced quotation followed by a word emits without waiting."""
+    text = "\u2018Xin chào\u2019 rồi đi."
+    assert StreamClauseDetector.split_clause_text_with_separators(text) == [(text, "")]
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators(text) == [(text, "")]
+    assert detector.finish_with_separators() == []
+
+
+def test_stream_clause_detector_emits_a_balanced_straight_span_before_a_following_clause() -> None:
+    """Test a balanced straight quotation followed by a word emits without waiting."""
+    text = "'Tôi đi' rồi về."
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators(text) == [(text, "")]
+    assert detector.finish_with_separators() == []
+
+
+def test_stream_clause_detector_emits_a_balanced_quote_before_a_later_closer() -> None:
+    """Test a later closer does not retroactively keep a balanced quote open."""
+    text = "\u2018James\u2019 team.\u2019"
+    one_chunk = StreamClauseDetector()
+    assert one_chunk.add_chunk_with_separators(text) == [(text, "")]
+    assert one_chunk.finish_with_separators() == []
+
+    two_chunks = StreamClauseDetector()
+    assert two_chunks.add_chunk_with_separators("\u2018James\u2019 team.") == [
+        ("\u2018James\u2019 team.", "")
+    ]
+    assert two_chunks.add_chunk_with_separators("\u2019") == []
+    assert two_chunks.finish_with_separators() == [("\u2019", "")]
+
+
+def test_stream_clause_detector_keeps_ascii_possessive_inside_a_curly_quote() -> None:
+    """Test a curly stack entry does not expect an ASCII quote closer."""
+    text = "\u2018Anh nói 'James', team.'\u2019 Tiếp theo."
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators(text) == [
+        ("\u2018Anh nói 'James',", " "),
+        ("team.'\u2019", " "),
+        ("Tiếp theo.", ""),
+    ]
+    assert detector.finish() == ""
+
+
+def test_stream_clause_detector_emits_a_balanced_straight_quote_before_a_later_closer() -> None:
+    """Test a later closer does not retroactively keep a balanced straight quote open."""
+    text = "'James' team.'"
+    one_chunk = StreamClauseDetector()
+    assert _stream_pairs(one_chunk, text) == [(text, "")]
+    assert one_chunk.finish() == ""
+
+    two_chunks = StreamClauseDetector()
+    assert two_chunks.add_chunk_with_separators("'James' team.") == [("'James' team.", "")]
+    assert two_chunks.add_chunk_with_separators("'") == []
+    assert two_chunks.finish_with_separators() == [("'", "")]
+
+
+def test_stream_clause_detector_keeps_trailing_quote_for_next_context() -> None:
+    """Test a buffer-final quote waits for text that resolves its role."""
+    first = "Anh nói: 'Một câu. '"
+    pending = StreamClauseDetector()
+    assert pending.add_chunk_with_separators(first) == []
+    assert pending.add_chunk_with_separators("Tiếp theo.'") == [("Anh nói: 'Một câu.", " ")]
+    assert pending.finish() == "'Tiếp theo.'"
+
+    terminal = StreamClauseDetector()
+    assert terminal.add_chunk_with_separators(first) == []
+    assert terminal.finish_with_separators() == [(first, "")]
+
+
+def test_stream_clause_detector_keeps_trailing_double_quote_for_next_context() -> None:
+    """Test a buffer-final double quote waits for text that resolves its role."""
+    first = 'Anh nói: "Một câu. "'
+    expected = [('Anh nói: "Một câu.', " ")]
+    one_chunk = StreamClauseDetector()
+    assert one_chunk.add_chunk_with_separators(f'{first}Tiếp theo."') == expected
+    assert one_chunk.finish() == '"Tiếp theo."'
+
+    pending = StreamClauseDetector()
+    assert pending.add_chunk_with_separators(first) == []
+    assert pending.add_chunk_with_separators('Tiếp theo."') == expected
+    assert pending.finish() == '"Tiếp theo."'
+
+    terminal = StreamClauseDetector()
+    assert terminal.add_chunk_with_separators(first) == []
+    assert terminal.finish_with_separators() == [(first, "")]
+
+
+def test_stream_clause_detector_emits_paragraph_quote_before_crlf() -> None:
+    """Test CRLF stops the quote lookahead so the paragraph emits immediately."""
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators("Anh nói: 'Chào bạn'\r\n") == [
+        ("Anh nói: 'Chào bạn'", "\r\n")
+    ]
+    assert detector.finish() == ""
+
+
+def test_stream_clause_detector_emits_paragraph_after_an_unquoted_possessive() -> None:
+    """Test an unquoted possessive does not hold a paragraph boundary."""
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators("teachers'\n") == [("teachers'", "\n")]
+    assert detector.finish() == ""
+
+
+def test_stream_clause_detector_treats_a_quote_after_a_number_as_inches() -> None:
+    """Test an inch mark does not open a quote wrapper."""
+    text = 'Màn hình 24" và rất rõ.'
+    detector = StreamClauseDetector()
+    assert _stream_pairs(detector, text) == [(text, "")]
+    assert detector.finish() == ""
+
+
+def test_stream_clause_detector_closes_a_quote_after_a_measurement_without_a_later_closer() -> None:
+    """Test a quote after a number closes the quotation when no later closer confirms it."""
+    text = 'Anh ấy nói: "Màn hình 24" rồi đi.'
+    detector = StreamClauseDetector()
+    assert _stream_pairs(detector, text) == [(text, "")]
+    assert detector.finish() == ""
+
+
+def test_stream_clause_detector_closes_a_double_quote_after_a_number() -> None:
+    """Test a closing quote after a number still closes an open quotation."""
+    text = 'Anh ấy nói: "Tôi có 24".'
+    detector = StreamClauseDetector()
+    assert _stream_pairs(detector, text) == [(text, "")]
+    assert detector.finish() == ""
+
+
+def test_stream_clause_detector_ignores_a_quote_in_the_next_sentence_after_a_number() -> None:
+    """Test a later sentence's quote cannot keep a measurement mark open."""
+    text = 'Anh ấy nói: "Màn hình 24" rồi đi. Sau đó "ổn".'
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators(text) == [
+        ('Anh ấy nói: "Màn hình 24" rồi đi.', " "),
+        ('Sau đó "ổn".', ""),
+    ]
+    assert detector.finish() == ""
+
+
+def test_stream_clause_detector_ignores_an_opening_quote_after_a_number() -> None:
+    """Test a later opening quote cannot keep the current quotation span open."""
+    text = 'Anh ấy nói: "Màn hình 24" và nói "ổn".'
+    detector = StreamClauseDetector()
+    assert _stream_pairs(detector, text) == [(text, "")]
+    assert detector.finish() == ""
+
+
+def test_stream_clause_detector_keeps_a_confirmed_inch_mark_at_a_clause_boundary() -> None:
+    """Test a later closer still confirms the inch mark at a comma."""
+    text = 'Anh nói: "Màn hình 24" và rõ, sau đó".'
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators(text) == [
+        ('Anh nói: "Màn hình 24" và rõ,', " "),
+        ('sau đó".', ""),
+    ]
+    assert detector.finish() == ""
+
+
+def test_stream_clause_detector_stops_a_measurement_quote_at_the_next_line() -> None:
+    """Test a quote on a later line cannot confirm the measurement span."""
+    text = 'Anh ấy nói: "Màn hình 24" rồi đi. Sau "ổn"\nTiếp.'
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators(text) == [
+        ('Anh ấy nói: "Màn hình 24" rồi đi.', " "),
+        ('Sau "ổn"', "\n"),
+        ("Tiếp.", ""),
+    ]
+    assert detector.finish() == ""
+
+
+def test_stream_clause_detector_treats_an_unquoted_decade_as_text() -> None:
+    """Test a decade mention without a matching closer does not hold the sentence."""
+    text = "Nhạc '90s rất hay."
+    detector = StreamClauseDetector()
+    assert _stream_pairs(detector, text) == [(text, "")]
+    assert detector.finish() == ""
+
+
+def test_stream_clause_detector_keeps_a_quoted_decade_span() -> None:
+    """Test a decade quotation with a matching closer still opens and closes."""
+    text = "'90s rất hay.'"
+    detector = StreamClauseDetector()
+    assert _stream_pairs(detector, text) == [(text, "")]
+    assert detector.finish() == ""
+
+
+def test_stream_clause_detector_keeps_nested_decade_text_inside_a_quote() -> None:
+    """Test a decade apostrophe inside a quotation does not open a nested quote."""
+    text = "Anh nói: 'Nhạc '90s rất hay.' Tiếp theo."
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators(text) == [
+        ("Anh nói: 'Nhạc '90s rất hay.'", " "),
+        ("Tiếp theo.", ""),
+    ]
+    assert detector.finish() == ""
+
+
+def test_stream_clause_detector_closes_curly_quote_before_a_later_possessive() -> None:
+    """Test a later sentence's possessive cannot keep a closed quotation open."""
+    text = "\u2018Tôi đi\u2019. James\u2019 team."
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators(text) == [
+        ("\u2018Tôi đi\u2019.", " "),
+        ("James\u2019 team.", ""),
+    ]
+    assert detector.finish() == ""
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("'The winner is James'.'", [("'The winner is James'.'", "")]),
+        (
+            "\u2018The winner is James\u2019.\u2019",
+            [("\u2018The winner is James\u2019.\u2019", "")],
+        ),
+        ("'James'. 'Next sentence.'", [("'James'.", " "), ("'Next sentence.'", "")]),
+        (
+            "\u2018James\u2019. \u2018Next sentence.\u2019",
+            [("\u2018James\u2019.", " "), ("\u2018Next sentence.\u2019", "")],
+        ),
+    ],
+)
+def test_stream_clause_detector_bounds_possessive_lookahead_to_the_sentence(
+    text: str, expected: list[tuple[str, str]]
+) -> None:
+    """Test a closer after punctuation stays, but later sentences stay separate."""
+    detector = StreamClauseDetector()
+    assert _stream_pairs(detector, text) == expected
+    assert detector.finish() == ""
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Anh nói: 'James' team at TP.HCM.'", [("Anh nói: 'James' team at TP.HCM.'", "")]),
+        ("Anh nói: 'James' team at U.S.A.'", [("Anh nói: 'James' team at U.S.A.'", "")]),
+        ("Anh nói: 'James' team at 1.000.'", [("Anh nói: 'James' team at 1.000.'", "")]),
+        (
+            "Anh nói: 'James' team at TP.HCM, xong.'",
+            [
+                ("Anh nói: 'James' team at TP.HCM,", " "),
+                ("xong.'", ""),
+            ],
+        ),
+    ],
+)
+def test_stream_clause_detector_searches_past_an_intra_token_period(
+    text: str, expected: list[tuple[str, str]]
+) -> None:
+    """Test a closer after an abbreviation or number still belongs to the sentence."""
+    detector = StreamClauseDetector()
+    assert _stream_pairs(detector, text) == expected
+    assert detector.finish() == ""
+
+
+def test_stream_clause_detector_closes_a_balanced_quote_before_a_later_clause() -> None:
+    """Test an established sentence boundary still closes a balanced quotation."""
+    text = "Anh nói: 'James' team, sau đó. Tiếp theo."
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators(text) == [
+        ("Anh nói: 'James' team,", " "),
+        ("sau đó.", " "),
+        ("Tiếp theo.", ""),
+    ]
+    assert detector.finish() == ""
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '"Anh nói: "Tôi đi!""',
+        'Anh nói: "A "B.""',
+        'Anh nói: "A: "B.""',
+    ],
+)
+def test_stream_clause_detector_nests_straight_double_quotes(text: str) -> None:
+    """Test a straight double quote after a colon opens nested quoted text."""
+    assert StreamClauseDetector.split_clause_text_with_separators(text) == [(text, "")]
+
+    detector = StreamClauseDetector()
+    assert _stream_pairs(detector, text) == [(text, "")]
+    assert detector.finish() == ""
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Anh nói: 'A: 'B.''",
+        "Anh nói: 'Tôi đi!'",
+        "'James' team.'",
+        "'Cafe\u0301's menu.'",
+    ],
+)
+def test_stream_clause_detector_nests_straight_single_quotes(text: str) -> None:
+    """Test a straight single quote after a colon nests without breaking apostrophes."""
+    assert StreamClauseDetector.split_clause_text_with_separators(text) == [(text, "")]
+
+    detector = StreamClauseDetector()
+    assert _stream_pairs(detector, text) == [(text, "")]
+    assert detector.finish() == ""
+
+
+def test_stream_clause_detector_treats_inches_inside_curly_quotes_as_text() -> None:
+    """Test an inch mark cannot leave a curly quotation waiting for its closer."""
+    text = 'Anh nói: \u201cMàn hình 24" và rất rõ!\u201d'
+    detector = StreamClauseDetector()
+    assert _stream_pairs(detector, text) == [(text, "")]
+    assert detector.finish() == ""
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "'James'\rteam.",
+        "\u2018James\u2019\rteam.",
+    ],
+)
+def test_stream_clause_detector_does_not_continue_a_word_across_a_carriage_return(
+    text: str,
+) -> None:
+    """Test a CR-separated word is not treated as part of the preceding quote."""
+    detector = StreamClauseDetector()
+    assert _stream_pairs(detector, text) == [(text, "")]
+    assert detector.finish() == ""
+
+
+def test_stream_clause_detector_does_not_attach_a_quote_across_a_carriage_return() -> None:
+    """Test wrapper lookahead stops at a carriage return before a closing quote."""
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators('Chào.\r"') == [("Chào.", "\r")]
+    assert detector.finish_with_separators() == [('"', "")]
+
+
+def test_stream_clause_detector_holds_a_sentence_for_a_later_closing_quote() -> None:
+    """Test an opening quote keeps its sentence pending until the closer arrives."""
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators('Anh nói: "Chào.') == []
+    assert detector.add_chunk_with_separators('" Tiếp.') == [
+        ('Anh nói: "Chào."', " "),
+        ("Tiếp.", ""),
+    ]
+    assert detector.finish_with_separators() == []
+
+
+def test_stream_clause_detector_holds_a_sentence_for_a_later_closing_bracket() -> None:
+    """Test an opening bracket keeps its sentence pending until the closer arrives."""
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators("Anh nói: (Chào.") == []
+    assert detector.add_chunk_with_separators(") Tiếp.") == [
+        ("Anh nói: (Chào.)", " "),
+        ("Tiếp.", ""),
+    ]
+    assert detector.finish_with_separators() == []
+
+
+def test_stream_clause_detector_tracks_a_quote_across_emitted_sentences() -> None:
+    """Test an emitted opening quote still holds the final sentence until it closes."""
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators('Anh nói: "Một câu. Hai câu.') == [
+        ('Anh nói: "Một câu.', " ")
+    ]
+    assert detector.add_chunk_with_separators('" Xong.') == [
+        ('Hai câu."', " "),
+        ("Xong.", ""),
+    ]
+    assert detector.finish_with_separators() == []
+
+
+def test_stream_clause_detector_tracks_a_bracket_across_emitted_sentences() -> None:
+    """Test an emitted opening bracket still holds the final sentence until it closes."""
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators("Anh nói: (Một câu. Hai câu.") == [
+        ("Anh nói: (Một câu.", " ")
+    ]
+    assert detector.add_chunk_with_separators(") Xong.") == [
+        ("Hai câu.)", " "),
+        ("Xong.", ""),
+    ]
+    assert detector.finish_with_separators() == []
+
+
+def test_stream_clause_detector_tracks_nested_wrappers_across_emitted_sentences() -> None:
+    """Test an inner closer cannot settle a sentence while an outer wrapper is open."""
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators('Anh nói: "(Một câu. Hai câu.)') == [
+        ('Anh nói: "(Một câu.', " ")
+    ]
+    assert detector.add_chunk_with_separators('" Xong.') == [
+        ('Hai câu.)"', " "),
+        ("Xong.", ""),
+    ]
+    assert detector.finish_with_separators() == []
+
+
+def test_stream_clause_detector_still_emits_a_decade_without_a_closer() -> None:
+    """Test a decade apostrophe is not treated as an opening quotation."""
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators("Nhạc '90s rất hay.") == [("Nhạc '90s rất hay.", "")]
+    assert detector.finish_with_separators() == []
+
+
+def test_stream_clause_detector_drops_a_stray_opener_at_a_paragraph_break() -> None:
+    """Test a stray opener cannot hold sentences in a later paragraph."""
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators("Xin chào (mọi người.\n") == [
+        ("Xin chào (mọi người.", "\n")
+    ]
+    assert detector.add_chunk_with_separators("Đoạn mới đã xong. ") == [("Đoạn mới đã xong.", " ")]
+    assert detector.finish_with_separators() == []
+
+
+def test_stream_clause_detector_drops_a_stray_opener_past_the_tracking_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test one unmatched opener stops holding sentences once tracking is capped."""
+    monkeypatch.setattr("wyoming_vietnamese.tts._WRAPPER_TRACK_MAX_CHARS", 40)
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators("Xin chào (mọi người. ") == []
+    assert detector.add_chunk_with_separators("Câu một đã xong. ") == [
+        ("Xin chào (mọi người.", " ")
+    ]
+    assert detector.add_chunk_with_separators("Câu hai đã xong. ") == [
+        ("Câu một đã xong.", " "),
+        ("Câu hai đã xong.", " "),
+    ]
+    assert detector.finish_with_separators() == []
+
+
 def test_prefix_abbreviations_align_with_zerotts() -> None:
     """Verify local administrative prefix abbreviations stay aligned with ZeroTTS helper."""
     from zerotts.text_norm.vi_normalizer import _PREFIX_ABBR as UPSTREAM_PREFIX_ABBR
@@ -3041,6 +4878,37 @@ def test_stream_clause_detector_waits_for_a_number_split_across_chunks() -> None
     assert not list(detector.add_chunk("Nhiệt độ ngoài trời là 33,"))
     assert list(detector.add_chunk("8 độ C. Trời đẹp")) == ["Nhiệt độ ngoài trời là 33,8 độ C."]
     assert detector.finish() == "Trời đẹp"
+
+
+def test_stream_clause_detector_emits_number_sentence_once_whitespace_arrives() -> None:
+    """Test whitespace after a number's period proves it is not a decimal."""
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators("Nhiệt độ là 42.") == []
+    assert detector.add_chunk_with_separators(" ") == [("Nhiệt độ là 42.", " ")]
+    assert detector.finish_with_separators() == []
+
+
+def test_stream_clause_detector_emits_an_ellipsis_after_a_number() -> None:
+    """Test a delimiter run after a number is a sentence end, not a decimal."""
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators("Nhiệt độ là 42...") == [("Nhiệt độ là 42...", "")]
+    assert detector.finish_with_separators() == []
+
+
+def test_stream_clause_detector_emits_dash_clause_once_whitespace_arrives() -> None:
+    """Test whitespace after a dash rules out a token-joining boundary."""
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators("Tuyến đường Sài Gòn- ") == [
+        ("Tuyến đường Sài Gòn-", " ")
+    ]
+    assert detector.finish_with_separators() == []
+
+
+def test_stream_clause_detector_emits_uppercase_sentence_once_whitespace_arrives() -> None:
+    """Test whitespace after an uppercase token's period resolves the boundary."""
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators("Nhiệt độ là OK. ") == [("Nhiệt độ là OK.", " ")]
+    assert detector.finish_with_separators() == []
 
 
 def test_stream_clause_detector_splits_distinct_paragraph_sentence_clause_tiers() -> None:
@@ -3309,7 +5177,7 @@ def test_stream_clause_detector_matches_across_chunk_sizes(chunk_size: int) -> N
     pairs: list[tuple[str, str]] = []
     for offset in range(0, len(text), chunk_size):
         pairs.extend(detector.add_chunk_with_separators(text[offset : offset + chunk_size]))
-    tail = detector.finish()
+    pairs.extend(detector.finish_with_separators())
 
     clauses = [clause for clause, _ in pairs]
     assert clauses == [
@@ -3325,52 +5193,40 @@ def test_stream_clause_detector_matches_across_chunk_sizes(chunk_size: int) -> N
         "sentence",
     ]
     assert " ".join(clauses) == text
-    assert tail == ""
 
 
-def test_stream_clause_detector_incremental_scan_preserves_pending_boundaries() -> None:
-    """Test a delimiter run and a growing short clause survive an incremental resume."""
-    # A run arriving across chunks must be matched as a whole, not per character.
-    detector = StreamClauseDetector(min_clause_chars=3)
-    assert not list(detector.add_chunk("a\u2013"))
-    assert list(detector.add_chunk("\u2013")) == ["a\u2013\u2013"]
+def test_stream_clause_detector_splits_sentences_inside_a_quotation() -> None:
+    """Test quotation balance does not delay ordinary sentence boundaries."""
+    text = 'Anh nói: "Câu một. Câu hai." Tiếp.'
+    expected = [
+        ('Anh nói: "Câu một.', " "),
+        ('Câu hai."', " "),
+        ("Tiếp.", ""),
+    ]
+    detector = StreamClauseDetector()
+    assert _stream_pairs(detector, text) == expected
+
+
+def test_stream_clause_detector_attaches_trailing_wrappers() -> None:
+    """Test closing wrappers stay with the sentence they end."""
+    for text in (
+        'Anh nói: "Xin chào."',
+        "Anh nói: 'Xin chào.'",
+        "Anh nói: (Xin chào.)",
+    ):
+        detector = StreamClauseDetector()
+        assert _stream_pairs(detector, text) == [(text, "")]
+
+
+def test_stream_clause_detector_holds_a_buffer_final_quote() -> None:
+    """Test a final straight quote waits for the next chunk instead of attaching early."""
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators("Anh nói: 'Xin chào.'") == []
+    assert detector.finish_with_separators() == [("Anh nói: 'Xin chào.'", "")]
+
+
+def test_stream_clause_detector_emits_a_paragraph_inside_a_quote() -> None:
+    """Test a paragraph break ends a segment even while a quotation is open."""
+    detector = StreamClauseDetector()
+    assert detector.add_chunk_with_separators("\u201cCâu một.\n") == [("\u201cCâu một.", "\n")]
     assert detector.finish() == ""
-
-    # A trailing delimiter below the clause minimum becomes eligible as its
-    # trailing whitespace arrives, so the scan must resume at the delimiter.
-    detector = StreamClauseDetector(min_clause_chars=5)
-    assert not list(detector.add_chunk("Ab\u2013"))
-    assert not list(detector.add_chunk(" "))
-    assert list(detector.add_chunk(" ")) == ["Ab\u2013"]
-    assert detector.finish() == ""
-
-
-async def test_tts_streaming_subsentence_engine_does_not_split_commas() -> None:
-    """Test streaming with chunks_are_sentences=False avoids clause fragmentation."""
-    engine = FakeTTS([np.array([0.5], dtype=np.float32)], chunks_are_sentences=False)
-    handler, _writer = make_handler(engine)
-    assert await handler.handle_event(SynthesizeStart().event()) is True
-
-    # First chunk contains a comma; must NOT trigger early synthesis
-    assert (
-        await handler.handle_event(SynthesizeChunk(text="Hôm nay thời tiết rất đẹp, ").event())
-        is True
-    )
-    assert len(engine.calls) == 0
-
-    # Second chunk ends the sentence with a period; triggers synthesis for sentence 1
-    assert (
-        await handler.handle_event(SynthesizeChunk(text="chúng ta cùng đi dạo nhé. ").event())
-        is True
-    )
-    assert len(engine.calls) == 1
-    assert engine.calls[0][0] == "Hôm nay thời tiết rất đẹp, chúng ta cùng đi dạo nhé."
-
-    # Third chunk has a second sentence, synthesized upon SynthesizeStop
-    assert (
-        await handler.handle_event(SynthesizeChunk(text="Ngày mai trời cũng đẹp.").event()) is True
-    )
-    assert await handler.handle_event(SynthesizeStop().event()) is True
-
-    assert len(engine.calls) == 2
-    assert engine.calls[1][0] == "Ngày mai trời cũng đẹp."
